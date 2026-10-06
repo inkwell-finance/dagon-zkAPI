@@ -1,0 +1,15 @@
+# Local-validator test double for the Pyth receiver program. It only copies instruction data into an account it owns,
+# so the e2e harness can keep a SOL/USD PriceUpdateV2 account fresh. Never deploy anywhere real.
+[package]
+name = "mock-pyth-writer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "=2.3.0"
+
+[workspace]
