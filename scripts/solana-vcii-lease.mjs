@@ -7,8 +7,11 @@
 //         `dagon-zkapi serverd --ledger solana` (immutable-program gate, genesis pin, finalized vault + Pyth reads),
 //         its OpenRouterProvisioner talking to vcii /zk/v1/keys, usage settlement.
 //   Mock: the Pyth SOL/USD account. A PriceUpdateV2 account (official SDK serialization, Full verification, real feed ID,
-//         receiver-program owner) is refreshed every few seconds by solana/dev/mock-pyth-writer, loaded at the receiver
-//         program ID. No Wormhole/guardian verification. Price is a fixed $150.00 +/- $0.01.
+//         receiver-program owner) is refreshed continuously (--refresh-ms, default 400 ms like the real feed) by
+//         solana/dev/mock-pyth-writer, loaded at the receiver program ID, as a small random walk around $150.00 +/- $0.01
+//         that stays inside serverd's quote tolerance. No Wormhole/guardian verification.
+//   --scenario jump: the price also jumps 2% down while the first proof is being generated; serverd must answer a retriable
+//         409 native_quote_stale and the client re-quotes, re-proves and succeeds.
 // Needs Linux with Node 24 and Agave (solana-test-validator). Loopback only.
 //   VCII_ZK_BASE=http://127.0.0.1:8813/zk VCII_ZK_MANAGEMENT_KEY=... node scripts/solana-vcii-lease.mjs \
 //     --bin-dir /target/sol-host/release --sbf-dir /target/sbf --key-dir /scratch --output-dir .zkapi/solana-acceptance
@@ -32,6 +35,9 @@ const DEPOSIT = 1_000_000_000; // 1 SOL
 const CAP = 12_000_000; // lamports per request: ~1.80 USD at $150, enough for one 1.5-credit vcii call
 const LEASE_TTL_SECONDS = 3600;
 const PYTH = { price: 15_000_000_000, conf: 1_000_000, exponent: -8 }; // $150.00 +/- $0.01
+const WALK_BPS = 20; // the walk stays within +/-20 bps of its center, so any two prices differ by < 50 bps (serverd tolerance)
+const JUMP_BPS = 200; // 'jump' scenario: -2%, far beyond the 50 bps tolerance
+const MAX_QUOTE_ATTEMPTS = 4;
 const VCII_ZK_BASE = process.env.VCII_ZK_BASE;
 const VCII_ZK_MANAGEMENT_KEY = process.env.VCII_ZK_MANAGEMENT_KEY;
 const VCII_BASE = process.env.VCII_BASE ?? VCII_ZK_BASE?.replace(/\/zk\/?$/, '');
@@ -69,13 +75,19 @@ function options(args) {
     const parsed = {
         binDir: path.join(ROOT, 'target/release'), sbfDir: path.join(ROOT, 'solana/target/deploy'),
         keyDir: path.join(ROOT, '.zkapi/solana-keys'), outputDir: path.join(ROOT, '.zkapi/solana-acceptance'),
+        refreshMs: 400, scenario: 'steady',
     };
     for (let i = 0; i < args.length; i++) {
         if (args[i] === '--help') return { help: true };
-        const key = { '--bin-dir': 'binDir', '--sbf-dir': 'sbfDir', '--key-dir': 'keyDir', '--output-dir': 'outputDir' }[args[i]];
+        const key = { '--bin-dir': 'binDir', '--sbf-dir': 'sbfDir', '--key-dir': 'keyDir', '--output-dir': 'outputDir',
+            '--refresh-ms': 'refreshMs', '--scenario': 'scenario' }[args[i]];
         assert.ok(key && args[i + 1], `Unknown or incomplete option: ${args[i]}`);
-        parsed[key] = path.resolve(args[++i]);
+        if (key === 'refreshMs') parsed[key] = Number(args[++i]);
+        else if (key === 'scenario') parsed[key] = args[++i];
+        else parsed[key] = path.resolve(args[++i]);
     }
+    assert.ok(Number.isSafeInteger(parsed.refreshMs) && parsed.refreshMs >= 100, '--refresh-ms must be >= 100');
+    assert.ok(['steady', 'jump'].includes(parsed.scenario), '--scenario must be steady or jump');
     return parsed;
 }
 
@@ -93,7 +105,7 @@ function expectedLamports(quote, microUsd) {
 async function main() {
     const opts = options(process.argv.slice(2));
     if (opts.help) {
-        console.log('Usage: VCII_ZK_BASE=... VCII_ZK_MANAGEMENT_KEY=... node scripts/solana-vcii-lease.mjs [--bin-dir D] [--sbf-dir D] [--key-dir D] [--output-dir D]\n'
+        console.log('Usage: VCII_ZK_BASE=... VCII_ZK_MANAGEMENT_KEY=... node scripts/solana-vcii-lease.mjs [--bin-dir D] [--sbf-dir D] [--key-dir D] [--output-dir D] [--refresh-ms 400] [--scenario steady|jump]\n'
             + 'Runs a disposable loopback solana-test-validator, real serverd, real proofs, mock Pyth account. See docs/solana-vcii-lease.md.');
         return;
     }
@@ -241,22 +253,26 @@ async function main() {
         console.log('program show:', shown.split(/\r?\n/).filter(l => /^(Program Id|Authority|Data Length)/.test(l)).join(' | '));
         assert.match(shown, /Authority: none/);
         await pyth('airdrop', { pubkey: updaterKey, lamports: Number(LAMPORTS_PER_SOL) });
-        // The server (correctly) refuses a lease whose quote was superseded by a newer finalized Pyth publication, so the
-        // refresher is serialized and can be paused around quote -> prove -> lease. Real feeds update on deviation/heartbeat.
-        let pythChain = Promise.resolve();
-        let pythPaused = false;
-        const refreshPyth = (force = false) => {
-            const run = pythChain.then(() => (pythPaused && !force) ? undefined
-                : pyth('pyth_update', { keypair: updaterFile, address: PYTH_SOL_USD_ACCOUNT, ...PYTH }));
-            pythChain = run.catch(() => {});
-            return run;
+        // Continuous refresher, like the real feed: every --refresh-ms a new publication (random walk within +/-WALK_BPS of
+        // `center`; `center` only moves in the 'jump' scenario). serverd accepts a quote that is no longer the latest as long as
+        // the lower-bound price has not fallen more than its tolerance (--native-quote-tolerance-bps, default 50).
+        let center = PYTH.price;
+        let walk = 0;
+        let publications = 0;
+        const nextPrice = () => {
+            walk = Math.max(-WALK_BPS, Math.min(WALK_BPS, walk + Math.round((Math.random() * 2 - 1) * 3)));
+            return Math.round(center * (1 + walk / 10_000));
         };
+        const refreshPyth = () => pyth('pyth_update', { keypair: updaterFile, address: PYTH_SOL_USD_ACCOUNT, ...PYTH, price: nextPrice() })
+            .then(value => { publications++; return value; });
         await refreshPyth();
+        const pythStart = Date.now();
         let updaterFailure;
         updater = (async () => {
             while (!interrupted && !updater?.stop) {
-                await delay(3000);
+                const started = Date.now();
                 try { await refreshPyth(); } catch (error) { updaterFailure = error; }
+                await delay(Math.max(0, opts.refreshMs - (Date.now() - started)));
             }
         })();
         updater.stop = false;
@@ -306,32 +322,50 @@ async function main() {
         }
         const tree = await waitFor('indexer snapshot', async () => wallet('wallet_snapshot_tree'));
         const merkle = await wallet('tree_path', { args: { snapshot: tree, note_id: 0, require_existing: true } });
-        // Publish a fresh price, wait until serverd sees it at finalized commitment, then freeze the feed for the proof.
-        const before = (await get(`${serverUrl}/v2/billing/quote`)).publish_time;
-        await refreshPyth(true);
-        pythPaused = true;
-        await pythChain;
-        const quote = await waitFor('finalized Pyth publication visible to serverd', async () => {
-            const candidate = await get(`${serverUrl}/v2/billing/quote`);
-            return candidate.publish_time > before && candidate;
-        }, 60_000);
-        assert.equal(quote.asset, 'native_sol');
-        console.log('QUOTE:', JSON.stringify({ asset: quote.asset, source: quote.source, price: quote.price, confidence: quote.confidence,
-            exponent: quote.exponent, feed_account: quote.feed_account, publish_time: quote.publish_time, posted_slot: quote.posted_slot }));
-        const payload = JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1, billing_quote: quote });
-        const id = `vcii-${randomUUID()}`;
-        const prepared = await wallet('prepare_request', { args: { payload, active_root: merkle.active_root,
-            merkle_siblings: merkle.siblings, client_request_id: id, request_time: Math.floor(Date.now() / 1000), created_at_ms: Date.now() } });
-        const issuedAt = Math.floor(Date.now() / 1000);
-        console.log(`quote age at lease submission: ${issuedAt - quote.publish_time}s (server limit 60s)`);
-        const issued = await request(`${serverUrl}/v2/openrouter/leases`, { method: 'POST', value: prepared.request });
-        assert.equal(issued.status, 201, `lease rejected: ${issued.status} ${JSON.stringify(issued.value).slice(0, 300)}`);
-        const lease = issued.value;
+        // quote -> prove (~13 s) -> lease, re-quoting and re-proving on a retriable native_quote_stale (bounded).
+        const id0 = `vcii-${randomUUID()}`;
+        let quote, prepared, id, lease, issuedAt;
+        let jumped = false;
+        for (let attempt = 1; ; attempt++) {
+            assert.ok(attempt <= MAX_QUOTE_ATTEMPTS, `native_quote_stale persisted after ${MAX_QUOTE_ATTEMPTS} attempts`);
+            quote = await get(`${serverUrl}/v2/billing/quote`);
+            assert.equal(quote.asset, 'native_sol');
+            console.log(`QUOTE (attempt ${attempt}):`, JSON.stringify({ asset: quote.asset, source: quote.source, price: quote.price, confidence: quote.confidence,
+                exponent: quote.exponent, feed_account: quote.feed_account, publish_time: quote.publish_time, posted_slot: quote.posted_slot }));
+            const payload = JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1, billing_quote: quote });
+            id = attempt === 1 ? id0 : `vcii-${randomUUID()}`;
+            const publishedBefore = publications;
+            if (opts.scenario === 'jump' && !jumped) {
+                jumped = true;
+                setTimeout(() => { center = Math.round(PYTH.price * (1 - JUMP_BPS / 10_000)); walk = 0;
+                    console.log(`!! price jumps -${JUMP_BPS} bps mid-proof (new center ${center})`); }, 1000);
+            }
+            prepared = await wallet('prepare_request', { args: { payload, active_root: merkle.active_root,
+                merkle_siblings: merkle.siblings, client_request_id: id, request_time: Math.floor(Date.now() / 1000), created_at_ms: Date.now() } });
+            if (opts.scenario === 'jump' && attempt === 1) {
+                // serverd reads Pyth at finalized commitment (~15 s behind the tip here), so on a fast prover the jump may not be
+                // visible yet; a slower proof would simply have taken this long. Wait until the finalized feed shows it.
+                await waitFor('finalized feed reflects the jump', async () =>
+                    BigInt((await get(`${serverUrl}/v2/billing/quote`)).price) * 10_000n < BigInt(quote.price) * BigInt(10_000 - 2 * 50), 60_000);
+            }
+            issuedAt = Math.floor(Date.now() / 1000);
+            const latest = await get(`${serverUrl}/v2/billing/quote`);
+            console.log(`${publications - publishedBefore} newer Pyth publications during proving; quote age at lease submission: ${issuedAt - quote.publish_time}s (server limit 60s); `
+                + `quote is ${latest.publish_time > quote.publish_time || latest.posted_slot > quote.posted_slot ? 'NOT the latest' : 'still the latest'} `
+                + `(latest price ${latest.price} vs quoted ${quote.price})`);
+            const issued = await request(`${serverUrl}/v2/openrouter/leases`, { method: 'POST', value: prepared.request });
+            if (issued.status === 201) { lease = issued.value; break; }
+            assert.ok(issued.status === 409 && issued.value.error_code === 'native_quote_stale' && issued.value.retriable === true,
+                `lease rejected: ${issued.status} ${JSON.stringify(issued.value).slice(0, 300)}`);
+            console.log(`lease refused: HTTP 409 ${issued.value.error_code} retriable=${issued.value.retriable}; nothing reserved, re-quoting and re-proving`);
+            assert.equal(opts.scenario, 'jump', 'a price walk inside the tolerance must never be refused');
+            await wallet('discard_request');
+        }
+        if (opts.scenario === 'jump') assert.ok(jumped && id !== id0, 'the jump scenario must have exercised the retry');
         assert.match(lease.api_key, /^vcii_zk_/, 'serverd must hand back the key minted by vcii');
         const { api_key: _redacted, ...leaseMeta } = lease;
         console.log('LEASE (key redacted):', JSON.stringify(leaseMeta));
-        console.log(`lease key length ${lease.api_key.length}; expires_at - issued ~ ${lease.expires_at - issuedAt}s (serverd --openrouter-lease-ttl-seconds ${LEASE_TTL_SECONDS})`);
-        pythPaused = false;
+        console.log(`lease key length ${lease.api_key.length}; expires_at - issued ~ ${lease.expires_at - issuedAt}s (serverd --openrouter-lease-ttl-seconds ${LEASE_TTL_SECONDS}); ${publications} Pyth publications in ${((Date.now() - pythStart) / 1000).toFixed(0)}s (one per ${((Date.now() - pythStart) / publications).toFixed(0)} ms on average)`);
         const replay = await request(`${serverUrl}/v2/openrouter/leases`, { method: 'POST', value: prepared.request });
         assert.equal(replay.status, 409, 'active lease replay must not mint another runtime key');
         const call = await mcpCall(lease.api_key, 'market_pulse');
@@ -346,7 +380,7 @@ async function main() {
         }, 90_000);
         const response = recovery.request_response;
         const expected = expectedLamports(quote, 1_500_000);
-        console.log('SETTLEMENT: charge_applied (lamports) =', response.charge_applied, `(expected ${expected}: 1.5 USD at ($150 - $0.01 confidence), ceil)`,
+        console.log('SETTLEMENT: charge_applied (lamports) =', response.charge_applied, `(expected ${expected}: 1.5 USD at the accepted quote's price minus confidence, ceil)`,
             'response_payload =', response.response_payload);
         assert.equal(JSON.parse(response.response_payload).usage_usd, 1.5, 'vcii usage (1 credit x 1.5 USD) must reach the settled charge');
         assert.equal(BigInt(response.charge_applied), expected, 'charge must equal the ceil-converted vcii usage at the accepted quote');

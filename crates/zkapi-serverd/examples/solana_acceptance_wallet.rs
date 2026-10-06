@@ -500,6 +500,12 @@ impl WalletDriver {
                 self.journal = Some(prepared.journal);
                 Ok(json!({"request": prepared.request}))
             }
+            "discard_request" => {
+                // Only after serverd answered a retriable 409 that reserved nothing (native_quote_stale):
+                // mirrors the browser SDK clearing its journal once the server confirms non-acceptance.
+                self.journal = None;
+                Ok(self.status())
+            }
             "complete_response" => {
                 let next = zkapi_browser::complete_response(
                     self.config.as_ref().context("initialize the wallet first")?,

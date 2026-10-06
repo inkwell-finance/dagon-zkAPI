@@ -1,0 +1,557 @@
+--- a/crates/zkapi-cli/src/main.rs
++++ b/crates/zkapi-cli/src/main.rs
+@@ -160,6 +160,10 @@
+     pyth_max_age_seconds: u64,
+     #[arg(long, default_value_t = 100, requires = "solana_rpc_url")]
+     pyth_max_confidence_bps: u16,
++    /// Accept a proof-bound quote older than the latest finalized Pyth publication
++    /// while that publication's lower-bound price has not fallen more than this.
++    #[arg(long, default_value_t = 50, requires = "solana_rpc_url")]
++    native_quote_tolerance_bps: u16,
+ }
+ 
+ impl SolanaServerArgs {
+@@ -191,6 +195,7 @@
+                 feed_id: self.pyth_feed_id,
+                 max_age_seconds: self.pyth_max_age_seconds,
+                 max_confidence_bps: self.pyth_max_confidence_bps,
++                quote_tolerance_bps: self.native_quote_tolerance_bps,
+             },
+         })
+     }
+--- a/crates/zkapi-serverd/src/error.rs
++++ b/crates/zkapi-serverd/src/error.rs
+@@ -15,6 +15,12 @@
+     #[error("native billing quote superseded before request acceptance")]
+     NativeQuoteSuperseded,
+ 
++    /// The proof-bound Solana quote is no longer acceptable (the finalized
++    /// price moved beyond the server's tolerance, or the quote is unknown or
++    /// outside its age limit). Nothing was reserved: re-quote and re-prove.
++    #[error("native billing quote is stale; request a fresh quote and prove again")]
++    NativeQuoteStale,
++
+     #[error("invalid proof: {0}")]
+     InvalidProof(String),
+ 
+@@ -71,6 +77,7 @@
+         match self {
+             ServerError::NativeQuoteExpired => "native_quote_expired",
+             ServerError::NativeQuoteSuperseded => "native_quote_superseded",
++            ServerError::NativeQuoteStale => "native_quote_stale",
+             ServerError::InvalidProof(_) => "invalid_proof",
+             ServerError::StaleRoot { .. } => "stale_root",
+             ServerError::Replay => "replay",
+@@ -93,6 +100,7 @@
+         match self {
+             ServerError::NativeQuoteExpired => true,
+             ServerError::NativeQuoteSuperseded => false,
++            ServerError::NativeQuoteStale => true,
+             ServerError::StaleRoot { .. } => true,
+             ServerError::Internal(_) => true,
+             ServerError::Database(_) => true,
+--- a/crates/zkapi-serverd/src/processor_v2.rs
++++ b/crates/zkapi-serverd/src/processor_v2.rs
+@@ -734,7 +734,9 @@
+         } else {
+             let oracle = &self.billing;
+             match oracle.validate(&quote, current_timestamp()).await {
+-                Err(ServerError::NativeQuoteSuperseded) => "superseded_unaccepted",
++                Err(ServerError::NativeQuoteSuperseded | ServerError::NativeQuoteStale) => {
++                    "superseded_unaccepted"
++                }
+                 Err(ServerError::NativeQuoteExpired)
+                     if quote.expires_at() <= current_timestamp() =>
+                 {
+--- a/crates/zkapi-serverd/src/routes.rs
++++ b/crates/zkapi-serverd/src/routes.rs
+@@ -743,7 +743,8 @@
+         | ServerError::ProtocolMismatch(_) => StatusCode::BAD_REQUEST,
+         ServerError::StaleRoot { .. }
+         | ServerError::NativeQuoteExpired
+-        | ServerError::NativeQuoteSuperseded => StatusCode::CONFLICT,
++        | ServerError::NativeQuoteSuperseded
++        | ServerError::NativeQuoteStale => StatusCode::CONFLICT,
+         ServerError::Replay | ServerError::NullifierUsed => StatusCode::CONFLICT,
+         ServerError::LeasePending | ServerError::LeaseSettlementPending { .. } => {
+             StatusCode::CONFLICT
+--- a/crates/zkapi-serverd/src/sol_billing.rs
++++ b/crates/zkapi-serverd/src/sol_billing.rs
+@@ -1,5 +1,5 @@
+ //! Official Pyth Receiver account adapter; no account type crosses this module.
+-use std::time::Duration;
++use std::{collections::VecDeque, sync::Mutex, time::Duration};
+ 
+ use anchor_lang::{AccountDeserialize, Owner};
+ use base64::Engine;
+@@ -19,8 +19,18 @@
+     pub feed_id: String,
+     pub max_age_seconds: u64,
+     pub max_confidence_bps: u16,
++    /// How far (in bps) the latest finalized lower-bound price may have fallen
++    /// below the proof-bound quote's lower bound before a lease is refused.
++    pub quote_tolerance_bps: u16,
+ }
+ 
++/// Default tolerance: well inside the 1% confidence ceiling, wide enough for
++/// the price movement of one proving round at SOL/USD's typical volatility.
++pub const DEFAULT_QUOTE_TOLERANCE_BPS: u16 = 50;
++pub const MAX_QUOTE_TOLERANCE_BPS: u16 = 500;
++/// Bounded memory of finalized publications this server has itself read.
++const QUOTE_HISTORY_LIMIT: usize = 2048;
++
+ pub fn parse_solana_identity(name: &str, value: &str) -> anyhow::Result<[u8; 32]> {
+     let bytes: [u8; 32] = bs58::decode(value)
+         .into_vec()?
+@@ -53,6 +63,10 @@
+             (1..=100).contains(&self.max_confidence_bps),
+             "Pyth max confidence must be in 1..=100 bps"
+         );
++        anyhow::ensure!(
++            self.quote_tolerance_bps <= MAX_QUOTE_TOLERANCE_BPS,
++            "Pyth quote tolerance must be in 0..={MAX_QUOTE_TOLERANCE_BPS} bps"
++        );
+         Ok(())
+     }
+ }
+@@ -61,6 +75,11 @@
+     rpc_url: String,
+     genesis_hash: [u8; 32],
+     pins: SolanaBillingPins,
++    quote_tolerance_bps: u16,
++    /// Finalized publications this server has read. A proof-bound quote older
++    /// than the latest is only accepted if it is one of these, so a client can
++    /// never present an invented price that merely lies within the tolerance.
++    seen: Mutex<VecDeque<SolanaBillingQuote>>,
+     http: reqwest::Client,
+ }
+ 
+@@ -91,10 +110,13 @@
+         pins.receiver_program = config.receiver_program;
+         pins.max_age_seconds = config.max_age_seconds;
+         pins.max_confidence_bps = config.max_confidence_bps;
++        let quote_tolerance_bps = config.quote_tolerance_bps;
+         Ok(Self {
+             rpc_url,
+             genesis_hash,
+             pins,
++            quote_tolerance_bps,
++            seen: Mutex::new(VecDeque::new()),
+             http: reqwest::Client::builder()
+                 .timeout(Duration::from_secs(15))
+                 .redirect(reqwest::redirect::Policy::none())
+@@ -157,7 +179,28 @@
+             {"encoding":"base64","commitment":"finalized"}]),
+             )
+             .await?;
+-        self.decode_quote(&result, now)
++        let quote = self.decode_quote(&result, now)?;
++        self.remember(&quote, now);
++        Ok(quote)
++    }
++
++    fn remember(&self, quote: &SolanaBillingQuote, now: u64) {
++        let mut seen = self.seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
++        seen.retain(|old| old.expires_at > now);
++        if !seen.iter().any(|old| old == quote) {
++            if seen.len() >= QUOTE_HISTORY_LIMIT {
++                seen.pop_front();
++            }
++            seen.push_back(quote.clone());
++        }
++    }
++
++    fn was_seen(&self, quote: &SolanaBillingQuote) -> bool {
++        self.seen
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner())
++            .iter()
++            .any(|old| old == quote)
+     }
+ 
+     fn decode_quote(&self, result: &Value, now: u64) -> Result<SolanaBillingQuote, ServerError> {
+@@ -245,15 +288,145 @@
+     fn validate<'a>(&'a self, quote: &'a BillingQuote, now: u64) -> BillingFuture<'a, ()> {
+         Box::pin(async move {
+             self.assert_fresh(quote, now)?;
+-            let current = BillingQuote::NativeSol(self.finalized_quote(now).await?);
+-            if &current != quote {
+-                return Err(ServerError::NativeQuoteSuperseded);
++            let BillingQuote::NativeSol(quoted) = quote else {
++                return Err(invalid("ETH quote cannot use the SOL oracle"));
++            };
++            let latest = self.finalized_quote(now).await?;
++            if &latest != quoted && !self.was_seen(quoted) {
++                // Restarted server or a quote this server never published.
++                return Err(ServerError::NativeQuoteStale);
+             }
+-            Ok(())
++            assess_quote_against_latest(quoted, &latest, self.quote_tolerance_bps)
+         })
+     }
+ }
+ 
++/// The proof binds `quoted`, and its price alone sizes the lease budget and the
++/// settlement conversion, so serverd verifies against it rather than rewriting
++/// it. A fall of the latest finalized lower bound (price - confidence, the
++/// price billing uses) is the only move that can under-collateralise the
++/// server, so it alone is capped by `tolerance_bps`; a rise only favours it.
++/// The quote's own freshness is enforced by the caller.
++pub(crate) fn assess_quote_against_latest(
++    quoted: &SolanaBillingQuote,
++    latest: &SolanaBillingQuote,
++    tolerance_bps: u16,
++) -> Result<(), ServerError> {
++    if quoted == latest {
++        return Ok(());
++    }
++    if latest.publish_time < quoted.publish_time
++        || latest.posted_slot < quoted.posted_slot
++        || latest.exponent != quoted.exponent
++    {
++        return Err(ServerError::NativeQuoteStale);
++    }
++    let lower = |quote: &SolanaBillingQuote| -> Result<u128, ServerError> {
++        let price: u64 = quote.price.parse().map_err(|_| invalid("invalid SOL price"))?;
++        let confidence: u64 = quote
++            .confidence
++            .parse()
++            .map_err(|_| invalid("invalid SOL confidence"))?;
++        price
++            .checked_sub(confidence)
++            .filter(|value| *value > 0)
++            .map(u128::from)
++            .ok_or_else(|| invalid("SOL lower-bound price must be positive"))
++    };
++    let (quoted_lower, latest_lower) = (lower(quoted)?, lower(latest)?);
++    // latest_lower < quoted_lower * (1 - tolerance), in exact integers.
++    if latest_lower * 10_000 < quoted_lower * (10_000 - u128::from(tolerance_bps)) {
++        return Err(ServerError::NativeQuoteStale);
++    }
++    Ok(())
++}
++
+ fn invalid(message: &str) -> ServerError {
+     ServerError::InvalidRequest(message.into())
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn quote(price: u64, confidence: u64, publish_time: u64, posted_slot: u64) -> SolanaBillingQuote {
++        SolanaBillingQuote {
++            asset: "native_sol".into(),
++            source: PYTH_SOURCE.into(),
++            credit_unit: "lamports".into(),
++            base_units_per_asset: LAMPORTS_PER_SOL,
++            chain_id: "1".into(),
++            deployment_binding: Default::default(),
++            backend: "dagon.solana.groth16.v1".into(),
++            network: "localnet".into(),
++            vault: "vault".into(),
++            feed_id: SOL_USD_FEED_ID.into(),
++            feed_account: "feed".into(),
++            receiver_program: "receiver".into(),
++            price: price.to_string(),
++            exponent: -8,
++            confidence: confidence.to_string(),
++            publish_time,
++            expires_at: publish_time + 60,
++            posted_slot,
++        }
++    }
++
++    #[test]
++    fn older_quote_is_accepted_within_tolerance_only_against_a_price_fall() {
++        // $150.00 +/- $0.01 -> lower bound 14_999_000_000.
++        let quoted = quote(15_000_000_000, 1_000_000, 1_000, 10);
++        let assess = |latest: &SolanaBillingQuote, bps| assess_quote_against_latest(&quoted, latest, bps);
++        assess(&quoted, 0).unwrap();
++        // A newer publication at the same price, or any rise, favours the server.
++        assess(&quote(15_000_000_000, 1_000_000, 1_001, 11), 0).unwrap();
++        assess(&quote(16_000_000_000, 1_000_000, 1_001, 11), 0).unwrap();
++        // A 50 bps fall of the lower bound passes a 50 bps tolerance; 51 bps does not.
++        // Exact lower-bound fall: 14_999_000_000 * (10_000 - bps) / 10_000 plus the same confidence.
++        let fall = |bps: u64| quote(14_999_000_000 * (10_000 - bps) / 10_000 + 1_000_000, 1_000_000, 1_001, 11);
++        assess(&fall(49), 50).unwrap();
++        assess(&fall(50), 50).unwrap();
++        assert!(matches!(assess(&fall(51), 50), Err(ServerError::NativeQuoteStale)));
++        assert!(matches!(assess(&fall(1), 0), Err(ServerError::NativeQuoteStale)));
++        // Confidence widening lowers the billing price and counts as a fall.
++        assert!(matches!(
++            assess(&quote(15_000_000_000, 150_000_000, 1_001, 11), 50),
++            Err(ServerError::NativeQuoteStale)
++        ));
++    }
++
++    #[test]
++    fn latest_that_is_not_a_later_publication_of_the_same_feed_is_stale() {
++        let quoted = quote(15_000_000_000, 1_000_000, 1_000, 10);
++        let stale = |latest| matches!(
++            assess_quote_against_latest(&quoted, &latest, 500),
++            Err(ServerError::NativeQuoteStale)
++        );
++        assert!(stale(quote(15_000_000_000, 1_000_001, 999, 10)));
++        assert!(stale(quote(15_000_000_000, 1_000_001, 1_000, 9)));
++        let mut other_exponent = quote(15_000_000_000, 1_000_000, 1_001, 11);
++        other_exponent.exponent = -7;
++        assert!(stale(other_exponent));
++    }
++
++    #[test]
++    fn stale_quote_is_retriable_conflict_with_its_own_code() {
++        assert_eq!(ServerError::NativeQuoteStale.error_code(), "native_quote_stale");
++        assert!(ServerError::NativeQuoteStale.is_retriable());
++    }
++
++    #[test]
++    fn tolerance_is_bounded() {
++        let mut config = PythBillingConfig {
++            price_account: bs58::encode([8; 32]).into_string(),
++            receiver_program: PriceUpdateV2::owner().to_string(),
++            feed_id: SOL_USD_FEED_ID.into(),
++            max_age_seconds: 60,
++            max_confidence_bps: 100,
++            quote_tolerance_bps: MAX_QUOTE_TOLERANCE_BPS,
++        };
++        config.validate().unwrap();
++        config.quote_tolerance_bps += 1;
++        assert!(config.validate().is_err());
++    }
++}
+--- a/crates/zkapi-serverd/tests/solana_startup.rs
++++ b/crates/zkapi-serverd/tests/solana_startup.rs
+@@ -122,6 +122,7 @@
+                     feed_id: SOL_USD_FEED_ID.into(),
+                     max_age_seconds: 30,
+                     max_confidence_bps: 100,
++                    quote_tolerance_bps: 50,
+                 },
+             }),
+             openrouter_leases: Some(OpenRouterLeaseConfig {
+@@ -408,3 +409,91 @@
+         assert!(config.validate_native_mode().is_err());
+     }
+ }
++
++#[derive(Clone)]
++struct LiveRpc {
++    accounts: Arc<std::sync::Mutex<HashMap<String, Value>>>,
++    genesis: String,
++}
++async fn live_rpc(State(state): State<LiveRpc>, Json(request): Json<Value>) -> Json<Value> {
++    let result = match request["method"].as_str().unwrap() {
++        "getGenesisHash" => json!(state.genesis),
++        "getAccountInfo" => {
++            let value = state
++                .accounts
++                .lock()
++                .unwrap()
++                .get(request["params"][0].as_str().unwrap())
++                .cloned()
++                .unwrap_or(Value::Null);
++            json!({"context":{"slot":100},"value":value})
++        }
++        other => panic!("unexpected RPC {other}"),
++    };
++    Json(json!({"jsonrpc":"2.0","id":1,"result":result}))
++}
++
++#[tokio::test]
++async fn quote_older_than_latest_is_accepted_within_tolerance_and_otherwise_retriably_stale() {
++    use zkapi_serverd::error::ServerError;
++    let dir = tempfile::tempdir().unwrap();
++    let mut f = Fixture::new(dir.path().join("unused.db").to_string_lossy().into_owned());
++    f.serialize_accounts();
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    f.config.solana.as_mut().unwrap().ledger.rpc_url =
++        format!("http://{}", listener.local_addr().unwrap());
++    let accounts = Arc::new(std::sync::Mutex::new(f.accounts.clone()));
++    let router = Router::new().route("/", post(live_rpc)).with_state(LiveRpc {
++        accounts: accounts.clone(),
++        genesis: f.genesis.clone(),
++    });
++    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
++    let price_account = f.config.solana.as_ref().unwrap().billing.price_account.clone();
++    // Publish a newer finalized price: (price, conf, publish_time delta, slot).
++    let publish = |price: i64, conf: u64, seconds: i64, slot: u64| {
++        let mut update = f.price.clone();
++        update.price_message.price = price;
++        update.price_message.conf = conf;
++        update.price_message.publish_time += seconds;
++        update.posted_slot = slot;
++        let mut data = Vec::new();
++        update.try_serialize(&mut data).unwrap();
++        data.resize(PriceUpdateV2::LEN, 0);
++        accounts
++            .lock()
++            .unwrap()
++            .insert(price_account.clone(), account(PriceUpdateV2::owner(), false, data));
++    };
++    let signer = ServerSigner::new(&f.config.state_seed, &f.config.clear_seed);
++    let backends = prepare_solana_backends(&f.config, &signer).await.unwrap();
++    let quote = backends.billing.quote(now()).await.unwrap();
++    backends.billing.validate(&quote, now()).await.unwrap();
++
++    // A newer publication within 50 bps (and any rise) leaves the older proof-bound quote valid.
++    publish(14_990_000_000, 15_000_000, 1, 11);
++    backends.billing.validate(&quote, now()).await.unwrap();
++    publish(15_500_000_000, 15_000_000, 2, 12);
++    backends.billing.validate(&quote, now()).await.unwrap();
++    // A forged quote that only lies within tolerance of the latest was never read by this server.
++    let BillingQuote::NativeSol(sol) = &quote else { panic!("expected SOL") };
++    let mut forged = sol.clone();
++    forged.price = "15400000000".into();
++    assert!(matches!(
++        backends.billing.validate(&BillingQuote::NativeSol(forged), now()).await,
++        Err(ServerError::NativeQuoteStale)
++    ));
++    // A fall beyond tolerance is retriably stale, never silently priced at the old quote.
++    publish(14_800_000_000, 15_000_000, 3, 13);
++    let error = backends.billing.validate(&quote, now()).await.unwrap_err();
++    assert!(matches!(error, ServerError::NativeQuoteStale), "{error:?}");
++    assert!(error.is_retriable());
++    // A fresh quote taken after the move validates again.
++    let fresh = backends.billing.quote(now()).await.unwrap();
++    backends.billing.validate(&fresh, now()).await.unwrap();
++    // The quoted publication must still be within the max price age.
++    assert!(matches!(
++        backends.billing.validate(&quote, now() + 31).await,
++        Err(ServerError::NativeQuoteExpired)
++    ));
++    task.abort();
++}
+--- a/docs/SOLANA_SERVER.md
++++ b/docs/SOLANA_SERVER.md
+@@ -85,6 +85,11 @@
+ - Price account: explicitly configured, never supplied by the API caller.
+ - `--pyth-max-age-seconds`: default 30, allowed `1..=60`.
+ - `--pyth-max-confidence-bps`: default 100, allowed `1..=100` (at most 1%).
++- `--native-quote-tolerance-bps`: default 50, allowed `0..=500`. The quote is bound into the proof and
++  prices the lease, so a lease whose quote is no longer the latest finalized publication is still accepted when the
++  quote is one this server read, is inside the price-age limit, and the latest finalized lower bound (price minus
++  confidence, the price billing uses) has not fallen more than this below the quoted one. A rise only favours the
++  server. Otherwise `409 native_quote_stale` (retriable, nothing reserved): fetch a new quote and prove again.
+ - Full verification only; partial guardian verification is rejected.
+ - Non-executable data account, exact official allocated length, canonical official
+   serialization with zero trailing allocation padding, and posted slot no later
+--- a/sdk/services/browserWalletRuntime.js
++++ b/sdk/services/browserWalletRuntime.js
+@@ -159,13 +159,16 @@
+     });
+ }
+ 
++// Fresh quote/proof attempts after `native_quote_stale` before surfacing the error.
++const MAX_STALE_QUOTE_ATTEMPTS = 4;
++
+ function isExplicitlyRetriableLeaseError(error) {
+     const explicitlyRetriable = error?.data?.retriable === true
+         || error?.data?.error?.retriable === true;
+     // These responses require a new proof or local lost-key reconciliation;
+     // repeatedly sending the same lease request cannot resolve either state.
+     return explicitlyRetriable
+-        && !['stale_root', 'native_quote_expired', 'native_quote_superseded', 'lease_pending', 'lease_settlement_pending'].includes(error?.code);
++        && !['stale_root', 'native_quote_expired', 'native_quote_superseded', 'native_quote_stale', 'lease_pending', 'lease_settlement_pending'].includes(error?.code);
+ }
+ 
+ function isExplicitlyRetriableLeaseRetirementError(error) {
+@@ -2364,7 +2367,7 @@
+         try {
+             return await this.requestLeaseWithRetry(request, onProgress, signal);
+         } catch (error) {
+-            if (['native_quote_expired', 'native_quote_superseded'].includes(error?.code)) {
++            if (['native_quote_expired', 'native_quote_superseded', 'native_quote_stale'].includes(error?.code)) {
+                 await this.recoverUnacceptedNativeQuote(request, signal);
+             }
+             throw error;
+@@ -2438,13 +2441,27 @@
+                 request = await this.prepareLeaseRequest(onProgress, signal, spendingLimitUsd);
+             }
+             let lease;
+-            try {
+-                lease = await this.requestLeaseWithQuoteRecovery(request, onProgress, signal);
+-            } catch (error) {
+-                if (error.code === 'stale_root') {
+-                    await this.commit({ ...this.runtime, journal: null });
++            // A quote that the finalized price has since moved away from is rejected before any
++            // reservation (409, retriable). After the server confirms nothing was accepted the
++            // journal is cleared, so quote and prove again a bounded number of times.
++            for (let staleQuoteAttempt = 1; ; staleQuoteAttempt += 1) {
++                try {
++                    lease = await this.requestLeaseWithQuoteRecovery(request, onProgress, signal);
++                    break;
++                } catch (error) {
++                    if (error.code === 'native_quote_stale'
++                        && staleQuoteAttempt < MAX_STALE_QUOTE_ATTEMPTS
++                        && !this.runtime?.journal) {
++                        throwIfAborted(signal);
++                        onProgress('syncing', 'The price moved while proving. Getting a fresh quote…');
++                        request = await this.prepareLeaseRequest(onProgress, signal, spendingLimitUsd);
++                        continue;
++                    }
++                    if (error.code === 'stale_root') {
++                        await this.commit({ ...this.runtime, journal: null });
++                    }
++                    throw error;
+                 }
+-                throw error;
+             }
+             await this.verifyLease(
+                 lease,
+--- a/sdk/test/browser-wallet-lease-retry.test.mjs
++++ b/sdk/test/browser-wallet-lease-retry.test.mjs
+@@ -537,6 +537,44 @@
+     assert.equal(runtime.activeLease.sessionId, 'chat-session');
+ });
+ 
++for (const [failures, expectAttempts] of [[2, 3], [10, 4]]) test(`issueLease re-quotes and re-proves on native_quote_stale up to a bound (${failures} stale answers)`, async () => {
++    const runtime = runtimeForLeaseRequests();
++    runtime.manifest = { deployment_id: 'focused-test' };
++    runtime.runtime = { state: { note_id: 44, current_balance: 5_000_000 }, journal: null };
++    runtime.ownerId = 'test-owner';
++    runtime.reload = async () => runtime.runtime;
++    runtime.recoverPendingLocked = async () => {};
++    let prepareCalls = 0;
++    runtime.prepareLeaseRequest = async () => {
++        prepareCalls += 1;
++        return {
++            client_request_id: `request-${prepareCalls}`,
++            payload: JSON.stringify({ billing_quote: nativeQuote(runtime.config.funding) }),
++            public_inputs: { solvency_bound: 1_000_000 }
++        };
++    };
++    let stale = failures;
++    runtime.requestLeaseWithQuoteRecovery = async request => {
++        if (stale-- > 0) {
++            // recoverUnacceptedNativeQuote has cleared the journal by now.
++            throw new BrowserWalletHttpError('stale', 409, 'native_quote_stale', { retriable: true });
++        }
++        return { client_request_id: request.client_request_id, status: 'active', api_key: 'k',
++            expires_at: 2_000_000_000, settle_after: 2_000_000_060, spending_limit_usd: 1 };
++    };
++    runtime.verifyLease = async () => {};
++    runtime.commit = async next => { runtime.runtime = next; return next; };
++    runtime.scheduleSettlement = () => {};
++
++    if (failures < expectAttempts) {
++        const lease = await runtime.issueLease('chat-session');
++        assert.equal(lease.client_request_id, `request-${expectAttempts}`);
++    } else {
++        await assert.rejects(runtime.issueLease('chat-session'), error => error.code === 'native_quote_stale');
++    }
++    assert.equal(prepareCalls, expectAttempts);
++});
++
+ for (const selectedCap of [1, 4.5, 6]) test(`issueLease settles the original journal before exposing a selected $${selectedCap} key`, { timeout: 2_000 }, async () => {
+     const runtime = runtimeForLeaseRequests();
+     runtime.manifest = { deployment_id: 'focused-test' };
+@@ -975,7 +1013,7 @@
+     assert.deepEqual(JSON.parse(bodies[0]), request);
+ });
+ 
+-for (const code of ['lease_pending', 'lease_settlement_pending', 'native_quote_expired', 'native_quote_superseded']) {
++for (const code of ['lease_pending', 'lease_settlement_pending', 'native_quote_expired', 'native_quote_superseded', 'native_quote_stale']) {
+     test(`lease issuance never retries a proof requiring reconciliation: ${code}`, async () => {
+         const runtime = runtimeForLeaseRequests();
+         const error = new BrowserWalletHttpError(

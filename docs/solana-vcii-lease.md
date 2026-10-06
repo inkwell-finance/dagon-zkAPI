@@ -16,7 +16,7 @@ provisioning/usage/settlement, the wallet accepting the server-signed settlement
 Mocked: the Pyth SOL/USD account. `solana/dev/mock-pyth-writer` is a ~20-line program loaded at the Pyth receiver program ID
 (`rec5EKMG...`) that copies instruction data into an account it owns. The harness fills the pre-created account at
 `7UVimffx...` (Pyth's SOL/USD shard-0 address) with an official-SDK-serialized `PriceUpdateV2` (Full verification, the real
-SOL/USD feed ID, correct length and zero padding) at a fixed `$150.00 +/- $0.01`, refreshed every 3 s with the current
+SOL/USD feed ID, correct length and zero padding) at `$150.00 +/- $0.01` (random walk of +/-20 bps), refreshed every 400 ms (random walk, see below) with the current
 time and a finalized `posted_slot`. No Wormhole/guardian verification and no real market price. A static clone of the real
 account cannot work because serverd allows at most 60 s of price age.
 
@@ -55,8 +55,36 @@ when creating its accounts directories and the default Podman seccomp profile bl
 - **u64 chain IDs.** The derived Solana chain ID usually exceeds 2^53 and the Rust public-input structs serialize it as a JSON
   number. A JS client that `JSON.parse`s and re-sends the request rounds it and serverd answers `protocol_mismatch`. The
   browser SDK's WASM layer stringifies it; the Node helper does the same.
-- **Quote supersession.** serverd rejects a lease (`409 native_quote_superseded`) if a newer finalized Pyth publication exists
-  between the quote fetch and the lease POST; proving took ~13 s here. The harness serializes and pauses its price refresher
-  across quote -> prove -> lease. A real feed updating faster than a client can prove would make lease issuance racy, so
-  clients should treat that error as retryable with a fresh quote.
+- **Quote supersession and `native_quote_stale`.** The quote is bound into the proof (it is part of the signed payload), so
+  a ~13 s proof is always made against a quote that is no longer the latest finalized Pyth publication. serverd used to
+  answer such a lease with a non-retriable `409 native_quote_superseded`, which a feed publishing every few hundred ms
+  would trigger on essentially every lease. It now verifies the proof against the QUOTED price (unchanged) and then compares
+  the latest finalized publication: the lease is accepted if the quote is one this server itself read from the finalized
+  feed (an invented price inside the tolerance is refused), is within the price-age limit (`--pyth-max-age-seconds`, at
+  most 60 s), and the latest lower-bound price (price minus confidence, what billing converts with) has not fallen more than
+  `--native-quote-tolerance-bps` (default 50) below the quoted lower bound. A price rise only favours the server. Anything
+  else is `409 native_quote_stale`, `retriable: true`, nothing reserved: re-quote and prove again. The browser SDK does this
+  (up to 4 attempts); the harness does it explicitly. The exposure per lease is bounded by the tolerance because the USD
+  budget and the settlement conversion stay a deterministic function of the proof-bound quote (the client and the recovery
+  paths re-derive them). zkapi-clientd has no Solana support yet; its native-ETH retry list is unchanged.
+  The harness now refreshes the mock feed continuously (`--refresh-ms`, default 400) as a bounded random walk (+/-20 bps),
+  and `--scenario jump` drops the price 2% mid-proof to exercise the stale -> re-quote -> re-prove path.
 - The finalized indexer lags the chain by roughly 15 s (about 32 slots); the harness polls instead of sleeping.
+
+## Applying the quote-tolerance change onto the Solana-port work in progress
+
+The serverd/CLI/SDK part of the fix edits files that are still uncommitted in the Solana port, so it is not committed as
+source here. `patches/native-quote-tolerance.patch` is a unified diff (paths relative to the repo root, `-p1`) of only that
+change against the working tree it was made on. Apply it on top of the port:
+
+```sh
+git apply --check patches/native-quote-tolerance.patch && git apply patches/native-quote-tolerance.patch
+```
+
+It touches `crates/zkapi-serverd/src/{sol_billing,error,routes,processor_v2}.rs`, `crates/zkapi-serverd/tests/solana_startup.rs`,
+`crates/zkapi-cli/src/main.rs`, `sdk/services/browserWalletRuntime.js`, `sdk/test/browser-wallet-lease-retry.test.mjs` and
+`docs/SOLANA_SERVER.md` (new flag `--native-quote-tolerance-bps`, new `PythBillingConfig::quote_tolerance_bps` field, new error
+`NativeQuoteStale`/`native_quote_stale`). Tests: `cargo test -p zkapi-serverd -p zkapi-cli` and
+`node --test sdk/test/browser-wallet-lease-retry.test.mjs`.
+
+The harness, wallet example (`discard_request` command) and this document are committed directly.
