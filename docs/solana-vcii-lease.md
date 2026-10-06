@@ -151,7 +151,7 @@ re-prove (`[409, 201]`). Build clientd statically for the Linux container:
 `CGO_ENABLED=0 go build -o zkapi-clientd ./cmd/zkapi-clientd` (in `zkapi-clientd/`), then
 `node scripts/solana-vcii-lease.mjs ... --client clientd --clientd-bin /path/zkapi-clientd`. Go unit tests:
 `podman run --rm -v <worktree>:/src -w /src/zkapi-clientd golang:1.25 go test ./...` (a CRLF checkout breaks two embedded-manifest
-hash tests; run in a copy normalised with `sed -i 's/$//'`).
+hash tests; run in a copy normalised with `sed -i 's/\r$//'`).
 
 Known SDK mismatch (not touched here): `sdk/services/zkapiNativeSol.mjs` validates a quote with `source: "pyth_receiver"`,
 `published_at` and `price_account`, while serverd's quote carries `source: "pyth_solana_receiver"`, `publish_time` and
