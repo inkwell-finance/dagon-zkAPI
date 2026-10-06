@@ -88,6 +88,24 @@ It touches `crates/zkapi-serverd/src/{sol_billing,error,routes,processor_v2}.rs`
 `NativeQuoteStale`/`native_quote_stale`). Tests: `cargo test -p zkapi-serverd -p zkapi-cli` and
 `node --test sdk/test/browser-wallet-lease-retry.test.mjs`.
 
+## Applying the SDK native-SOL schema fix
+
+`sdk/services/zkapiNativeSol.mjs` (owner WIP, uncommitted) validated quotes against a schema serverd never emitted
+(`source: 'pyth_receiver'`, `published_at`, `price_account`), so it rejected every real quote, and `sameSolanaQuote`
+compared the same wrong keys, which made the lease/receipt quote-equality check vacuous. `patches/sdk-native-sol-schema.patch`
+fixes it to serverd's `SolanaBillingQuote` (`pyth_solana_receiver`, `publish_time`, `feed_account`, exact key set, numeric
+Felt252 comparison because serverd strips leading zeros) and adds `sdk/test/helpers/serverd-solana-quote.json` plus tests in
+`sdk/test/native-sol.test.mjs` that also read the Rust struct to catch future drift.
+
+Order matters: apply it AFTER `patches/native-quote-tolerance.patch` (it was generated against a tree that already has that
+patch; the two touch disjoint SDK files, so either order applies cleanly, but the baseline assumed is tolerance-applied):
+
+```sh
+git apply patches/native-quote-tolerance.patch
+git apply --check patches/sdk-native-sol-schema.patch && git apply patches/sdk-native-sol-schema.patch
+node --test sdk/test/native-sol.test.mjs
+```
+
 The harness, wallet example (`discard_request` command) and this document are committed directly.
 
 ## zkapi-clientd as the client (`--client clientd`)
