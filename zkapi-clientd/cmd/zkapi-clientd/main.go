@@ -64,8 +64,8 @@ func run(args []string) error {
 		help()
 		return nil
 	}
-	if args[0] != "config" && args[0] != "serve" && args[0] != "lease" {
-		return errors.New("unknown command; use zkapi-clientd config, serve or lease (--help for usage)")
+	if args[0] != "config" && args[0] != "serve" && args[0] != "lease" && args[0] != "solana" {
+		return errors.New("unknown command; use zkapi-clientd config, serve, lease or solana (--help for usage)")
 	}
 	if dir == "" {
 		dir, err = config.DefaultDir()
@@ -77,7 +77,15 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	if args[0] == "solana" {
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		return runSolana(ctx, dir, args[1:], os.Stdin, os.Stdout)
+	}
 	if args[0] == "config" {
+		if saved, err := config.Load(dir); err == nil && saved.ZKAPI.Network == config.SolanaNetwork {
+			return errors.New("this profile uses the native-SOL network; manage it with zkapi-clientd solana and zkapi-clientd lease")
+		}
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
 		ui := &terminalSetupPrompter{out: os.Stdout}
@@ -108,6 +116,9 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	if c.ZKAPI.Network == config.SolanaNetwork {
+		return serveSolana(ctx, dir, c, os.Stdout)
+	}
 	return runConfiguredServe(ctx, dir, c, expected, os.Stdout)
 
 }
@@ -118,6 +129,10 @@ func help() {
   config                 Show status, configure or edit settings, and prepare the wallet
   serve                  Run inference using the saved configuration
   lease export           Print a bounded lease key for an external service (needs serve running)
+  lease settle|status    Close the open lease now / show it (native-SOL profiles; needs serve running)
+  solana                 Configure and inspect a native-SOL (Solana vault) profile
+  lease settle|status    Close the open lease now / show it (native-SOL profiles; needs serve running)
+  solana                 Configure and inspect a native-SOL (Solana vault) profile
 
 Run zkapi-clientd config --help for configuration options.
 Run zkapi-clientd --version to show the installed version.
@@ -423,7 +438,7 @@ func resolveActiveConfig(ctx context.Context, c config.Config) (config.Config, e
 	var active server.ServiceStatus
 	if json.Unmarshal(data, &active) != nil ||
 		active.Backend != "zkapi" ||
-		(active.Network != "mainnet" && active.Network != "sepolia") {
+		(active.Network != "mainnet" && active.Network != "sepolia" && active.Network != config.SolanaNetwork) {
 		return config.Config{}, errors.New("local service returned invalid active-mode metadata; restart it with the current client")
 	}
 	c.Backend = active.Backend

@@ -12,16 +12,21 @@
 //         that stays inside serverd's quote tolerance. No Wormhole/guardian verification.
 //   --scenario jump: the price also jumps 2% down while the first proof is being generated; serverd must answer a retriable
 //         409 native_quote_stale and the client re-quotes, re-proves and succeeds.
+//   --client clientd --clientd-bin PATH: the CLIENT is the zkapi-clientd daemon instead of the Rust helper: `solana init` /
+//         `import-wallet`, `serve`, `lease export --usd 2 --confirm` (retrying on the jump by itself), a paid MCP call with the
+//         printed key, a daemon crash/restart, `lease settle --confirm`, and the key refused afterwards. A small loopback proxy
+//         sits between clientd and serverd to count lease POSTs and (jump scenario) hold the first until the finalized feed shows the jump.
 // Needs Linux with Node 24 and Agave (solana-test-validator). Loopback only.
 //   VCII_ZK_BASE=http://127.0.0.1:8813/zk VCII_ZK_MANAGEMENT_KEY=... node scripts/solana-vcii-lease.mjs \
 //     --bin-dir /target/sol-host/release --sbf-dir /target/sbf --key-dir /scratch --output-dir .zkapi/solana-acceptance
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, rmSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -75,19 +80,22 @@ function options(args) {
     const parsed = {
         binDir: path.join(ROOT, 'target/release'), sbfDir: path.join(ROOT, 'solana/target/deploy'),
         keyDir: path.join(ROOT, '.zkapi/solana-keys'), outputDir: path.join(ROOT, '.zkapi/solana-acceptance'),
-        refreshMs: 400, scenario: 'steady',
+        refreshMs: 400, scenario: 'steady', client: 'helper', clientdBin: null, proofSetupDir: path.join(ROOT, 'protocol/setup/v2'),
     };
     for (let i = 0; i < args.length; i++) {
         if (args[i] === '--help') return { help: true };
         const key = { '--bin-dir': 'binDir', '--sbf-dir': 'sbfDir', '--key-dir': 'keyDir', '--output-dir': 'outputDir',
-            '--refresh-ms': 'refreshMs', '--scenario': 'scenario' }[args[i]];
+            '--refresh-ms': 'refreshMs', '--scenario': 'scenario', '--client': 'client', '--clientd-bin': 'clientdBin',
+            '--proof-setup-dir': 'proofSetupDir' }[args[i]];
         assert.ok(key && args[i + 1], `Unknown or incomplete option: ${args[i]}`);
         if (key === 'refreshMs') parsed[key] = Number(args[++i]);
-        else if (key === 'scenario') parsed[key] = args[++i];
+        else if (key === 'scenario' || key === 'client') parsed[key] = args[++i];
         else parsed[key] = path.resolve(args[++i]);
     }
     assert.ok(Number.isSafeInteger(parsed.refreshMs) && parsed.refreshMs >= 100, '--refresh-ms must be >= 100');
     assert.ok(['steady', 'jump'].includes(parsed.scenario), '--scenario must be steady or jump');
+    assert.ok(['helper', 'clientd'].includes(parsed.client), '--client must be helper or clientd');
+    assert.ok(parsed.client !== 'clientd' || parsed.clientdBin, '--client clientd needs --clientd-bin');
     return parsed;
 }
 
@@ -105,7 +113,7 @@ function expectedLamports(quote, microUsd) {
 async function main() {
     const opts = options(process.argv.slice(2));
     if (opts.help) {
-        console.log('Usage: VCII_ZK_BASE=... VCII_ZK_MANAGEMENT_KEY=... node scripts/solana-vcii-lease.mjs [--bin-dir D] [--sbf-dir D] [--key-dir D] [--output-dir D] [--refresh-ms 400] [--scenario steady|jump]\n'
+        console.log('Usage: VCII_ZK_BASE=... VCII_ZK_MANAGEMENT_KEY=... node scripts/solana-vcii-lease.mjs [--bin-dir D] [--sbf-dir D] [--key-dir D] [--output-dir D] [--refresh-ms 400] [--scenario steady|jump] [--client helper|clientd --clientd-bin PATH]\n'
             + 'Runs a disposable loopback solana-test-validator, real serverd, real proofs, mock Pyth account. See docs/solana-vcii-lease.md.');
         return;
     }
@@ -319,6 +327,161 @@ async function main() {
                 accept: 'application/json, text/event-stream', 'content-type': 'application/json' },
                 body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: tool, arguments: {} } }) });
             return { status: res.status, text: (await res.text()).slice(0, 400) };
+        }
+        // --client clientd: zkapi-clientd is the wallet. The Rust helper only made the deposit and hands its note over.
+        async function runWithClientd() {
+            // clientd insists on a private (0700) config directory, which the bind-mounted run directory cannot guarantee, and the
+            // wallet file holds the note secret: keep both in a fresh private temp directory and remove it at the end.
+            const clientdDir = await fs.mkdtemp(path.join(os.tmpdir(), 'zkapi-clientd-'));
+            const cfgDir = path.join(clientdDir, 'config');
+            process.once('exit', () => rmSync(clientdDir, { recursive: true, force: true }));
+            const walletFile = path.join(cfgDir, 'zkapi', 'solana', vault.vault_state, 'wallet.json');
+            const proxyStats = { posts: [], expires: 0, quotes: 0 };
+            let jumpTriggered = false;
+            // Loopback proxy between clientd and serverd: counts lease POSTs and, in the 'jump' scenario, holds the first one until
+            // the finalized feed (which serverd reads) shows the 2% drop, so that the proof made on the earlier quote is stale.
+            const proxy = http.createServer(async (req, res) => {
+                try {
+                    const chunks = [];
+                    for await (const chunk of req) chunks.push(chunk);
+                    const body = Buffer.concat(chunks);
+                    let entry;
+                    if (req.method === 'GET' && req.url === '/v2/billing/quote') proxyStats.quotes++;
+                    if (req.method === 'POST' && req.url.endsWith('/expire')) proxyStats.expires++;
+                    if (req.method === 'POST' && req.url === '/v2/openrouter/leases') {
+                        const request = JSON.parse(body.toString());
+                        entry = { n: proxyStats.posts.length + 1, id: request.client_request_id, nullifier: request.public_inputs.request_nullifier,
+                            bodyHash: createHash('sha256').update(body).digest('hex'), quote: JSON.parse(request.payload).billing_quote, body };
+                        proxyStats.posts.push(entry);
+                        if (opts.scenario === 'jump' && !jumpTriggered) {
+                            jumpTriggered = true;
+                            center = Math.round(PYTH.price * (1 - JUMP_BPS / 10_000)); walk = 0;
+                            console.log(`!! price jumps -${JUMP_BPS} bps while attempt ${entry.n} proof is in flight (new center ${center}); holding its POST until the finalized feed shows it`);
+                            await waitFor('finalized feed reflects the jump', async () =>
+                                BigInt((await get(`${serverUrl}/v2/billing/quote`)).price) * 10_000n < BigInt(entry.quote.price) * BigInt(10_000 - 2 * 50), 90_000);
+                        }
+                    }
+                    const upstream = await fetch(serverUrl + req.url, { method: req.method,
+                        headers: body.length ? { 'content-type': 'application/json' } : {}, body: body.length ? body : undefined });
+                    const text = await upstream.text();
+                    if (entry) {
+                        entry.status = upstream.status;
+                        try { entry.code = JSON.parse(text).error_code; entry.retriable = JSON.parse(text).retriable; } catch { /* not JSON */ }
+                        console.log(`proxy: lease POST #${entry.n} (${entry.id.slice(0, 22)}...) -> HTTP ${entry.status} ${entry.code ?? ''} ${entry.retriable === undefined ? '' : `retriable=${entry.retriable}`}`);
+                    }
+                    res.writeHead(upstream.status, { 'content-type': 'application/json' });
+                    res.end(text);
+                } catch (error) {
+                    console.error(`proxy error: ${error.message}`);
+                    res.writeHead(502); res.end();
+                }
+            });
+            servers.add(proxy);
+            const proxyPort = await freePort();
+            await new Promise(resolve => proxy.listen(proxyPort, '127.0.0.1', resolve));
+            const listenPort = await freePort();
+            const apiUrl = `http://127.0.0.1:${listenPort}`;
+
+            function cli(args) {
+                return new Promise((resolve, reject) => {
+                    check();
+                    const log = createWriteStream(path.join(runDir, 'clientd-cli.log'), { flags: 'a', mode: 0o600 });
+                    const child = spawn(opts.clientdBin, ['--config-dir', cfgDir, ...args], { cwd: ROOT, env: { PATH: process.env.PATH },
+                        stdio: ['ignore', 'pipe', 'pipe'] });
+                    children.add(child);
+                    let stdout = '';
+                    child.stdout.on('data', chunk => { stdout += chunk; }); // never logged: `lease export` prints the key here
+                    child.stderr.pipe(log);
+                    child.once('error', reject);
+                    child.once('close', code => { children.delete(child); log.end(); resolve({ code, stdout }); });
+                });
+            }
+            async function cliOk(args) {
+                const result = await cli(args);
+                assert.equal(result.code, 0, `zkapi-clientd ${args.slice(0, 2).join(' ')} failed (see clientd-cli.log)`);
+                return result.stdout;
+            }
+            async function startDaemon() {
+                const daemon = launch(opts.clientdBin, ['--config-dir', cfgDir, 'serve'], 'clientd.log');
+                await waitFor('zkapi-clientd serve', async () => (await fetch(`${apiUrl}/healthz`)).status === 200, 30_000);
+                return daemon;
+            }
+
+            // Pin the deployment, then hand the funded note to clientd (the helper deposited it; secrets stay in 0600 files).
+            const deployment = { server_url: `http://127.0.0.1:${proxyPort}`, indexer_url: indexerUrl, inference_base: `${VCII_ZK_BASE.replace(/\/+$/, '')}/v1`, cluster: 'localnet',
+                program_id: vault.program_id, vault_state: vault.vault_state, genesis_hash: genesisHash,
+                state_signing_key: signingKeys.state_signing_key, clearance_signing_key: signingKeys.clearance_signing_key, min_lease_lamports: CAP };
+            const deploymentFile = path.join(clientdDir, 'deployment.json');
+            await fs.writeFile(deploymentFile, JSON.stringify(deployment), { mode: 0o600 });
+            console.log((await cliOk(['solana', 'init', '--deployment', deploymentFile, '--prover', path.join(opts.binDir, 'examples/solana_acceptance_wallet'),
+                '--proof-setup-dir', opts.proofSetupDir, '--listen', `127.0.0.1:${listenPort}`])).trim());
+            const pinned = JSON.parse(await fs.readFile(path.join(cfgDir, 'config.json'), 'utf8')).zkapi.solana;
+            assert.equal(pinned.chain_id, vault.chain_id, 'clientd must derive the same proof chain id as the vault init');
+            const exportFile = path.join(clientdDir, 'wallet-export.json');
+            await fs.writeFile(exportFile, JSON.stringify(await wallet('export_wallet')), { mode: 0o600 });
+            await cliOk(['solana', 'import-wallet', '--file', exportFile]);
+            await fs.rm(exportFile);
+            const funded = JSON.parse(await cliOk(['solana', 'status']));
+            assert.equal(funded.wallet.private_balance_lamports, String(DEPOSIT));
+            console.log(`clientd profile pinned (chain id ${pinned.chain_id}); imported note holds ${funded.wallet.private_balance_lamports} lamports`);
+
+            let daemon = await startDaemon();
+            const started = Date.now();
+            const exported = await cli(['lease', 'export', '--usd', '2', '--confirm']);
+            assert.equal(exported.code, 0, 'zkapi-clientd lease export failed (see clientd-cli.log)');
+            const key = exported.stdout.trim();
+            assert.match(key, /^vcii_zk_/, 'lease export must print the key minted by vcii');
+            console.log(`lease export succeeded in ${((Date.now() - started) / 1000).toFixed(1)}s; key length ${key.length} (key redacted)`);
+            const { posts } = proxyStats;
+            console.log(`serverd saw ${posts.length} lease POST(s): ${posts.map(p => `#${p.n} HTTP ${p.status}${p.code ? ` ${p.code}` : ''}`).join(', ')}; ${proxyStats.expires} /expire check(s); ${proxyStats.quotes} quote read(s)`);
+            assert.equal(new Set(posts.map(p => p.bodyHash)).size, posts.length, 'a proof must never be sent twice');
+            assert.equal(new Set(posts.map(p => p.id)).size, posts.length, 'every attempt must use a fresh request id');
+            const accepted = posts.at(-1);
+            assert.equal(accepted.status, 201);
+            if (opts.scenario === 'jump') {
+                assert.deepEqual(posts.map(p => p.status), [409, 201]);
+                assert.equal(posts[0].code, 'native_quote_stale');
+                assert.equal(posts[0].retriable, true);
+                assert.ok(proxyStats.expires >= 1, 'clientd must confirm non-acceptance with serverd before re-proving');
+            } else {
+                assert.deepEqual(posts.map(p => p.status), [201], 'a price walk inside the tolerance must never be refused');
+            }
+            assert.ok(!(await fs.readFile(walletFile, 'utf8')).includes(key), 'the exported key must not be stored in the wallet file');
+
+            const replay = await request(`${serverUrl}/v2/openrouter/leases`, { method: 'POST', value: JSON.parse(accepted.body.toString()) });
+            assert.equal(replay.status, 409, 'active lease replay must not mint another runtime key');
+            const call = await mcpCall(key, 'market_pulse');
+            console.log(`vcii /mcp tools/call market_pulse with the clientd-exported key -> HTTP ${call.status}`, call.text.slice(0, 160).replace(/\s+/g, ' '));
+            assert.equal(call.status, 200);
+
+            // Crash safety: SIGKILL the daemon mid-lease; the restarted one finds the open lease from the wallet file.
+            daemon.kill('SIGKILL');
+            await new Promise(resolve => daemon.once('close', resolve));
+            daemon = await startDaemon();
+            const pending = JSON.parse(await cliOk(['lease', 'status']));
+            assert.equal(pending.pending_request, true);
+            assert.ok(pending.settle_after > Date.now() / 1000, 'the open lease must survive a daemon crash');
+            console.log(`daemon killed and restarted: lease still open until ${new Date(pending.lease_expires_at * 1000).toISOString()}`);
+            const stillValid = await mcpCall(key, 'market_pulse');
+            assert.equal(stillValid.status, 200, 'a restart must not retire a key that is still in use');
+
+            const settled = JSON.parse(await cliOk(['lease', 'settle', '--confirm']));
+            const expected = expectedLamports(accepted.quote, 1_500_000);
+            console.log('SETTLEMENT via clientd:', JSON.stringify(settled), `(expected balance ${BigInt(DEPOSIT) - expected}: 1.5 USD at the accepted quote, ceil)`);
+            assert.equal(settled.settled, true);
+            assert.equal(BigInt(settled.private_balance_lamports), BigInt(DEPOSIT) - expected, 'note balance must drop by exactly the settled charge');
+            const after = JSON.parse(await cliOk(['solana', 'status']));
+            assert.equal(after.wallet.pending_request, false);
+            assert.equal(after.wallet.private_balance_lamports, settled.private_balance_lamports);
+            const refused = await mcpCall(key, 'market_pulse');
+            console.log(`after settlement the key is refused: HTTP ${refused.status}`);
+            assert.equal(refused.status, 401);
+            assert.equal(updaterFailure, undefined, `Pyth refresh failed: ${updaterFailure?.message}`);
+            console.log(`PASS (${opts.scenario}): zkapi-clientd native-SOL lease -> lease export key -> paid MCP call -> crash/restart -> settlement installed -> key refused.`);
+        }
+        if (opts.client === 'clientd') {
+            await runWithClientd();
+            return;
         }
         const tree = await waitFor('indexer snapshot', async () => wallet('wallet_snapshot_tree'));
         const merkle = await wallet('tree_path', { args: { snapshot: tree, note_id: 0, require_existing: true } });

@@ -66,7 +66,8 @@ when creating its accounts directories and the default Podman seccomp profile bl
   else is `409 native_quote_stale`, `retriable: true`, nothing reserved: re-quote and prove again. The browser SDK does this
   (up to 4 attempts); the harness does it explicitly. The exposure per lease is bounded by the tolerance because the USD
   budget and the settlement conversion stay a deterministic function of the proof-bound quote (the client and the recovery
-  paths re-derive them). zkapi-clientd has no Solana support yet; its native-ETH retry list is unchanged.
+  paths re-derive them). zkapi-clientd now does the same for Solana (see "zkapi-clientd as the client" below); its native-ETH
+  retry list is unchanged.
   The harness now refreshes the mock feed continuously (`--refresh-ms`, default 400) as a bounded random walk (+/-20 bps),
   and `--scenario jump` drops the price 2% mid-proof to exercise the stale -> re-quote -> re-prove path.
 - The finalized indexer lags the chain by roughly 15 s (about 32 slots); the harness polls instead of sleeping.
@@ -88,3 +89,70 @@ It touches `crates/zkapi-serverd/src/{sol_billing,error,routes,processor_v2}.rs`
 `node --test sdk/test/browser-wallet-lease-retry.test.mjs`.
 
 The harness, wallet example (`discard_request` command) and this document are committed directly.
+
+## zkapi-clientd as the client (`--client clientd`)
+
+`zkapi-clientd` (the Go client daemon) has a native-SOL profile that follows the browser SDK's lease flow
+(`sdk/services/browserWalletRuntime.js`): quote -> prove -> lease -> settle, with the SDK's bounded `native_quote_stale` retry.
+It is a separate network next to `mainnet`/`sepolia`: `network: "solana"` plus a pinned deployment in `config.json`
+(`zkapi.solana`: serverd and indexer origins, cluster label, program ID, vault state PDA, genesis hash, derived chain ID and
+protocol binding, the vault's state/clearance signing keys, the vault's per-request cap as the minimum lease, the Pyth feed
+identities and bounds, the lease provider base). It never starts the Ethereum `zkapi-walletd` companion.
+
+Division of labour: Go owns durable state and the network protocol; every proof and note transition is computed by the same
+Rust code as the SDK (`zkapi_browser::prepare_request_with_prover` / `complete_response`), reached through the wallet helper
+`crates/zkapi-serverd/examples/solana_acceptance_wallet` (stdin/stdout JSON, one process per operation, empty environment, no
+stderr kept). The helper gained `derive_deployment`, `load_wallet`, `export_wallet` and returns the pending-request journal from
+`prepare_request`. Pass `--prover` and `--proof-setup-dir` (the directory holding `request.pk`) to `zkapi-clientd solana init`.
+
+```sh
+zkapi-clientd solana init --deployment deployment.json --prover ./solana_acceptance_wallet --proof-setup-dir protocol/setup/v2
+zkapi-clientd solana import-wallet --file wallet-export.json   # the helper's export_wallet reply: {config, state}
+zkapi-clientd serve                                            # loopback management API, settles the lease when due
+zkapi-clientd lease export --usd 2 --confirm                   # key on stdout, once
+zkapi-clientd lease status                                     # open lease timing, never the key
+zkapi-clientd lease settle --confirm                           # close the key now and install the signed receipt
+zkapi-clientd solana status                                    # offline: balance and pending flag
+```
+
+Deposits are not part of this client yet: the note comes from `export_wallet` of a helper/SDK wallet that made the deposit.
+
+Lease flow in `ExportLease` (`zkapi-clientd/internal/zkapi/solana_wallet.go`):
+
+1. Recover first. A journal left by a crash or an unknown outcome is resolved (lease status, nullifier lookup, the
+   `/expire` handshake) before anything new is proved. A wallet with an unresolved request answers `lease_pending`.
+2. Check serverd's attestation against the pinned chain ID, binding and signing keys; read and validate the quote (field-by-field
+   against the pins, 60 s age bound, confidence bound); convert the cap to lamports (ceil on the price minus confidence);
+   refuse below the vault minimum or above the balance.
+3. Prove, then write the journal (the full prepared request, secret-bearing) to the wallet file with fsync + rename BEFORE the
+   POST. The exported key is never written anywhere.
+4. On `409 native_quote_stale` with `retriable: true`: ask `POST .../expire` (serverd answers under its issuance lock whether
+   the request was never accepted; while the quote could still be accepted it answers `lease_pending` and the client waits for
+   the quote to expire). Only a confirmed `superseded_unaccepted`/`expired_unaccepted` clears the journal and starts a new
+   round with a fresh quote, a fresh request ID and a fresh proof; at most 4 rounds (`native_quote_stale` afterwards). The same
+   proof is never sent twice. Any other failure (timeout, 5xx) keeps the journal: the outcome is unknown and recovery decides.
+5. Verify the 201 lease against what was proved (quote, spending limit in micro-USD, provider base, `key_source` must be
+   `openrouter`); record its expiry/settle times durably; only then return the key. A lease failing the checks is retired at once.
+6. Settlement: at `settle_after` (or `lease settle`) retire through `POST /v2/openrouter/leases/{id}` (retrying only
+   `lease_settlement_pending`-style refusals), fetch `/v2/requests/{id}`, require the settled payload's quote to equal the proved
+   quote, let the helper verify and apply the signed transition, then replace the note and clear journal and lease in one atomic
+   write. A restarted daemon never retires a key whose settle time has not come (it may be in use); it retires an open key that
+   was lost before it was handed out.
+
+The wallet file is `<config-dir>/zkapi/solana/<vault-state>/wallet.json` (0600): note secret, journal, lease timing.
+
+`--client clientd --clientd-bin PATH` replaces the Rust helper as the client in this scenario. The helper still deposits and
+hands the note over; then clientd obtains the lease itself (`lease export --usd 2 --confirm`), a paid MCP call uses the printed
+key, the daemon is SIGKILLed and restarted mid-lease, `lease settle --confirm` closes it, the note balance must equal the deposit
+minus the exact ceil-converted vcii usage, and the key must be refused afterwards. A loopback proxy between clientd and serverd
+records every lease POST (status, request ID, proof hash; a proof must never repeat); with `--scenario jump` it holds the first
+POST until the finalized feed shows the 2% drop, so serverd answers 409 `native_quote_stale` and clientd must re-quote and
+re-prove (`[409, 201]`). Build clientd statically for the Linux container:
+`CGO_ENABLED=0 go build -o zkapi-clientd ./cmd/zkapi-clientd` (in `zkapi-clientd/`), then
+`node scripts/solana-vcii-lease.mjs ... --client clientd --clientd-bin /path/zkapi-clientd`. Go unit tests:
+`podman run --rm -v <worktree>:/src -w /src/zkapi-clientd golang:1.25 go test ./...` (a CRLF checkout breaks two embedded-manifest
+hash tests; run in a copy normalised with `sed -i 's/$//'`).
+
+Known SDK mismatch (not touched here): `sdk/services/zkapiNativeSol.mjs` validates a quote with `source: "pyth_receiver"`,
+`published_at` and `price_account`, while serverd's quote carries `source: "pyth_solana_receiver"`, `publish_time` and
+`feed_account` (the clientd port follows serverd's actual JSON).

@@ -60,6 +60,9 @@ type ZKAPI struct {
 	Binary            string `json:"binary,omitempty"`
 	ProofSetupDir     string `json:"proof_setup_dir,omitempty"`
 	ExternalCompanion bool   `json:"external_companion,omitempty"`
+	// Solana pins a native-SOL deployment. It is required exactly when Network is
+	// "solana"; that mode never starts the Ethereum companion.
+	Solana *Solana `json:"solana,omitempty"`
 	// Retained only to load older configurations. Each new request chooses its
 	// budget from the selected model; a saved fixed limit has no effect.
 	RequestLimitMicroUSD uint64 `json:"request_limit_micro_usd,omitempty"`
@@ -179,8 +182,16 @@ func Validate(c Config) error {
 	if _, err := relay.NewClient(c.RelayURL); err != nil {
 		return err
 	}
-	if c.ZKAPI.Network != "mainnet" && c.ZKAPI.Network != "sepolia" {
-		return errors.New("ZKAPI network must be mainnet or sepolia")
+	if c.ZKAPI.Network != "mainnet" && c.ZKAPI.Network != "sepolia" && c.ZKAPI.Network != SolanaNetwork {
+		return errors.New("ZKAPI network must be mainnet, sepolia or solana")
+	}
+	if (c.ZKAPI.Network == SolanaNetwork) != (c.ZKAPI.Solana != nil) {
+		return errors.New("ZKAPI solana deployment is required for the solana network and invalid otherwise")
+	}
+	if c.ZKAPI.Solana != nil {
+		if err := c.ZKAPI.Solana.Validate(); err != nil {
+			return err
+		}
 	}
 	if len(c.ZKAPI.BridgeToken) < 32 {
 		return errors.New("ZKAPI bridge_token must have at least 32 characters")

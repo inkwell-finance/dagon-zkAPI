@@ -38,7 +38,7 @@ use zkapi_browser::{
 };
 use zkapi_proof::compact::{CompactSigner, RequestProver, CIRCUIT_ID};
 use zkapi_serverd::native_billing::billing::SOL_USD_FEED_ID;
-use zkapi_types::Felt252;
+use zkapi_types::{solana_chain_id, solana_deployment_binding, Felt252};
 
 const SOLANA_BACKEND: &str = "dagon.solana.groth16.v1";
 
@@ -477,6 +477,39 @@ impl WalletDriver {
                 })?;
                 Ok(json!({"updated": true}))
             }
+            "derive_deployment" => {
+                // Pure derivation of the proof chain ID and protocol binding from public identities (no RPC), so zkapi-clientd
+                // can pin a deployment without re-implementing the derivation.
+                let account = |name: &str| -> Result<[u8; 32]> {
+                    Ok(Pubkey::from_str(command[name].as_str().with_context(|| name.to_string())?)?.to_bytes())
+                };
+                let (program_id, vault_state) = (account("program_id")?, account("vault_state")?);
+                let genesis = account("genesis_hash")?;
+                Ok(json!({
+                    "chain_id": solana_chain_id(&genesis).to_string(),
+                    "protocol_binding": solana_deployment_binding(&program_id, &vault_state, &genesis),
+                }))
+            }
+            "load_wallet" => {
+                // Replace the whole in-memory wallet from durable client storage (zkapi-clientd keeps state and the pending
+                // journal itself and starts this helper per operation).
+                let config: BrowserWalletConfig = serde_json::from_value(command["config"].clone())?;
+                ensure!(config.protocol_version == 2, "only protocol v2 is supported");
+                ensure!(config.ledger_backend == SOLANA_BACKEND, "not a Solana wallet");
+                ensure!(!config.contract_address.is_zero(), "vault binding is required");
+                self.state = serde_json::from_value(command["state"].clone())?;
+                self.journal = serde_json::from_value(command["journal"].clone())?;
+                self.config = Some(config);
+                Ok(self.status())
+            }
+            "export_wallet" => {
+                // Secret-bearing: the caller must store this in an owner-only file and never log it.
+                Ok(json!({
+                    "config": self.config.as_ref().context("no wallet configuration")?,
+                    "state": self.state,
+                    "journal": self.journal,
+                }))
+            }
             "init" => {
                 ensure!(self.config.is_none(), "wallet is already initialized");
                 let config: BrowserWalletConfig = serde_json::from_value(command["config"].clone())?;
@@ -497,8 +530,8 @@ impl WalletDriver {
                     args,
                     self.request_prover.as_ref().context("missing request prover")?,
                 )?;
-                self.journal = Some(prepared.journal);
-                Ok(json!({"request": prepared.request}))
+                self.journal = Some(prepared.journal.clone());
+                Ok(json!({"request": prepared.request, "journal": prepared.journal}))
             }
             "discard_request" => {
                 // Only after serverd answered a retriable 409 that reserved nothing (native_quote_stale):
