@@ -102,6 +102,19 @@ func (h *FundingHandler) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) 
 				result, err = h.FundAddress(ctx, body.Amount)
 			}
 		}
+	case r.Method == http.MethodPost && r.URL.Path == "/admin/lease/export":
+		// Returns a bounded runtime key once, for use by an external service.
+		var body struct {
+			LimitMicroUSD uint64 `json:"request_limit_micro_usd"`
+			Confirm       bool   `json:"confirm"`
+		}
+		if err = decode(&body); err == nil {
+			if !body.Confirm {
+				err = errors.New("lease export requires explicit confirmation")
+			} else {
+				result, err = h.client.ExportLease(ctx, body.LimitMicroUSD)
+			}
+		}
 	case r.Method == http.MethodPost && r.URL.Path == "/admin/return/quote":
 		var body struct {
 			Destination string `json:"destination"`

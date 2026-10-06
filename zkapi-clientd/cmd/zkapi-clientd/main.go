@@ -64,8 +64,8 @@ func run(args []string) error {
 		help()
 		return nil
 	}
-	if args[0] != "config" && args[0] != "serve" {
-		return errors.New("unknown command; use zkapi-clientd config or zkapi-clientd serve (--help for usage)")
+	if args[0] != "config" && args[0] != "serve" && args[0] != "lease" {
+		return errors.New("unknown command; use zkapi-clientd config, serve or lease (--help for usage)")
 	}
 	if dir == "" {
 		dir, err = config.DefaultDir()
@@ -83,6 +83,15 @@ func run(args []string) error {
 		ui := &terminalSetupPrompter{out: os.Stdout}
 		defer ui.Close()
 		return runConfigure(ctx, dir, args[1:], ui, os.Stdout)
+	}
+	if args[0] == "lease" {
+		c, err := config.Load(dir)
+		if err != nil {
+			return configurationRequired(err)
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		return runLease(ctx, c, args[1:], os.Stdout, os.Stderr)
 	}
 	if args[0] == "serve" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
 		fmt.Println("Usage: zkapi-clientd serve\nRun the saved configuration. Run zkapi-clientd config to configure missing prerequisites.")
@@ -108,6 +117,7 @@ func help() {
 
   config                 Show status, configure or edit settings, and prepare the wallet
   serve                  Run inference using the saved configuration
+  lease export           Print a bounded lease key for an external service (needs serve running)
 
 Run zkapi-clientd config --help for configuration options.
 Run zkapi-clientd --version to show the installed version.
