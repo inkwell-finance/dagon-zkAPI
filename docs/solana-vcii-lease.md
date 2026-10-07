@@ -321,3 +321,16 @@ Remaining scope limits: the acceptance oracle is mocked and the validator is loc
 key attestation are absent. A binary writable by an attacker can still change between hashing and execution. Signing inspection
 restricts the target to the pinned vault but does not independently bind every instruction argument or compute-budget fee to
 the journal's intent. Production operators must protect the helper/profile files and publish trusted deployment pins.
+
+
+Final binaries passed both local-validator scenarios after the finality safeguards:
+
+- **Steady:** one successful lease issuance; exhausted and idle leases settled automatically. Withdrawal returned
+  969964948 lamports plus 1545120 lamports of closed-account rent (971510068 at the destination).
+- **2% price jump:** the first proof received `409 native_quote_stale`; a fresh proof succeeded with `201`.
+  Withdrawal returned 969367281 lamports plus rent (970912401 at the destination).
+
+Both runs refused wrong program/helper pins, finalized a real staged-buffer cancellation with rent refunded (10000 lamports
+of transaction fees), recovered a deposit after SIGKILL, preserved a working key through daemon restart and ongoing usage,
+refused retired keys, and ended with no private note balance. These are local-validator transactions with a mocked oracle;
+no live-chain funds were spent. Final staged secret scan passed.
