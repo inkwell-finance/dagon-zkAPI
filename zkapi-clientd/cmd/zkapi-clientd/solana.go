@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,12 +23,16 @@ import (
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/zkapi"
 )
 
-const solanaUsage = `usage: zkapi-clientd solana init --deployment FILE [--prover PATH] [--proof-setup-dir DIR] [--listen IP:PORT]
+const solanaUsage = `usage: zkapi-clientd solana init --deployment FILE [--rpc-url URL] [--prover PATH --prover-sha256 HEX] [--proof-setup-dir DIR] [--settle-idle-seconds N] [--listen IP:PORT]
+       zkapi-clientd solana deposit --keypair FILE --sol AMOUNT --confirm
+       zkapi-clientd solana withdraw --to ADDRESS (--all | --sol AMOUNT) [--keypair FILE] --confirm
+       zkapi-clientd solana verify
        zkapi-clientd solana import-wallet --file FILE|-
        zkapi-clientd solana status`
 
-// runSolana handles the native-SOL profile commands. They work on saved files
-// only; leasing runs inside the daemon (zkapi-clientd serve).
+// runSolana handles the native-SOL profile commands. Leasing runs inside the
+// daemon (zkapi-clientd serve); funding runs in this process, or through the
+// daemon when one is running on the same configuration directory.
 func runSolana(ctx context.Context, dir string, args []string, in io.Reader, out io.Writer) error {
 	if len(args) == 0 {
 		return errors.New(solanaUsage)
@@ -35,6 +40,12 @@ func runSolana(ctx context.Context, dir string, args []string, in io.Reader, out
 	switch args[0] {
 	case "init":
 		return solanaInit(ctx, dir, args[1:], out)
+	case "deposit":
+		return solanaDeposit(ctx, dir, args[1:], out)
+	case "withdraw":
+		return solanaWithdraw(ctx, dir, args[1:], out)
+	case "verify":
+		return solanaVerify(ctx, dir, out)
 	case "import-wallet":
 		return solanaImport(dir, args[1:], in, out)
 	case "status":
@@ -46,8 +57,11 @@ func runSolana(ctx context.Context, dir string, args []string, in io.Reader, out
 func solanaInit(ctx context.Context, dir string, args []string, out io.Writer) error {
 	flags := flag.NewFlagSet("solana init", flag.ContinueOnError)
 	deployment := flags.String("deployment", "", "JSON file with the pinned Solana deployment")
-	prover := flags.String("prover", "", "Solana wallet helper binary (overrides the deployment file)")
-	setup := flags.String("proof-setup-dir", "", "request proving key directory (overrides the deployment file)")
+	prover := flags.String("prover", "", "zkapi-solana-wallet helper binary (overrides the deployment file)")
+	proverHash := flags.String("prover-sha256", "", "SHA-256 of the helper binary, from the release notes (overrides the deployment file)")
+	setup := flags.String("proof-setup-dir", "", "proving key directory holding request.pk and withdrawal.pk (overrides the deployment file)")
+	rpcURL := flags.String("rpc-url", "", "Solana JSON-RPC used for on-chain verification and funding (overrides the deployment file)")
+	idle := flags.Int64("settle-idle-seconds", -1, "settle an open lease after this many seconds without new usage; 0 disables (default 900)")
 	listen := flags.String("listen", "", "numeric loopback API address and port")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -68,15 +82,45 @@ func solanaInit(ctx context.Context, dir string, args []string, out io.Writer) e
 	if *prover != "" {
 		pin.Prover = *prover
 	}
+	if *proverHash != "" {
+		pin.ProverSHA256 = strings.ToLower(*proverHash)
+	}
 	if *setup != "" {
 		pin.ProofSetupDir = *setup
 	}
+	if *rpcURL != "" {
+		pin.RPCURL = *rpcURL
+	}
+	if *idle >= 0 {
+		seconds := uint64(*idle)
+		pin.SettleIdleSeconds = &seconds
+	}
 	pin.Normalize()
+	// Persist paths independently of the directory from which serve is started.
+	if pin.Prover != "" {
+		pin.Prover, err = filepath.Abs(pin.Prover)
+		if err != nil {
+			return errors.New("cannot resolve the wallet helper path")
+		}
+	}
+	if pin.ProofSetupDir != "" {
+		pin.ProofSetupDir, err = filepath.Abs(pin.ProofSetupDir)
+		if err != nil {
+			return errors.New("cannot resolve the proof setup directory")
+		}
+	}
+	if pin.Prover != "" && pin.ProverSHA256 == "" {
+		observed, err := zkapi.HashFile(pin.Prover)
+		if err != nil {
+			return errors.New("cannot read the wallet helper binary")
+		}
+		return fmt.Errorf("pin the wallet helper: compare its SHA-256 with the release notes, then pass --prover-sha256 %s", observed)
+	}
 	// The chain ID and protocol binding are derived from the public identities by
 	// the wallet helper. A file that states them must agree; one that omits them
 	// is completed, so a typo can never pin a mismatched deployment.
 	if pin.Prover != "" && pin.ProofSetupDir != "" {
-		derived, err := zkapi.ExecSolanaProver{Binary: pin.Prover, SetupDir: pin.ProofSetupDir}.Derive(ctx, pin.ProgramID, pin.VaultState, pin.GenesisHash)
+		derived, err := zkapi.SolanaProverFor(pin).Derive(ctx, pin.ProgramID, pin.VaultState, pin.GenesisHash)
 		if err != nil {
 			return err
 		}
@@ -93,10 +137,24 @@ func solanaInit(ctx context.Context, dir string, args []string, out io.Writer) e
 	if *listen != "" {
 		c.Listen = *listen
 	}
+	if err := pin.Validate(); err != nil {
+		return err
+	}
+	// Nothing is saved unless the chain agrees with every pin: a wrong program ID, vault, genesis
+	// hash or signing key, a paused vault or a program that can still be upgraded is refused here.
+	client, err := solanaHTTPClient(c)
+	if err != nil {
+		return err
+	}
+	vault, err := zkapi.VerifySolanaChain(ctx, client, pin)
+	if err != nil {
+		return err
+	}
 	if err := config.Init(dir, c); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "Initialized the native-SOL profile for vault %s.\nImport a funded wallet with zkapi-clientd solana import-wallet, then run zkapi-clientd serve.\n", pin.VaultState)
+	fmt.Fprintf(out, "Verified on chain: vault %s of immutable program %s (%d notes, per-request cap %d lamports).\n", pin.VaultState, pin.ProgramID, vault.NextNoteID, vault.RequestChargeCap)
+	fmt.Fprintf(out, "Initialized the native-SOL profile for vault %s.\nFund it with zkapi-clientd solana deposit (or import a wallet with solana import-wallet), then run zkapi-clientd serve.\n", pin.VaultState)
 	return nil
 }
 
@@ -203,10 +261,16 @@ func serveSolana(ctx context.Context, dir string, c config.Config, out io.Writer
 	if err != nil {
 		return err
 	}
-	wallet, err := zkapi.OpenSolanaWallet(dir, *pin, client, zkapi.ExecSolanaProver{Binary: pin.Prover, SetupDir: pin.ProofSetupDir})
+	wallet, err := zkapi.OpenSolanaWallet(dir, *pin, client, zkapi.SolanaProverFor(*pin))
 	if err != nil {
 		return err
 	}
+	// Refuse to serve a deployment the chain no longer agrees with (program upgraded or
+	// replaced, vault paused or re-keyed, wrong cluster behind the RPC).
+	if _, err := wallet.VerifyChain(ctx); err != nil {
+		return err
+	}
+	logger.Printf("Verified on chain: vault %s of immutable program %s", pin.VaultState, pin.ProgramID)
 	listener, err := net.Listen("tcp", c.Listen)
 	if err != nil {
 		return errors.New("could not bind local API address; check for an existing service")

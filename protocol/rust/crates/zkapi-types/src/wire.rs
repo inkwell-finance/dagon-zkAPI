@@ -82,6 +82,10 @@ pub struct OpenRouterLeaseStatusResponse {
     pub spending_limit_usd: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_usd: Option<f64>,
+    /// Live usage of a still-active key, as the issuer reports it now. Advisory (clients use it to settle early);
+    /// the settled `usage_usd` and charge always come from retirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_usage_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub charge_applied: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]

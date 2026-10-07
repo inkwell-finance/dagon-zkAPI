@@ -43,6 +43,7 @@ type SolanaWallet struct {
 	path   string
 	http   *http.Client
 	prover SolanaProver
+	funder SolanaFunder // vault deposits and withdrawals; nil when the prover cannot fund
 	now    func() time.Time
 	sleep  func(context.Context, time.Duration) error
 	slot   chan struct{} // one wallet operation at a time; context-aware
@@ -64,6 +65,10 @@ type solanaLease struct {
 	ExpiresAt        uint64  `json:"expires_at"`
 	SettleAfter      uint64  `json:"settle_after"`
 	SpendingLimitUSD float64 `json:"spending_limit_usd"`
+	// Early settlement: the key's last observed usage (micro-USD) and when it last
+	// grew (or, before any usage, when the key was issued). Idle time counts from there.
+	UsageMicroUSD  uint64 `json:"usage_micro_usd,omitempty"`
+	LastActivityAt uint64 `json:"last_activity_at,omitempty"`
 }
 
 type solanaWalletFile struct {
@@ -73,6 +78,14 @@ type solanaWalletFile struct {
 	State      json.RawMessage `json:"state"`
 	Journal    json.RawMessage `json:"journal,omitempty"`
 	Lease      *solanaLease    `json:"lease,omitempty"`
+
+	// Funding. A wallet without a note (State null) holds only its configuration
+	// until a deposit installs one; a completed withdrawal returns it to that state.
+	Deposit    *pendingDeposit      `json:"deposit,omitempty"`
+	Withdrawal *pendingWithdrawal   `json:"withdrawal,omitempty"`
+	Keypair    string               `json:"funding_keypair,omitempty"` // path only, never key material
+	History    []fundingRecord      `json:"history,omitempty"`
+	Cleanup    *pendingCancellation `json:"cleanup,omitempty"`
 }
 
 // solanaNote is the non-secret view of the stored note state.
@@ -85,12 +98,21 @@ type solanaNote struct {
 
 // SolanaStatus is safe local metadata: no secrets and no request identifiers.
 type SolanaStatus struct {
-	HasNote        bool   `json:"has_note"`
-	Balance        string `json:"private_balance_lamports,omitempty"`
-	PendingRequest bool   `json:"pending_request"`
-	LeaseExpiresAt uint64 `json:"lease_expires_at,omitempty"`
-	SettleAfter    uint64 `json:"settle_after,omitempty"`
+	HasNote           bool   `json:"has_note"`
+	Balance           string `json:"private_balance_lamports,omitempty"`
+	PendingRequest    bool   `json:"pending_request"`
+	PendingDeposit    bool   `json:"pending_deposit,omitempty"`
+	PendingWithdrawal bool   `json:"pending_withdrawal,omitempty"`
+	LeaseExpiresAt    uint64 `json:"lease_expires_at,omitempty"`
+	SettleAfter       uint64 `json:"settle_after,omitempty"`
+	// Early settlement: the key's last observed usage and when it settles for lack of
+	// use (0 when idle settlement is off). Both advisory.
+	LeaseUsageUSD float64 `json:"lease_usage_usd,omitempty"`
+	IdleSettleAt  uint64  `json:"idle_settle_at,omitempty"`
 }
+
+// ErrNoSolanaWallet means the profile has no wallet file yet: import one, or deposit.
+var ErrNoSolanaWallet = errors.New("no Solana wallet for this deployment; run zkapi-clientd solana deposit (or solana import-wallet)")
 
 func solanaWalletPath(dir string, pin config.Solana) string {
 	return filepath.Join(dir, "zkapi", "solana", pin.VaultState, "wallet.json")
@@ -143,6 +165,9 @@ func (f solanaWalletFile) check(pin config.Solana) error {
 		cfg.ChainID.String() != pin.ChainID || !config.SameFelt(cfg.ContractAddress, pin.ProtocolBinding) {
 		return errors.New("wallet config does not match the pinned Solana deployment")
 	}
+	if f.noNote() {
+		return nil // configuration only: no deposit has been installed yet, or it was fully withdrawn
+	}
 	note, err := f.note()
 	if err != nil {
 		return err
@@ -151,6 +176,10 @@ func (f solanaWalletFile) check(pin config.Solana) error {
 		return errors.New("wallet note does not match the pinned Solana deployment")
 	}
 	return nil
+}
+
+func (f solanaWalletFile) noNote() bool {
+	return len(f.State) == 0 || bytes.Equal(f.State, []byte("null"))
 }
 
 func (f solanaWalletFile) note() (solanaNote, error) {
@@ -209,7 +238,7 @@ func OpenSolanaWallet(dir string, pin config.Solana, client *http.Client, prover
 	path := solanaWalletPath(dir, pin)
 	info, err := os.Lstat(path)
 	if err != nil {
-		return nil, errors.New("no Solana wallet for this deployment; run zkapi-clientd solana import-wallet")
+		return nil, ErrNoSolanaWallet
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
 		return nil, errors.New("Solana wallet file must be a regular owner-only file (chmod 600)")
@@ -228,8 +257,9 @@ func OpenSolanaWallet(dir string, pin config.Solana, client *http.Client, prover
 	if client == nil {
 		client = &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: 2 * time.Minute, CheckRedirect: noRedirect}
 	}
+	funder, _ := prover.(SolanaFunder)
 	return &SolanaWallet{
-		pin: pin, path: path, http: client, prover: prover, now: time.Now, file: file,
+		pin: pin, path: path, http: client, prover: prover, funder: funder, now: time.Now, file: file,
 		sleep: func(ctx context.Context, d time.Duration) error {
 			timer := time.NewTimer(d)
 			defer timer.Stop()
@@ -248,13 +278,17 @@ func OpenSolanaWallet(dir string, pin config.Solana, client *http.Client, prover
 func (w *SolanaWallet) Status() SolanaStatus {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	status := SolanaStatus{PendingRequest: w.file.hasJournal()}
+	status := SolanaStatus{PendingRequest: w.file.hasJournal(), PendingDeposit: w.file.Deposit != nil, PendingWithdrawal: w.file.Withdrawal != nil}
 	if note, err := w.file.note(); err == nil {
 		status.HasNote = true
 		status.Balance = note.CurrentBalance.String()
 	}
-	if w.file.Lease != nil {
-		status.LeaseExpiresAt, status.SettleAfter = w.file.Lease.ExpiresAt, w.file.Lease.SettleAfter
+	if lease := w.file.Lease; lease != nil {
+		status.LeaseExpiresAt, status.SettleAfter = lease.ExpiresAt, lease.SettleAfter
+		status.LeaseUsageUSD = float64(lease.UsageMicroUSD) / 1e6
+		if idle := w.pin.SettleIdle(); idle > 0 && lease.LastActivityAt != 0 {
+			status.IdleSettleAt = lease.LastActivityAt + uint64(idle/time.Second)
+		}
 	}
 	return status
 }
@@ -265,6 +299,25 @@ func (w *SolanaWallet) update(mutate func(*solanaWalletFile)) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	next := w.file
+	// The records are shared with readers' snapshots: mutate private copies, so the
+	// in-memory state changes only once the file is on disk.
+	if next.Deposit != nil {
+		deposit := *next.Deposit
+		next.Deposit = &deposit
+	}
+	if next.Withdrawal != nil {
+		withdrawal := *next.Withdrawal
+		next.Withdrawal = &withdrawal
+	}
+	if next.Lease != nil {
+		lease := *next.Lease
+		next.Lease = &lease
+	}
+	if next.Cleanup != nil {
+		cleanup := *next.Cleanup
+		next.Cleanup = &cleanup
+	}
+	next.History = append([]fundingRecord(nil), next.History...)
 	mutate(&next)
 	if err := next.save(w.path); err != nil {
 		return &Error{http.StatusInternalServerError, "wallet_storage_failed"}
@@ -437,7 +490,14 @@ func (w *SolanaWallet) ExportLease(ctx context.Context, limit uint64) (ExportedL
 	if err := w.recoverLocked(ctx); err != nil {
 		return ExportedLease{}, err
 	}
-	if w.snapshot().hasJournal() {
+	switch file := w.snapshot(); {
+	case file.Deposit != nil:
+		return ExportedLease{}, fundingErr("deposit_pending", "a deposit is unfinished; finish it with zkapi-clientd solana deposit before opening a lease")
+	case file.Withdrawal != nil:
+		return ExportedLease{}, fundingErr("withdrawal_pending", "a withdrawal is unfinished: the note is frozen until it completes (zkapi-clientd solana withdraw)")
+	case file.noNote():
+		return ExportedLease{}, fundingErr("no_funded_note", "this wallet holds no funded note; run zkapi-clientd solana deposit first")
+	case file.hasJournal():
 		return ExportedLease{}, &Error{http.StatusConflict, "lease_pending"}
 	}
 	if err := w.checkAttestation(ctx); err != nil {
@@ -581,7 +641,7 @@ func (w *SolanaWallet) acceptIssued(ctx context.Context, raw []byte, id string, 
 		return ExportedLease{}, &Error{http.StatusBadGateway, "invalid_solana_lease"}
 	}
 	if err := w.update(func(f *solanaWalletFile) {
-		f.Lease = &solanaLease{ClientRequestID: id, ExpiresAt: lease.ExpiresAt, SettleAfter: lease.SettleAfter, SpendingLimitUSD: lease.SpendingLimitUSD}
+		f.Lease = &solanaLease{ClientRequestID: id, ExpiresAt: lease.ExpiresAt, SettleAfter: lease.SettleAfter, SpendingLimitUSD: lease.SpendingLimitUSD, LastActivityAt: w.unix()}
 	}); err != nil {
 		return ExportedLease{}, err
 	}
@@ -720,6 +780,9 @@ type leaseStatus struct {
 	SettleAfter uint64   `json:"settle_after"`
 	ExpiresAt   uint64   `json:"expires_at"`
 	ChargeUsage *float64 `json:"usage_usd"`
+	// ObservedUsage is the issuer's live usage reading of a still-active key
+	// (advisory: serverd leaves it out when it cannot read it).
+	ObservedUsage *float64 `json:"observed_usage_usd"`
 }
 
 func (w *SolanaWallet) leaseStatus(ctx context.Context, id string) (leaseStatus, error) {
@@ -849,10 +912,22 @@ func (w *SolanaWallet) Recover(ctx context.Context) error {
 	return w.recoverLocked(ctx)
 }
 
-// service does what the wallet owes the server right now, re-reading the state
-// under the operation slot: recovery of a request without a lease record, or
-// settlement of a lease whose time has come. It is a no-op otherwise.
-func (w *SolanaWallet) service(ctx context.Context) error {
+// usagePollEvery is how often an open lease's live usage is read. It is shorter
+// for a short idle period, so the period is observed with some resolution.
+func (w *SolanaWallet) usagePollEvery() time.Duration {
+	every := 30 * time.Second
+	if idle := w.pin.SettleIdle(); idle > 0 {
+		every = min(every, max(idle/4, time.Second))
+	}
+	return every
+}
+
+// service does what the wallet owes the server or the chain right now,
+// re-reading the state under the operation slot: resolving unfinished funding,
+// recovery of a request without a lease record, settlement of a lease whose
+// time has come, and (poll) the early-settlement check of an open lease. It is
+// a no-op otherwise.
+func (w *SolanaWallet) service(ctx context.Context, poll bool, logf func(format string, args ...any)) error {
 	release, err := w.acquire(ctx)
 	if err != nil {
 		return err
@@ -860,6 +935,8 @@ func (w *SolanaWallet) service(ctx context.Context) error {
 	defer release()
 	file := w.snapshot()
 	switch {
+	case file.Deposit != nil || file.Withdrawal != nil:
+		return w.recoverFunding(ctx)
 	case !file.hasJournal():
 		return nil
 	case file.Lease == nil:
@@ -867,40 +944,114 @@ func (w *SolanaWallet) service(ctx context.Context) error {
 	case w.unix() >= file.Lease.SettleAfter:
 		_, err := w.settleLocked(ctx, false)
 		return err
+	case poll:
+		return w.settleEarlyLocked(ctx, logf)
 	}
 	return nil
 }
 
-// RunSettlement settles the open lease when its time comes, until ctx ends. It
-// also runs once at start so a lease from an earlier run is not forgotten.
+// settleEarlyLocked reads the open lease's live usage and settles it now when the
+// key has used up its spending limit or has seen no new usage for the idle
+// period. "Idle" counts from the last time the usage grew (or from issuance), so
+// a key that is being used keeps pushing the deadline out and is never retired
+// under its user. When the usage cannot be read nothing is settled: the lease
+// stays open until its settle time.
+func (w *SolanaWallet) settleEarlyLocked(ctx context.Context, logf func(format string, args ...any)) error {
+	lease := w.snapshot().Lease
+	if lease == nil {
+		return nil
+	}
+	status, err := w.leaseStatus(ctx, lease.ClientRequestID)
+	if err != nil {
+		return err
+	}
+	switch status.Status {
+	case "active":
+	case "retiring", "disabled", "revoking", "finalized":
+		// The server already moved it along: finish only known retirement states.
+		_, err := w.settleLocked(ctx, true)
+		return err
+	default:
+		return &Error{http.StatusBadGateway, "invalid_solana_server_response"}
+	}
+	if status.ObservedUsage == nil || *status.ObservedUsage < 0 || math.IsNaN(*status.ObservedUsage) || math.IsInf(*status.ObservedUsage, 0) {
+		return nil
+	}
+	// Bound the float conversion to exact integers and reject regressing readings.
+	micro := math.Round(*status.ObservedUsage * 1e6)
+	if math.IsInf(micro, 0) || micro > float64(maxSafeInteger) || micro < float64(lease.UsageMicroUSD) {
+		return nil
+	}
+	usage := uint64(micro)
+	now := w.unix()
+	if usage > lease.UsageMicroUSD || lease.LastActivityAt == 0 {
+		if err := w.update(func(f *solanaWalletFile) { f.Lease.UsageMicroUSD, f.Lease.LastActivityAt = usage, now }); err != nil {
+			return err
+		}
+		lease = w.snapshot().Lease
+	}
+	limit := uint64(math.Round(lease.SpendingLimitUSD * 1e6))
+	var reason string
+	switch idle := w.pin.SettleIdle(); {
+	case limit > 0 && usage >= limit:
+		reason = "its spending limit is used up"
+	case idle > 0 && now >= lease.LastActivityAt && time.Duration(now-lease.LastActivityAt)*time.Second >= idle:
+		reason = fmt.Sprintf("it saw no new usage for %s", idle)
+	default:
+		return nil
+	}
+	if logf != nil {
+		logf("Settling the open Solana lease early: %s", reason)
+	}
+	_, err = w.settleLocked(ctx, true)
+	return err
+}
+
+// RunSettlement settles the open lease when its time comes, or earlier when its
+// key is exhausted or idle, and resolves unfinished funding from the chain, until
+// ctx ends. It also runs once at start so work from an earlier run is not forgotten.
 func (w *SolanaWallet) RunSettlement(ctx context.Context, logf func(format string, args ...any)) {
 	retry := time.Second
+	poll := false
+	var lastFailure string
 	for {
 		status := w.Status()
 		wait := 30 * time.Second
-		if status.PendingRequest {
+		act := poll
+		switch {
+		case status.PendingDeposit || status.PendingWithdrawal:
+			act = true
+		case status.PendingRequest:
 			if status.SettleAfter == 0 {
-				wait = 0 // unresolved without a lease record: recover now
-			} else if due := time.Unix(int64(status.SettleAfter), 0).Add(250 * time.Millisecond); w.now().Before(due) {
-				wait = min(due.Sub(w.now()), wait)
+				act = true // unresolved without a lease record: recover now
+			} else if due := time.Unix(int64(status.SettleAfter), 0).Add(250 * time.Millisecond); !w.now().Before(due) {
+				act = true
 			} else {
-				wait = 0
+				wait = min(due.Sub(w.now()), w.usagePollEvery())
 			}
 		}
-		if wait == 0 {
-			err := w.service(ctx)
+		if act {
+			polled := poll
+			err := w.service(ctx, poll, logf)
 			if ctx.Err() != nil {
 				return
 			}
+			poll = false
 			if err != nil {
-				if logf != nil {
-					logf("Solana lease settlement is not final yet (%v); retrying", err)
-				}
 				wait = retry
 				retry = min(retry*2, 30*time.Second)
+				if errors.Is(err, errKeypairRequired) {
+					wait = 10 * time.Minute
+				}
+				if logf != nil && err.Error() != lastFailure {
+					lastFailure = err.Error()
+					logf("Solana wallet work is not final yet (%v); retrying", err)
+				}
 			} else {
-				retry = time.Second
-				wait = time.Second
+				retry, lastFailure = time.Second, ""
+				if !polled {
+					wait = time.Second // re-evaluate soon after real work
+				}
 			}
 		}
 		timer := time.NewTimer(wait)
@@ -910,6 +1061,8 @@ func (w *SolanaWallet) RunSettlement(ctx context.Context, logf func(format strin
 			return
 		case <-w.wake:
 		case <-timer.C:
+			// Nothing was due: read the open lease's usage before sleeping again.
+			poll = !act && status.PendingRequest && status.SettleAfter != 0
 		}
 		timer.Stop()
 	}

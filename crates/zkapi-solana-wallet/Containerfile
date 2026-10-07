@@ -1,0 +1,30 @@
+# Reproducible release build of zkapi-solana-wallet (no `dev` feature).
+#
+#   scripts/build-solana-wallet.sh            build, print the SHA-256 and version
+#   scripts/build-solana-wallet.sh --verify   build twice from scratch and require identical bytes
+#
+# The toolchain image is pinned by digest. Raise RUST_IMAGE deliberately (and rebuild the release) rather than floating on a tag.
+# Build from the repository root: podman build -f crates/zkapi-solana-wallet/Containerfile -t zkapi-solana-wallet-build .
+ARG RUST_IMAGE=docker.io/library/rust:1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+FROM ${RUST_IMAGE} AS build
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY protocol ./protocol
+COPY solana ./solana
+
+# Nothing machine- or time-specific may reach the binary: build paths are remapped, symbols are stripped, no incremental state.
+ENV CARGO_INCREMENTAL=0 \
+    CARGO_PROFILE_RELEASE_STRIP=symbols \
+    CARGO_HOME=/cargo \
+    SOURCE_DATE_EPOCH=1767225600 \
+    RUSTFLAGS="--remap-path-prefix=/src=/build --remap-path-prefix=/cargo=/cargo-home --remap-path-prefix=/usr/local/rustup=/rustup"
+
+RUN cargo build --locked --release -p zkapi-solana-wallet \
+    && install -D target/release/zkapi-solana-wallet /out/zkapi-solana-wallet \
+    && sha256sum /out/zkapi-solana-wallet > /out/zkapi-solana-wallet.sha256 \
+    && /out/zkapi-solana-wallet --version
+
+FROM scratch AS artifact
+COPY --from=build /out/ /

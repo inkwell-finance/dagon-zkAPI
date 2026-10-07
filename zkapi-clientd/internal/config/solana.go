@@ -7,11 +7,16 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // SolanaNetwork selects native-SOL leases against a pinned Solana vault. It has
 // no Ethereum companion; wallet proofs come from the Solana wallet helper.
 const SolanaNetwork = "solana"
+
+// DefaultSettleIdleSeconds is how long an open lease may go without any new
+// usage before it is settled early; 0 disables idle settlement.
+const DefaultSettleIdleSeconds = 15 * 60
 
 // Well-known Pyth identities for the sponsored SOL/USD feed. They are defaults
 // for Solana.Normalize; every value is still pinned in the saved profile.
@@ -33,6 +38,7 @@ type CurvePoint struct {
 type Solana struct {
 	ServerURL     string `json:"server_url"`     // serverd origin (HTTPS, or loopback HTTP)
 	IndexerURL    string `json:"indexer_url"`    // finalized-account indexer (tree snapshots)
+	RPCURL        string `json:"rpc_url"`        // Solana JSON-RPC for on-chain verification and funding (HTTPS, or loopback HTTP)
 	InferenceBase string `json:"inference_base"` // provider base every lease must carry
 	Cluster       string `json:"cluster"`        // label serverd quotes carry, e.g. mainnet-beta or localnet
 
@@ -54,19 +60,30 @@ type Solana struct {
 	PythMaxAgeSeconds    uint64 `json:"pyth_max_age_seconds"`
 	PythMaxConfidenceBps uint64 `json:"pyth_max_confidence_bps"`
 
-	Prover        string `json:"prover_binary,omitempty"`   // Solana wallet helper (solana_acceptance_wallet)
-	ProofSetupDir string `json:"proof_setup_dir,omitempty"` // request proving key directory
+	Prover        string `json:"prover_binary,omitempty"`   // Solana wallet helper (zkapi-solana-wallet)
+	ProverSHA256  string `json:"prover_sha256,omitempty"`   // pinned SHA-256 of the helper binary; a different file is never run
+	ProofSetupDir string `json:"proof_setup_dir,omitempty"` // proving key directory (request.pk, withdrawal.pk)
+
+	// SettleIdleSeconds settles an open lease early once its key has seen no new
+	// usage for this long (default 900; 0 disables). Settlement also happens when the
+	// lease's spending limit is used up, at its settle time, and on request.
+	SettleIdleSeconds *uint64 `json:"settle_idle_seconds,omitempty"`
 }
 
 var (
 	feltPattern    = regexp.MustCompile(`^0x[0-9a-fA-F]{1,64}$`)
 	decimalPattern = regexp.MustCompile(`^(0|[1-9][0-9]{0,19})$`)
 	clusterPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,31}$`)
+	sha256Pattern  = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 // Normalize fills the documented Pyth defaults. It never invents deployment
 // identity: the program, vault, genesis hash and keys must be supplied.
 func (s *Solana) Normalize() {
+	if s.SettleIdleSeconds == nil {
+		idle := uint64(DefaultSettleIdleSeconds)
+		s.SettleIdleSeconds = &idle
+	}
 	if s.PythFeedID == "" {
 		s.PythFeedID = PythSolUsdFeedID
 	}
@@ -82,6 +99,15 @@ func (s *Solana) Normalize() {
 	if s.PythMaxConfidenceBps == 0 {
 		s.PythMaxConfidenceBps = 100
 	}
+}
+
+// SettleIdle is the idle period after which an unused lease settles; zero
+// disables idle settlement.
+func (s *Solana) SettleIdle() time.Duration {
+	if s.SettleIdleSeconds == nil {
+		return DefaultSettleIdleSeconds * time.Second
+	}
+	return time.Duration(*s.SettleIdleSeconds) * time.Second
 }
 
 // ValidServiceURL accepts an HTTPS origin or a literal-loopback HTTP origin,
@@ -111,6 +137,9 @@ func (s *Solana) Validate() error {
 	if !ValidServiceURL(s.InferenceBase, true) {
 		return errors.New("solana inference_base must be an HTTPS or numeric-loopback HTTP URL without credentials, query or fragment")
 	}
+	if !ValidServiceURL(s.RPCURL, true) {
+		return errors.New("solana rpc_url must be an HTTPS or numeric-loopback HTTP URL without credentials, query or fragment")
+	}
 	if !clusterPattern.MatchString(s.Cluster) {
 		return errors.New("solana cluster must be a short lowercase label")
 	}
@@ -136,6 +165,12 @@ func (s *Solana) Validate() error {
 	if s.MinLeaseCredits == 0 || s.MinLeaseCredits > 1<<53 {
 		return errors.New("solana min_lease_lamports must be positive and below 2^53")
 	}
+	if s.Prover != "" && !sha256Pattern.MatchString(s.ProverSHA256) {
+		return errors.New("solana prover_sha256 must pin the helper binary: 64 lowercase hex digits (see the release notes)")
+	}
+	if s.SettleIdleSeconds != nil && *s.SettleIdleSeconds > 7*24*3600 {
+		return errors.New("solana settle_idle_seconds must be at most one week (0 disables)")
+	}
 	if s.PythMaxAgeSeconds < 1 || s.PythMaxAgeSeconds > 60 || s.PythMaxConfidenceBps < 1 || s.PythMaxConfidenceBps > 100 {
 		return errors.New("solana pyth safety bounds are out of range")
 	}
@@ -156,6 +191,29 @@ const base58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwx
 func Base58Account(value string) bool {
 	decoded, ok := Base58Decode(value)
 	return ok && len(decoded) == 32
+}
+
+// Base58Encode is the Bitcoin-alphabet base58 form of data, with one '1' per leading zero byte.
+func Base58Encode(data []byte) string {
+	zeros := 0
+	for zeros < len(data) && data[zeros] == 0 {
+		zeros++
+	}
+	number := new(big.Int).SetBytes(data)
+	base, mod := big.NewInt(58), new(big.Int)
+	var digits []byte
+	for number.Sign() > 0 {
+		number.DivMod(number, base, mod)
+		digits = append(digits, base58Alphabet[mod.Int64()])
+	}
+	out := make([]byte, 0, zeros+len(digits))
+	for i := 0; i < zeros; i++ {
+		out = append(out, '1')
+	}
+	for i := len(digits) - 1; i >= 0; i-- {
+		out = append(out, digits[i])
+	}
+	return string(out)
 }
 
 // Base58Decode decodes Bitcoin-alphabet base58 including leading-zero bytes.

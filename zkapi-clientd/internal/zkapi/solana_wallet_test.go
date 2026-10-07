@@ -32,7 +32,7 @@ func testHash(id string) string { return "0x" + hex.EncodeToString([]byte(id)) }
 
 func testPin(serverURL string) config.Solana {
 	pin := config.Solana{
-		ServerURL: serverURL, IndexerURL: serverURL, InferenceBase: testBase, Cluster: "localnet",
+		ServerURL: serverURL, IndexerURL: serverURL, RPCURL: "http://127.0.0.1:2", InferenceBase: testBase, Cluster: "localnet",
 		ProgramID: "7NdY5ZVP2He8gSiDHZbkfmNfSgKWV2tkZmZgty2C1d8H", VaultState: "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE",
 		GenesisHash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d", ChainID: testChainID, ProtocolBinding: testBinding,
 		StateSigningKey:     config.CurvePoint{X: "0x" + strings.Repeat("11", 32), Y: "0x" + strings.Repeat("12", 32)},
@@ -122,6 +122,10 @@ type fakeServer struct {
 	nullifier     func() (int, any)
 	retire        func(n int, id string) (int, any)
 	settlement    func(id string) (int, any)
+	clearance     func(nullifier string) (int, any)
+	clearances    []string
+	// clearanceJournaled records whether the wallet file already held the withdrawal when each clearance arrived.
+	clearanceJournaled []bool
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
@@ -203,6 +207,25 @@ func newFakeServer(t *testing.T) *fakeServer {
 	mux.HandleFunc("GET /v2/requests/{id}", func(w http.ResponseWriter, r *http.Request) {
 		status, payload := f.settlement(r.PathValue("id"))
 		reply(w, status, payload)
+	})
+	mux.HandleFunc("POST /v2/withdraw/clearance", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Nullifier string `json:"withdrawal_nullifier"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.mu.Lock()
+		f.clearances = append(f.clearances, body.Nullifier)
+		var file solanaWalletFile
+		saved, _ := os.ReadFile(f.walletF)
+		_ = json.Unmarshal(saved, &file)
+		f.clearanceJournaled = append(f.clearanceJournaled, file.Withdrawal != nil)
+		f.mu.Unlock()
+		if f.clearance != nil {
+			status, payload := f.clearance(body.Nullifier)
+			reply(w, status, payload)
+			return
+		}
+		reply(w, 200, map[string]any{"status": "ok", "withdrawal_nullifier": body.Nullifier, "signature": map[string]string{"r": "0x1", "s": "0x2"}})
 	})
 	mux.HandleFunc("GET /v2/nullifiers/{n}", func(w http.ResponseWriter, r *http.Request) {
 		status, payload := f.nullifier()
@@ -704,6 +727,7 @@ func TestExecProverSpeaksTheHelperProtocolAndDropsHelperErrors(t *testing.T) {
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
   case "$line" in
+    *'"command":"handshake"'*) printf '{"id":%s,"ok":true,"result":{"name":"zkapi-solana-wallet","version":"0.1.0","protocol":1,"dev":false}}\n' "$id" ;;
     *'"command":"derive_deployment"'*) printf '{"id":%s,"ok":true,"result":{"chain_id":"42","protocol_binding":"0x01"}}\n' "$id" ;;
     *'"command":"load_wallet"'*) printf '{"id":%s,"ok":true,"result":{}}\n' "$id" ;;
     *'"command":"tree_path"'*) printf '{"id":%s,"ok":true,"result":{"active_root":"0x01","siblings":["0x02"]}}\n' "$id" ;;

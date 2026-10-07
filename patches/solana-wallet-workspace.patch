@@ -1,0 +1,45 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -7,6 +7,7 @@
+     "crates/zkapi-cli",
+     "crates/zkapi-serverd",
+     "crates/zkapi-indexerd",
++    "crates/zkapi-solana-wallet",
+ ]
+ default-members = ["crates/zkapi-cli"]
+ exclude = ["protocol", "protocol/rust", "sdk", "solana"]
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4983,6 +4983,32 @@
+ ]
+ 
+ [[package]]
++name = "zkapi-solana-wallet"
++version = "0.1.0"
++dependencies = [
++ "anchor-lang",
++ "anyhow",
++ "base64 0.22.1",
++ "bincode",
++ "dagon-zkapi-ledger",
++ "dagon-zkapi-solana-ledger",
++ "dagon-zkapi-vault",
++ "hex",
++ "pyth-solana-receiver-sdk",
++ "reqwest",
++ "serde",
++ "serde_json",
++ "solana-keypair",
++ "solana-message",
++ "solana-program",
++ "solana-signer",
++ "tokio",
++ "zkapi-browser",
++ "zkapi-proof",
++ "zkapi-types",
++]
++
++[[package]]
+ name = "zkapi-types"
+ version = "0.1.0"
+ dependencies = [

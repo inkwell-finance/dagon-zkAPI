@@ -130,9 +130,7 @@ func help() {
   serve                  Run inference using the saved configuration
   lease export           Print a bounded lease key for an external service (needs serve running)
   lease settle|status    Close the open lease now / show it (native-SOL profiles; needs serve running)
-  solana                 Configure and inspect a native-SOL (Solana vault) profile
-  lease settle|status    Close the open lease now / show it (native-SOL profiles; needs serve running)
-  solana                 Configure and inspect a native-SOL (Solana vault) profile
+  solana                 Configure, verify, fund (deposit, withdraw) and inspect a native-SOL (Solana vault) profile
 
 Run zkapi-clientd config --help for configuration options.
 Run zkapi-clientd --version to show the installed version.

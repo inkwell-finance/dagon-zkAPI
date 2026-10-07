@@ -11,7 +11,7 @@ import (
 
 // ServeAdminHTTP is mounted behind the API bearer, browser-origin and owner
 // management-token checks, like the Ethereum funding handler. It serves lease
-// export, early settlement and status for a native-SOL wallet.
+// export, early settlement, funding and status for a native-SOL wallet.
 func (w *SolanaWallet) ServeAdminHTTP(rw http.ResponseWriter, r *http.Request) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.Header().Set("Cache-Control", "no-store")
@@ -51,13 +51,46 @@ func (w *SolanaWallet) ServeAdminHTTP(rw http.ResponseWriter, r *http.Request) {
 				result, err = w.Settle(ctx, true)
 			}
 		}
+	case r.Method == http.MethodPost && r.URL.Path == "/admin/solana/deposit":
+		var body struct {
+			Keypair  string `json:"keypair"`
+			Lamports uint64 `json:"lamports"`
+			Confirm  bool   `json:"confirm"`
+		}
+		if err = decode(&body); err == nil {
+			if !body.Confirm {
+				err = errors.New("a deposit requires explicit confirmation")
+			} else {
+				result, err = w.Deposit(ctx, DepositRequest{KeypairPath: body.Keypair, Lamports: body.Lamports})
+			}
+		}
+	case r.Method == http.MethodPost && r.URL.Path == "/admin/solana/withdraw":
+		var body struct {
+			To       string `json:"to"`
+			Keypair  string `json:"keypair"`
+			All      bool   `json:"all"`
+			Lamports uint64 `json:"lamports"`
+			Confirm  bool   `json:"confirm"`
+		}
+		if err = decode(&body); err == nil {
+			if !body.Confirm {
+				err = errors.New("a withdrawal requires explicit confirmation")
+			} else {
+				result, err = w.Withdraw(ctx, WithdrawRequest{Destination: body.To, KeypairPath: body.Keypair, All: body.All, Lamports: body.Lamports})
+			}
+		}
 	default:
 		rw.WriteHeader(http.StatusNotFound)
 		_ = json.NewEncoder(rw).Encode(map[string]string{"error": "unknown management endpoint"})
 		return
 	}
 	if err != nil {
-		rw.WriteHeader(http.StatusBadGateway)
+		var refusal *FundingError
+		if errors.As(err, &refusal) {
+			rw.WriteHeader(http.StatusUnprocessableEntity)
+		} else {
+			rw.WriteHeader(http.StatusBadGateway)
+		}
 		_ = json.NewEncoder(rw).Encode(map[string]string{"error": err.Error()})
 		return
 	}

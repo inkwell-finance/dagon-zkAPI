@@ -1,0 +1,114 @@
+--- a/crates/zkapi-serverd/src/processor_v2.rs
++++ b/crates/zkapi-serverd/src/processor_v2.rs
+@@ -1539,9 +1539,31 @@
+                 settle_after: lease.settle_after,
+                 spending_limit_usd: lease.spending_limit_usd,
+                 usage_usd: lease.usage_usd,
++                observed_usage_usd: None,
+                 charge_applied: lease.charge_applied,
+                 last_error: lease.last_error,
+             })
++    }
++
++    /// Like [`Self::openrouter_lease_status`], and for a still-active direct OpenRouter key also the issuer's current usage
++    /// reading. Clients poll this to settle early once a key is exhausted or idle; the read is advisory and a failure leaves
++    /// the field out. Settlement itself never uses it.
++    pub async fn openrouter_lease_status_live(
++        &self,
++        client_request_id: &str,
++    ) -> Option<OpenRouterLeaseStatusResponse> {
++        let lease = self.store.lookup_openrouter_lease(client_request_id)?;
++        let mut status = self.openrouter_lease_status(client_request_id)?;
++        if lease.status == "active" && lease.key_source == "openrouter" {
++            if let (Some(provisioner), Some(key_hash)) =
++                (self.openrouter.as_ref(), lease.key_hash.as_deref())
++            {
++                if let Ok(usage) = provisioner.get_key_usage(key_hash).await {
++                    status.observed_usage_usd = Some(usage.usage_usd);
++                }
++            }
++        }
++        Some(status)
+     }
+ 
+     pub fn process_clearance(
+@@ -2472,6 +2494,8 @@
+         fail_delete: bool,
+         lose_delete_response: bool,
+         fail_usage: bool,
++        /// Allow the advisory live read of a key that is still enabled (status polling).
++        live_reads: bool,
+         usage: f64,
+         events: Vec<&'static str>,
+     }
+@@ -2502,7 +2526,10 @@
+         ) -> Result<Json<serde_json::Value>, StatusCode> {
+             let mut state = state.lock().unwrap();
+             state.events.push("usage");
+-            assert!(state.disabled, "usage must be read after spending stops");
++            assert!(
++                state.disabled || state.live_reads,
++                "usage must be read after spending stops"
++            );
+             assert!(!state.deleted, "usage is unavailable after deletion");
+             if state.fail_usage {
+                 state.fail_usage = false;
+@@ -2635,6 +2662,46 @@
+             drop(store);
+             std::fs::remove_file(db_path).unwrap();
+         }
++    }
++
++    #[tokio::test]
++    async fn active_lease_status_reports_live_usage_without_touching_settlement() {
++        let state = Arc::new(std::sync::Mutex::new(RetirementMock {
++            usage: 0.5,
++            live_reads: true,
++            ..Default::default()
++        }));
++        let (processor, request, server) = retirement_processor(state.clone(), 0, None).await;
++        let id = &request.client_request_id;
++        // The plain status never calls the issuer.
++        assert_eq!(
++            processor.openrouter_lease_status(id).unwrap().observed_usage_usd,
++            None
++        );
++        assert!(state.lock().unwrap().events.is_empty());
++        let status = processor.openrouter_lease_status_live(id).await.unwrap();
++        assert_eq!(status.status, "active");
++        assert_eq!(status.observed_usage_usd, Some(0.5));
++        assert_eq!(status.usage_usd, None, "settled usage stays unset until retirement");
++        state.lock().unwrap().usage = 0.75;
++        let status = processor.openrouter_lease_status_live(id).await.unwrap();
++        assert_eq!(status.observed_usage_usd, Some(0.75));
++        // An issuer failure leaves the advisory field out instead of failing the status.
++        state.lock().unwrap().fail_usage = true;
++        let status = processor.openrouter_lease_status_live(id).await.unwrap();
++        assert_eq!(status.observed_usage_usd, None);
++        assert_eq!(status.status, "active");
++        assert!(processor.openrouter_lease_status_live("unknown").await.is_none());
++        // Once retired the settled usage is authoritative and nothing is read live.
++        state.lock().unwrap().fail_usage = false;
++        let retired = processor.retire_openrouter_lease(id, &request).await.unwrap();
++        assert_eq!(retired.status, "finalized");
++        let events = state.lock().unwrap().events.len();
++        let status = processor.openrouter_lease_status_live(id).await.unwrap();
++        assert_eq!(status.observed_usage_usd, None);
++        assert_eq!(status.usage_usd, Some(0.75));
++        assert_eq!(state.lock().unwrap().events.len(), events);
++        server.abort();
+     }
+ 
+     #[tokio::test]
+--- a/crates/zkapi-serverd/src/routes.rs
++++ b/crates/zkapi-serverd/src/routes.rs
+@@ -363,7 +363,8 @@
+     Path(client_request_id): Path<String>,
+ ) -> Result<Json<OpenRouterLeaseStatusResponse>, StatusCode> {
+     processor
+-        .openrouter_lease_status(&client_request_id)
++        .openrouter_lease_status_live(&client_request_id)
++        .await
+         .map(Json)
+         .ok_or(StatusCode::NOT_FOUND)
+ }

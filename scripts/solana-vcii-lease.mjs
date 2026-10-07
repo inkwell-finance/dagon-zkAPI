@@ -12,10 +12,13 @@
 //         that stays inside serverd's quote tolerance. No Wormhole/guardian verification.
 //   --scenario jump: the price also jumps 2% down while the first proof is being generated; serverd must answer a retriable
 //         409 native_quote_stale and the client re-quotes, re-proves and succeeds.
-//   --client clientd --clientd-bin PATH: the CLIENT is the zkapi-clientd daemon instead of the Rust helper: `solana init` /
-//         `import-wallet`, `serve`, `lease export --usd 2 --confirm` (retrying on the jump by itself), a paid MCP call with the
-//         printed key, a daemon crash/restart, `lease settle --confirm`, and the key refused afterwards. A small loopback proxy
-//         sits between clientd and serverd to count lease POSTs and (jump scenario) hold the first until the finalized feed shows the jump.
+//   --client clientd --clientd-bin PATH: the CLIENT is zkapi-clientd instead of the Rust helper, end to end: `solana init` (on-chain
+//         verification; a wrong program pin and a wrong helper SHA-256 pin are refused), `solana deposit` (SIGKILLed once its signed
+//         transactions are journaled, then resumed), `serve`, `lease export --usd 3` + paid MCP calls on vcii with a daemon crash/restart
+//         and a pause inside the idle period, automatic settlement when the limit is used up, a second lease (`--usd 2`) settled by the
+//         idle period alone (`--idle-seconds`, default 40), and `solana withdraw --all` to a fresh address whose lamports are checked on
+//         chain. A small loopback proxy sits between clientd and serverd to count lease POSTs and (jump scenario) hold the first until
+//         the finalized feed shows the jump. The helper binary is zkapi-solana-wallet built with `--features dev` (it also creates the vault).
 // Needs Linux with Node 24 and Agave (solana-test-validator). Loopback only.
 //   VCII_ZK_BASE=http://127.0.0.1:8813/zk VCII_ZK_MANAGEMENT_KEY=... node scripts/solana-vcii-lease.mjs \
 //     --bin-dir /target/sol-host/release --sbf-dir /target/sbf --key-dir /scratch --output-dir .zkapi/solana-acceptance
@@ -80,19 +83,20 @@ function options(args) {
     const parsed = {
         binDir: path.join(ROOT, 'target/release'), sbfDir: path.join(ROOT, 'solana/target/deploy'),
         keyDir: path.join(ROOT, '.zkapi/solana-keys'), outputDir: path.join(ROOT, '.zkapi/solana-acceptance'),
-        refreshMs: 400, scenario: 'steady', client: 'helper', clientdBin: null, proofSetupDir: path.join(ROOT, 'protocol/setup/v2'),
+        refreshMs: 400, idleSeconds: 40, scenario: 'steady', client: 'helper', clientdBin: null, proofSetupDir: path.join(ROOT, 'protocol/setup/v2'),
     };
     for (let i = 0; i < args.length; i++) {
         if (args[i] === '--help') return { help: true };
         const key = { '--bin-dir': 'binDir', '--sbf-dir': 'sbfDir', '--key-dir': 'keyDir', '--output-dir': 'outputDir',
-            '--refresh-ms': 'refreshMs', '--scenario': 'scenario', '--client': 'client', '--clientd-bin': 'clientdBin',
+            '--refresh-ms': 'refreshMs', '--idle-seconds': 'idleSeconds', '--scenario': 'scenario', '--client': 'client', '--clientd-bin': 'clientdBin',
             '--proof-setup-dir': 'proofSetupDir' }[args[i]];
         assert.ok(key && args[i + 1], `Unknown or incomplete option: ${args[i]}`);
-        if (key === 'refreshMs') parsed[key] = Number(args[++i]);
+        if (key === 'refreshMs' || key === 'idleSeconds') parsed[key] = Number(args[++i]);
         else if (key === 'scenario' || key === 'client') parsed[key] = args[++i];
         else parsed[key] = path.resolve(args[++i]);
     }
     assert.ok(Number.isSafeInteger(parsed.refreshMs) && parsed.refreshMs >= 100, '--refresh-ms must be >= 100');
+    assert.ok(Number.isSafeInteger(parsed.idleSeconds) && parsed.idleSeconds >= 20, '--idle-seconds must be >= 20 (clientd idle settlement period used by the test)');
     assert.ok(['steady', 'jump'].includes(parsed.scenario), '--scenario must be steady or jump');
     assert.ok(['helper', 'clientd'].includes(parsed.client), '--client must be helper or clientd');
     assert.ok(parsed.client !== 'clientd' || parsed.clientdBin, '--client clientd needs --clientd-bin');
@@ -145,8 +149,8 @@ async function main() {
         const child = spawn(command, args, { cwd: ROOT, env: { PATH: process.env.PATH,
             RUST_LOG: 'warn,zkapi=info,zkapi_serverd=info,zkapi_indexerd=info,r1cs=warn', ...env },
             stdio: [interactive ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
-        if (!interactive) child.stdout.pipe(out);
-        child.stderr.pipe(out);
+        if (!interactive) child.stdout.pipe(out, { end: false });
+        child.stderr.pipe(out, { end: false });
         child.once('error', error => out.write(error.message));
         child.once('close', () => { children.delete(child); out.end(); });
         children.add(child);
@@ -186,7 +190,7 @@ async function main() {
         return result.value.result;
     }
     function helper(name) {
-        const child = launch(path.join(opts.binDir, 'examples/solana_acceptance_wallet'), [path.join(ROOT, 'protocol/setup/v2')],
+        const child = launch(path.join(opts.binDir, 'zkapi-solana-wallet'), [path.join(ROOT, 'protocol/setup/v2')],
             `${name}-wallet.log`, { interactive: true });
         const lines = readline.createInterface({ input: child.stdout });
         let nextId = 0;
@@ -237,9 +241,10 @@ async function main() {
         const rpcPort = await freePort();
         const rpcUrl = `http://127.0.0.1:${rpcPort}`;
         const faucetPort = await freePort();
-        const portBase = 20_000 + Math.floor(Math.random() * 900) * 10;
+        const gossipPort = await freePort();
+        const portBase = (opts.scenario === 'jump' ? 31_000 : 20_000) + Math.floor(Math.random() * 900) * 10;
         launch('solana-test-validator', ['--reset', '--quiet', '--ledger', path.join('/tmp', `zksol-ledger-${randomUUID().slice(0, 8)}`),
-            '--bind-address', '127.0.0.1', '--rpc-port', String(rpcPort), '--faucet-port', String(faucetPort),
+            '--bind-address', '127.0.0.1', '--rpc-port', String(rpcPort), '--faucet-port', String(faucetPort), '--gossip-port', String(gossipPort),
             '--dynamic-port-range', `${portBase}-${portBase + 99}`,
             '--upgradeable-program', VAULT_PROGRAM_ID, path.join(opts.sbfDir, 'dagon_zkapi_vault.so'), deployerKey,
             '--bpf-program', PYTH_RECEIVER, path.join(opts.sbfDir, 'mock_pyth_writer.so'),
@@ -295,14 +300,16 @@ async function main() {
             '--rpc-url', rpcUrl, '--program-id', vault.program_id, '--vault-state', vault.vault_state, '--poll-interval-ms', '500'], 'indexer.log');
         await waitFor('finalized indexer ready', async () => (await get(`${indexerUrl}/v1/tree/snapshot`)).next_note_id === 0);
         await wallet('attach_indexer', { indexer_url: indexerUrl });
-        const primary = await wallet('deposit', { amount: DEPOSIT });
-        assert.equal(primary.state.note.current_balance, DEPOSIT);
-        assert.equal(primary.state.note.is_genesis, true);
-        // The finalized indexer trails the chain by a few seconds; the ledger refuses a snapshot that disagrees with the vault.
-        const afterDeposit = await waitFor('indexer catches up with the deposit', async () => wallet('vault_snapshot'), 120_000);
-        assert.equal(afterDeposit.next_note_id, 1);
-        assert.ok(BigInt(afterDeposit.vault_lamports) >= BigInt(DEPOSIT), 'vault must hold the deposited lamports');
-        console.log(`deposited ${DEPOSIT} lamports into the Solana vault (finalized); vault now holds ${afterDeposit.vault_lamports} lamports (incl. rent)`);
+        if (opts.client === 'helper') {
+            const primary = await wallet('deposit', { amount: DEPOSIT });
+            assert.equal(primary.state.note.current_balance, DEPOSIT);
+            assert.equal(primary.state.note.is_genesis, true);
+            // The finalized indexer trails the chain by a few seconds; the ledger refuses a snapshot that disagrees with the vault.
+            const afterDeposit = await waitFor('indexer catches up with the deposit', async () => wallet('vault_snapshot'), 120_000);
+            assert.equal(afterDeposit.next_note_id, 1);
+            assert.ok(BigInt(afterDeposit.vault_lamports) >= BigInt(DEPOSIT), 'vault must hold the deposited lamports');
+            console.log(`deposited ${DEPOSIT} lamports into the Solana vault (finalized); vault now holds ${afterDeposit.vault_lamports} lamports (incl. rent)`);
+        }
 
         const serverPort = await freePort();
         const serverUrl = `http://127.0.0.1:${serverPort}`;
@@ -328,7 +335,8 @@ async function main() {
                 body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: tool, arguments: {} } }) });
             return { status: res.status, text: (await res.text()).slice(0, 400) };
         }
-        // --client clientd: zkapi-clientd is the wallet. The Rust helper only made the deposit and hands its note over.
+        // --client clientd: zkapi-clientd is the whole client. Only the vault's creation and the validator belong to the harness;
+        // `solana init` verifies the chain, `solana deposit` funds the note, `serve` leases and settles, `solana withdraw` pays it out.
         async function runWithClientd() {
             // clientd insists on a private (0700) config directory, which the bind-mounted run directory cannot guarantee, and the
             // wallet file holds the note secret: keep both in a fresh private temp directory and remove it at the end.
@@ -382,23 +390,26 @@ async function main() {
             const listenPort = await freePort();
             const apiUrl = `http://127.0.0.1:${listenPort}`;
 
-            function cli(args) {
-                return new Promise((resolve, reject) => {
-                    check();
-                    const log = createWriteStream(path.join(runDir, 'clientd-cli.log'), { flags: 'a', mode: 0o600 });
-                    const child = spawn(opts.clientdBin, ['--config-dir', cfgDir, ...args], { cwd: ROOT, env: { PATH: process.env.PATH },
-                        stdio: ['ignore', 'pipe', 'pipe'] });
-                    children.add(child);
-                    let stdout = '';
-                    child.stdout.on('data', chunk => { stdout += chunk; }); // never logged: `lease export` prints the key here
-                    child.stderr.pipe(log);
+            function spawnCli(args, cfg = cfgDir) {
+                check();
+                const log = createWriteStream(path.join(runDir, 'clientd-cli.log'), { flags: 'a', mode: 0o600 });
+                const child = spawn(opts.clientdBin, ['--config-dir', cfg, ...args], { cwd: ROOT, env: { PATH: process.env.PATH },
+                    stdio: ['ignore', 'pipe', 'pipe'] });
+                children.add(child);
+                let stdout = '';
+                let stderr = '';
+                child.stdout.on('data', chunk => { stdout += chunk; }); // never logged: `lease export` prints the key here
+                child.stderr.on('data', chunk => { stderr += chunk; log.write(chunk); });
+                const done = new Promise((resolve, reject) => {
                     child.once('error', reject);
-                    child.once('close', code => { children.delete(child); log.end(); resolve({ code, stdout }); });
+                    child.once('close', (code, signal) => { children.delete(child); log.end(); resolve({ code, signal, stdout, stderr }); });
                 });
+                return { child, done };
             }
-            async function cliOk(args) {
-                const result = await cli(args);
-                assert.equal(result.code, 0, `zkapi-clientd ${args.slice(0, 2).join(' ')} failed (see clientd-cli.log)`);
+            const cli = (args, cfg) => spawnCli(args, cfg).done;
+            async function cliOk(args, cfg) {
+                const result = await cli(args, cfg);
+                assert.equal(result.code, 0, `zkapi-clientd ${args.slice(0, 2).join(' ')} failed: ${result.stderr.trim().split('\n').slice(-3).join(' | ')}`);
                 return result.stdout;
             }
             async function startDaemon() {
@@ -406,29 +417,115 @@ async function main() {
                 await waitFor('zkapi-clientd serve', async () => (await fetch(`${apiUrl}/healthz`)).status === 200, 30_000);
                 return daemon;
             }
+            const readWallet = async () => JSON.parse(await fs.readFile(walletFile, 'utf8'));
+            const sol = lamports => `${Number(lamports) / 1e9} SOL`;
 
-            // Pin the deployment, then hand the funded note to clientd (the helper deposited it; secrets stay in 0600 files).
-            const deployment = { server_url: `http://127.0.0.1:${proxyPort}`, indexer_url: indexerUrl, inference_base: `${VCII_ZK_BASE.replace(/\/+$/, '')}/v1`, cluster: 'localnet',
+            // The helper clientd runs (a dev build here: it also has the validator-only commands the harness itself uses). Its
+            // SHA-256 is pinned in the profile, and clientd checks the pin and the protocol handshake before every run.
+            const helperBin = path.join(opts.binDir, 'zkapi-solana-wallet');
+            const helperSha = createHash('sha256').update(await fs.readFile(helperBin)).digest('hex');
+            const version = spawnSync(helperBin, ['--version'], { encoding: 'utf8', env: { PATH: process.env.PATH } });
+            console.log(`wallet helper: ${version.stdout.trim()}; sha256 ${helperSha}`);
+            const deployment = { server_url: `http://127.0.0.1:${proxyPort}`, indexer_url: indexerUrl, rpc_url: rpcUrl, inference_base: `${VCII_ZK_BASE.replace(/\/+$/, '')}/v1`, cluster: 'localnet',
                 program_id: vault.program_id, vault_state: vault.vault_state, genesis_hash: genesisHash,
                 state_signing_key: signingKeys.state_signing_key, clearance_signing_key: signingKeys.clearance_signing_key, min_lease_lamports: CAP };
+            const proverFlags = ['--prover', helperBin, '--proof-setup-dir', opts.proofSetupDir];
+
             const deploymentFile = path.join(clientdDir, 'deployment.json');
             await fs.writeFile(deploymentFile, JSON.stringify(deployment), { mode: 0o600 });
-            console.log((await cliOk(['solana', 'init', '--deployment', deploymentFile, '--prover', path.join(opts.binDir, 'examples/solana_acceptance_wallet'),
-                '--proof-setup-dir', opts.proofSetupDir, '--listen', `127.0.0.1:${listenPort}`])).trim());
+
+            // Negative checks first: a wrong pin never produces a profile.
+            const wrongDir = path.join(clientdDir, 'wrong-config');
+            const wrongFile = path.join(clientdDir, 'wrong-deployment.json');
+            await fs.writeFile(wrongFile, JSON.stringify({ ...deployment, program_id: PYTH_RECEIVER }), { mode: 0o600 });
+            const wrongProgram = await cli(['solana', 'init', '--deployment', wrongFile, ...proverFlags, '--prover-sha256', helperSha], wrongDir);
+            console.log(`init with a wrong program id pin -> exit ${wrongProgram.code}: ${wrongProgram.stderr.trim().replace(/^zkapi-clientd: /, '')}`);
+            assert.notEqual(wrongProgram.code, 0, 'a deployment pinning the wrong program must be refused');
+            assert.match(wrongProgram.stderr, /on-chain verification failed/);
+            await assert.rejects(fs.access(path.join(wrongDir, 'config.json')), 'a refused init must not save a profile');
+            const wrongHash = await cli(['solana', 'init', '--deployment', deploymentFile, ...proverFlags, '--prover-sha256', '0'.repeat(64)], wrongDir);
+            assert.notEqual(wrongHash.code, 0, 'a helper that is not the pinned binary must be refused');
+            console.log(`init with a wrong helper SHA-256 pin -> exit ${wrongHash.code}: ${wrongHash.stderr.trim().replace(/^zkapi-clientd: /, '')}`);
+
+            const initOut = await cliOk(['solana', 'init', '--deployment', deploymentFile, ...proverFlags, '--prover-sha256', helperSha,
+                '--settle-idle-seconds', String(opts.idleSeconds), '--listen', `127.0.0.1:${listenPort}`]);
+            console.log(initOut.trim());
+            assert.match(initOut, /Verified on chain/);
             const pinned = JSON.parse(await fs.readFile(path.join(cfgDir, 'config.json'), 'utf8')).zkapi.solana;
             assert.equal(pinned.chain_id, vault.chain_id, 'clientd must derive the same proof chain id as the vault init');
-            const exportFile = path.join(clientdDir, 'wallet-export.json');
-            await fs.writeFile(exportFile, JSON.stringify(await wallet('export_wallet')), { mode: 0o600 });
-            await cliOk(['solana', 'import-wallet', '--file', exportFile]);
-            await fs.rm(exportFile);
+            assert.equal(pinned.prover_sha256, helperSha);
+            const verified = JSON.parse(await cliOk(['solana', 'verify']));
+            assert.equal(verified.verified, true);
+
+            // Exercise the actual direct cancellation on chain: stage just the first transaction of a disposable deposit,
+            // cancel its buffer, and prove the payer recovered the rent (only transaction fees remain spent).
+            await wallet('connect', { rpc_url: rpcUrl, indexer_url: indexerUrl, network: 'localnet',
+                program_id: vault.program_id, vault_state: vault.vault_state, genesis_hash: genesisHash });
+            const beforeStage = BigInt((await rpc(rpcUrl, 'getBalance', [payerKey, { commitment: 'finalized' }])).value);
+            const disposable = await wallet('deposit_params');
+            const preparedStage = await wallet('deposit_prepare', { payer: payerKey, commitment: disposable.registration_commitment, amount: DEPOSIT });
+            const signedStage = await wallet('sign_operation', { keypair: payerFile, operation: preparedStage.operation });
+            await wallet('submit_signed', { signed: { transactions: signedStage.signed.transactions.slice(0, 1) }, finalize: true });
+            const cancel = await wallet('cancel_prepare', { payer: payerKey, operation_id: preparedStage.operation.operation_id });
+            const signedCancel = await wallet('sign_operation', { keypair: payerFile, operation: cancel.operation });
+            await wallet('submit_signed', { signed: signedCancel.signed, finalize: true });
+            await assert.rejects(wallet('cancel_prepare', { payer: payerKey, operation_id: preparedStage.operation.operation_id }), /staged buffer is absent/);
+            const afterCancel = BigInt((await rpc(rpcUrl, 'getBalance', [payerKey, { commitment: 'finalized' }])).value);
+            assert.ok(beforeStage - afterCancel > 0n && beforeStage - afterCancel <= 100_000n, 'cancel must return the buffer rent, leaving only transaction fees spent');
+            assert.equal((await wallet('vault_snapshot')).next_note_id, 0, 'the cancelled operation must not deposit a note');
+            console.log(`BUFFER CLEANUP: real staged operation cancelled and confirmed absent; rent returned, ${beforeStage - afterCancel} lamports spent on fees.`);
+
+            // Fund the note from the harness's local keypair file. The first run is SIGKILLed once its signed transactions are
+            // journaled but before they are final; the second finds the journal and finishes from the chain.
+            console.log(`depositing ${sol(DEPOSIT)} from keypair file payer.json (public ${payerKey}) with zkapi-clientd solana deposit`);
+            const depositArgs = ['solana', 'deposit', '--keypair', payerFile, '--sol', String(DEPOSIT / 1e9), '--confirm'];
+            const first = spawnCli(depositArgs);
+            const interruptedAt = Date.now();
+            let journaled;
+            await waitFor('the deposit journal with signed transactions', async () => {
+                try { journaled = (await readWallet()).deposit; } catch { return false; }
+                return journaled?.signed ? true : first.child.exitCode !== null;
+            }, 300_000);
+            first.child.kill('SIGKILL');
+            const killed = await first.done;
+            const midway = await readWallet();
+            if (killed.signal === 'SIGKILL' && midway.deposit) {
+                console.log(`deposit SIGKILLed ${((Date.now() - interruptedAt) / 1000).toFixed(1)}s in; journal holds note ${midway.deposit.note_id}, ${midway.deposit.signed.transactions.length} signed transactions, no note yet: ${midway.state === null}`);
+                assert.equal(midway.state, null, 'the note must not be installed before the deposit is final');
+                assert.ok(midway.deposit.secret, 'the note secret must be journaled before the chain is touched');
+                const pendingStatus = JSON.parse(await cliOk(['solana', 'status']));
+                assert.equal(pendingStatus.wallet.pending_deposit, true);
+            } else {
+                console.log('deposit finished before it could be interrupted; the crash check is skipped for this run');
+            }
+            const depositOut = JSON.parse(await cliOk(depositArgs.slice(0, 2).concat(['--keypair', payerFile, '--confirm'])));
+            console.log('DEPOSIT via clientd (resumed from the journal):', JSON.stringify(depositOut));
+            assert.equal(depositOut.kind, 'deposit');
+            assert.equal(depositOut.lamports, DEPOSIT);
+            assert.equal(depositOut.private_balance_lamports, String(DEPOSIT));
+            assert.ok(depositOut.signature, 'the deposit result carries the executing transaction signature');
             const funded = JSON.parse(await cliOk(['solana', 'status']));
             assert.equal(funded.wallet.private_balance_lamports, String(DEPOSIT));
-            console.log(`clientd profile pinned (chain id ${pinned.chain_id}); imported note holds ${funded.wallet.private_balance_lamports} lamports`);
+            assert.equal(funded.wallet.pending_deposit ?? false, false);
+            assert.ok(!(await fs.readFile(walletFile, 'utf8')).includes('"deposit":{'), 'the deposit journal must be cleared');
+            const afterDeposit = await waitFor('indexer catches up with the clientd deposit', async () => {
+                const snapshot = await wallet('vault_snapshot');
+                return snapshot.next_note_id === 1 && snapshot;
+            }, 120_000);
+            assert.ok(BigInt(afterDeposit.vault_lamports) >= BigInt(DEPOSIT), 'the vault must hold the deposited lamports');
+            console.log(`clientd deposited ${sol(DEPOSIT)} (tx ${depositOut.signature.slice(0, 16)}...); vault holds ${afterDeposit.vault_lamports} lamports`);
+            const treeRoot = (await waitFor('indexer snapshot', async () => wallet('wallet_snapshot_tree'))).root;
+            await waitFor('serverd root equals the finalized vault root after the deposit', async () => BigInt((await get(`${serverUrl}/health`)).current_root) === BigInt(treeRoot), 120_000);
 
             let daemon = await startDaemon();
-            const started = Date.now();
-            const exported = await cli(['lease', 'export', '--usd', '2', '--confirm']);
-            assert.equal(exported.code, 0, 'zkapi-clientd lease export failed (see clientd-cli.log)');
+            const lastQuote = () => proxyStats.posts.filter(p => p.status === 201).at(-1).quote;
+            let charged = 0n;
+
+            // Lease 1 (3 USD): one paid call, a pause shorter than the idle period (still open: the key is in use), a second call that
+            // uses the limit up, and clientd settles it on its own.
+            let started = Date.now();
+            const exported = await cli(['lease', 'export', '--usd', '3', '--confirm']);
+            assert.equal(exported.code, 0, `zkapi-clientd lease export failed: ${exported.stderr.trim().split('\n').slice(-2).join(' | ')}`);
             const key = exported.stdout.trim();
             assert.match(key, /^vcii_zk_/, 'lease export must print the key minted by vcii');
             console.log(`lease export succeeded in ${((Date.now() - started) / 1000).toFixed(1)}s; key length ${key.length} (key redacted)`);
@@ -447,14 +544,14 @@ async function main() {
                 assert.deepEqual(posts.map(p => p.status), [201], 'a price walk inside the tolerance must never be refused');
             }
             assert.ok(!(await fs.readFile(walletFile, 'utf8')).includes(key), 'the exported key must not be stored in the wallet file');
-
             const replay = await request(`${serverUrl}/v2/openrouter/leases`, { method: 'POST', value: JSON.parse(accepted.body.toString()) });
             assert.equal(replay.status, 409, 'active lease replay must not mint another runtime key');
             const call = await mcpCall(key, 'market_pulse');
             console.log(`vcii /mcp tools/call market_pulse with the clientd-exported key -> HTTP ${call.status}`, call.text.slice(0, 160).replace(/\s+/g, ' '));
             assert.equal(call.status, 200);
+            assert.equal(JSON.parse(await cliOk(['lease', 'status'])).pending_request, true);
 
-            // Crash safety: SIGKILL the daemon mid-lease; the restarted one finds the open lease from the wallet file.
+            // Crash safety: SIGKILL the daemon mid-lease; the restarted one finds the open lease (and its idle clock) in the wallet file.
             daemon.kill('SIGKILL');
             await new Promise(resolve => daemon.once('close', resolve));
             daemon = await startDaemon();
@@ -462,22 +559,80 @@ async function main() {
             assert.equal(pending.pending_request, true);
             assert.ok(pending.settle_after > Date.now() / 1000, 'the open lease must survive a daemon crash');
             console.log(`daemon killed and restarted: lease still open until ${new Date(pending.lease_expires_at * 1000).toISOString()}`);
-            const stillValid = await mcpCall(key, 'market_pulse');
-            assert.equal(stillValid.status, 200, 'a restart must not retire a key that is still in use');
 
-            const settled = JSON.parse(await cliOk(['lease', 'settle', '--confirm']));
-            const expected = expectedLamports(accepted.quote, 1_500_000);
-            console.log('SETTLEMENT via clientd:', JSON.stringify(settled), `(expected balance ${BigInt(DEPOSIT) - expected}: 1.5 USD at the accepted quote, ceil)`);
-            assert.equal(settled.settled, true);
-            assert.equal(BigInt(settled.private_balance_lamports), BigInt(DEPOSIT) - expected, 'note balance must drop by exactly the settled charge');
-            const after = JSON.parse(await cliOk(['solana', 'status']));
-            assert.equal(after.wallet.pending_request, false);
-            assert.equal(after.wallet.private_balance_lamports, settled.private_balance_lamports);
-            const refused = await mcpCall(key, 'market_pulse');
-            console.log(`after settlement the key is refused: HTTP ${refused.status}`);
-            assert.equal(refused.status, 401);
+            // A key in use is never settled under its user: wait most of the idle period, still open, then use the key again.
+            await delay(Math.floor(opts.idleSeconds * 0.5 * 1000));
+            const mid = JSON.parse(await cliOk(['lease', 'status']));
+            assert.equal(mid.pending_request, true, 'a key inside its idle period must stay open');
+            console.log(`${(opts.idleSeconds * 0.5).toFixed(0)}s after the first call (idle period ${opts.idleSeconds}s) the lease is still open; usage seen so far ${mid.lease_usage_usd} USD, idle settlement at ${new Date(mid.idle_settle_at * 1000).toISOString()}`);
+            assert.ok(mid.lease_usage_usd >= 1.5, 'clientd must have read the first call from serverd');
+            const second = await mcpCall(key, 'market_pulse');
+            assert.equal(second.status, 200, 'the second call (using the 3 USD limit up) must succeed');
+            started = Date.now();
+            await waitFor('clientd settles the exhausted lease by itself', async () => !(await cliOk(['lease', 'status']).then(JSON.parse)).pending_request, 240_000);
+            const exhaustedAfter = (Date.now() - started) / 1000;
+            console.log(`lease 1 settled by clientd ${exhaustedAfter.toFixed(1)}s after its limit was used up (no 'lease settle' was run)`);
+            assert.ok(exhaustedAfter < opts.idleSeconds, 'exhaustion must settle sooner than the idle period');
+            charged += expectedLamports(accepted.quote, 3_000_000);
+            const afterOne = JSON.parse(await cliOk(['solana', 'status']));
+            assert.equal(BigInt(afterOne.wallet.private_balance_lamports), BigInt(DEPOSIT) - charged, 'note balance must drop by exactly the settled charge (2 x 1.5 USD, ceil)');
+            assert.equal((await mcpCall(key, 'market_pulse')).status, 401, 'after settlement the key is refused');
+            console.log(`SETTLEMENT 1 (limit used up): note balance ${afterOne.wallet.private_balance_lamports} = ${DEPOSIT} - ${charged}`);
+
+            // Lease 2 (2 USD): one call, then nothing. clientd settles it once the key has been idle for the idle period.
+            const exported2 = await cli(['lease', 'export', '--usd', '2', '--confirm']);
+            assert.equal(exported2.code, 0, `second lease export failed: ${exported2.stderr.trim().split('\n').slice(-2).join(' | ')}`);
+            const key2 = exported2.stdout.trim();
+            const accepted2 = proxyStats.posts.filter(p => p.status === 201).at(-1);
+            assert.notEqual(accepted2.id, accepted.id);
+            assert.equal((await mcpCall(key2, 'market_pulse')).status, 200);
+            const lastCall = Date.now();
+            await waitFor('clientd settles the idle lease by itself', async () => !(await cliOk(['lease', 'status']).then(JSON.parse)).pending_request, 300_000);
+            const idleAfter = (Date.now() - lastCall) / 1000;
+            console.log(`lease 2 settled by clientd ${idleAfter.toFixed(1)}s after its last use (idle period ${opts.idleSeconds}s; no 'lease settle' was run)`);
+            assert.ok(idleAfter >= opts.idleSeconds * 0.75, `the idle lease settled after ${idleAfter}s, before its idle period`);
+            charged += expectedLamports(accepted2.quote, 1_500_000);
+            const afterTwo = JSON.parse(await cliOk(['solana', 'status']));
+            assert.equal(BigInt(afterTwo.wallet.private_balance_lamports), BigInt(DEPOSIT) - charged);
+            assert.equal((await mcpCall(key2, 'market_pulse')).status, 401, 'after idle settlement the key is refused');
+            console.log(`SETTLEMENT 2 (idle): note balance ${afterTwo.wallet.private_balance_lamports} = ${DEPOSIT} - ${charged}`);
+            const clientdLog = await fs.readFile(path.join(runDir, 'clientd.log'), 'utf8');
+            assert.match(clientdLog, /Settling the open Solana lease early: its spending limit is used up/);
+            assert.match(clientdLog, /Settling the open Solana lease early: it saw no new usage/);
+
+            // Withdraw everything to a fresh address, with the daemon running (it owns the wallet file, so the CLI asks it to).
+            const destFile = path.join(opts.keyDir, `withdraw-destination-${randomUUID().slice(0, 8)}.json`);
+            const destination = (await wallet('keygen', { path: destFile })).pubkey;
+            assert.equal((await rpc(rpcUrl, 'getBalance', [destination, { commitment: 'finalized' }])).value, 0, 'the destination must start empty');
+            const remaining = BigInt(DEPOSIT) - charged;
+            const withdrawal = await cli(['solana', 'withdraw', '--to', destination, '--all', '--confirm']);
+            assert.equal(withdrawal.code, 0, `solana withdraw failed: ${withdrawal.stderr.trim().split('\n').slice(-2).join(' | ')}`);
+            assert.match(withdrawal.stderr, /daemon is running/, 'with the daemon up, the withdrawal goes through its management API');
+            const paidOut = JSON.parse(withdrawal.stdout);
+            console.log('WITHDRAWAL via clientd:', JSON.stringify(paidOut));
+            assert.equal(paidOut.kind, 'withdrawal');
+            assert.equal(paidOut.destination, destination);
+            assert.equal(BigInt(paidOut.lamports), remaining);
+            assert.ok(paidOut.signature);
+            const arrived = await waitFor('the withdrawn lamports at the destination', async () => {
+                const balance = (await rpc(rpcUrl, 'getBalance', [destination, { commitment: 'finalized' }])).value;
+                return balance > 0 && BigInt(balance);
+            }, 60_000);
+            // The vault pays the note's remaining balance and closes the note account, whose rent goes to the destination too.
+            const noteRent = BigInt(await rpc(rpcUrl, 'getMinimumBalanceForRentExemption', [94]));
+            console.log(`destination ${destination} now holds ${arrived} lamports (${sol(arrived)}) = remaining balance ${remaining} + closed note account rent ${noteRent}`);
+            assert.equal(arrived, remaining + noteRent, 'the destination must receive the note\'s remaining balance plus the closed note account\'s rent');
+            const closed = JSON.parse(await cliOk(['solana', 'status']));
+            assert.equal(closed.wallet.has_note, false);
+            assert.equal(closed.wallet.pending_withdrawal ?? false, false);
+            const history = (await readWallet()).history.map(h => `${h.kind} ${h.lamports} ${h.signature.slice(0, 12)}...`);
+            console.log('wallet history:', history.join(' | '));
+            assert.equal(history.length, 2);
+            const noMore = await cli(['lease', 'export', '--usd', '2', '--confirm']);
+            assert.notEqual(noMore.code, 0, 'a closed note must not open another lease');
+            console.log(`after the withdrawal a lease is refused: ${noMore.stderr.trim().replace(/^zkapi-clientd: /, '').slice(0, 120)}`);
             assert.equal(updaterFailure, undefined, `Pyth refresh failed: ${updaterFailure?.message}`);
-            console.log(`PASS (${opts.scenario}): zkapi-clientd native-SOL lease -> lease export key -> paid MCP call -> crash/restart -> settlement installed -> key refused.`);
+            console.log(`PASS (${opts.scenario}): zkapi-clientd init (on-chain verified; wrong program pin and wrong helper pin refused) -> deposit (SIGKILLed and resumed) -> lease export -> paid MCP calls -> daemon crash/restart -> key in use stays open -> exhausted lease settled -> idle lease settled -> withdraw --all to a fresh address.`);
         }
         if (opts.client === 'clientd') {
             await runWithClientd();
