@@ -11,6 +11,7 @@
     "build": "node build.mjs",
     "start": "node coordinator/server.mjs",
     "init": "node coordinator/cli.mjs init",
+    "close": "node coordinator/cli.mjs close",
     "finalize": "node coordinator/cli.mjs finalize",
     "contribute": "node contribute.mjs",
     "verify": "node verify-ceremony.mjs",
@@ -18,6 +19,7 @@
   },
   "dependencies": {
     "@hono/node-server": "2.1.5",
+    "@noble/curves": "1.9.7",
     "hono": "4.13.14",
     "snarkjs": "0.7.6"
   },

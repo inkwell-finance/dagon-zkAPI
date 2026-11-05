@@ -1,6 +1,6 @@
 // The contributor page. Everything protocol-shaped (queue, download, attestation, upload) is lib/flow.mjs, shared with the
 // CLI; the contribution itself runs in worker.js. This file is only the user interface.
-import { CeremonyClient, CeremonyError } from "../lib/client.mjs";
+import { CeremonyClient, CeremonyError, httpError } from "../lib/client.mjs";
 import { contributeToCeremony } from "../lib/flow.mjs";
 import { prettyHash } from "../lib/hex.mjs";
 
@@ -16,6 +16,7 @@ const missing = [];
 if (!window.isSecureContext || !crypto?.subtle) missing.push("a secure (https) connection");
 if (typeof Worker === "undefined") missing.push("Web Workers");
 if (typeof WebAssembly === "undefined") missing.push("WebAssembly");
+if (typeof Promise.withResolvers !== "function") missing.push("Promise.withResolvers");
 if (missing.length > 0) {
   el.unsupported.hidden = false;
   el.unsupported.textContent = `This browser cannot take part from this page: it lacks ${missing.join(", ")}. Use a recent Chrome, Firefox, Safari or Edge, or the command line (see the README).`;
@@ -23,19 +24,20 @@ if (missing.length > 0) {
 
 // ---- extra entropy: pointer movement and key timing; mixed into what snarkjs uses, never replacing it ---------------
 const samples = [];
+let collecting = true;
 let lastSample = 0;
 addEventListener(
   "pointermove",
   (event) => {
     const t = performance.now();
-    if (t - lastSample < 8 || samples.length >= 4096) return;
+    if (!collecting || t - lastSample < 8 || samples.length >= 4096) return;
     lastSample = t;
     samples.push(`${event.clientX},${event.clientY},${t.toFixed(3)}`);
     el["entropy-note"].dataset.samples = String(samples.length);
   },
   { passive: true },
 );
-addEventListener("keydown", () => samples.length < 4096 && samples.push(`k${performance.now().toFixed(3)}`), { passive: true });
+addEventListener("keydown", () => collecting && samples.length < 4096 && samples.push(`k${performance.now().toFixed(3)}`), { passive: true });
 const entropyText = () => `${el.entropy.value}|${samples.join(";")}|${Date.now()}|${performance.now()}`;
 
 // ---- the contribution worker ----------------------------------------------------------------------------------------
@@ -56,6 +58,7 @@ function startWorker() {
   w.onerror = (event) => {
     for (const job of pending.values()) job.reject(new Error(event.message || "The worker crashed (out of memory?)."));
     pending.clear();
+    w.terminate();
     worker = undefined;
   };
   return w;
@@ -80,15 +83,19 @@ function upload(ticket, blob, onProgress) {
   xhr.upload.onprogress = (event) => event.lengthComputable && onProgress(event.loaded, event.total);
   xhr.onerror = () => reject(new CeremonyError("network", "The upload was interrupted."));
   xhr.onload = () => {
-    let body = {};
+    let body;
     try {
       body = JSON.parse(xhr.responseText);
     } catch {
       // not JSON: handled below by the status code
     }
-    if (xhr.status >= 200 && xhr.status < 300) resolve(body);
-    else reject(new CeremonyError(body.error ?? "http_error", body.message ?? `The server answered HTTP ${xhr.status}.`, xhr.status));
+    if (xhr.status >= 200 && xhr.status < 300) resolve(body ?? {});
+    else reject(httpError(xhr.status, body));
   };
+  xhr.onabort = () => reject(controller.signal.reason ?? new Error("Upload cancelled."));
+  const abort = () => xhr.abort();
+  controller.signal.addEventListener("abort", abort, { once: true });
+  xhr.onloadend = () => controller.signal.removeEventListener("abort", abort);
   xhr.send(blob);
   return promise;
 }
@@ -227,8 +234,20 @@ document.addEventListener("visibilitychange", () => document.visibilityState ===
 
 let controller;
 
+function clearEntropy() {
+  collecting = false;
+  el.entropy.value = "";
+  samples.fill("");
+  samples.length = 0;
+  worker?.terminate();
+  worker = undefined;
+  for (const job of pending.values()) job.reject(new Error("Contribution cancelled."));
+  pending.clear();
+}
+
 async function start() {
   controller = new AbortController();
+  collecting = true;
   show("run");
   setStep("queue");
   el.bar.removeAttribute("value");
@@ -256,6 +275,7 @@ async function start() {
     el["failed-message"].textContent = error instanceof CeremonyError || error instanceof Error ? error.message : String(error);
     show("failed");
   } finally {
+    clearEntropy();
     removeEventListener("beforeunload", warnLeaving);
     clearInterval(clockTimer);
     await wakeLock?.release().catch(() => {});
@@ -264,7 +284,7 @@ async function start() {
 }
 
 el.start.onclick = start;
-el.cancel.onclick = () => controller?.abort();
+el.cancel.onclick = () => { controller?.abort(); clearEntropy(); };
 el.retry.onclick = () => show("intro");
 
 // ---- status and the public list -------------------------------------------------------------------------------------

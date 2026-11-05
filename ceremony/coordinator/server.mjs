@@ -6,6 +6,7 @@ import { loadAssets } from "./assets.mjs";
 import { Coordinator } from "./coordinator.mjs";
 import { childVerifier } from "./verify-child.mjs";
 
+import { requireMemory } from "./resources.mjs";
 // Environment (all optional):
 //   DATA_DIR       where the ceremony lives (default ./data; a Railway volume in production)
 //   HOST, PORT     listen address (default 0.0.0.0:8788)
@@ -18,6 +19,7 @@ const env = process.env;
 const dataDir = resolve(env.DATA_DIR ?? "data");
 const number = (name, fallback) => (env[name] ? Number(env[name]) : fallback);
 
+requireMemory();
 const coordinator = await Coordinator.open({
   dataDir,
   verify: childVerifier({ timeoutMs: number("VERIFY_TIMEOUT_MINUTES", 30) * 60_000 }),
@@ -38,7 +40,7 @@ for (const signal of ["SIGTERM", "SIGINT"]) {
   process.once(signal, async () => {
     console.log(`[ceremony] ${signal}: finishing the verification in progress, then exiting`);
     server.close();
-    await coordinator.settled();
+    await coordinator.shutdown();
     process.exit(0);
   });
 }

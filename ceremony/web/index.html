@@ -23,11 +23,11 @@
   <section id="intro" class="card">
     <h2>What happens when you press the button</h2>
     <ul class="points">
-      <li><b>Why.</b> Zero-knowledge proofs need public keys that were made from secret random numbers. Whoever knows those secrets could forge proofs, so the secrets must be destroyed. Many people each add their own randomness; the secrets are gone unless <em>every single one</em> of them cheated.</li>
-      <li><b>You.</b> Your browser downloads the current keys, mixes in fresh randomness from your device (and anything you type or wiggle below), sends the changed keys back and forgets the randomness. About <span id="eta">a few</span> minute(s).</li>
-      <li><b>One honest person is enough.</b> You do not have to trust us, or anyone: if you are honest, the setup is safe, and anyone can re-check the whole chain afterwards.</li>
-      <li><b>What it does not do.</b> No wallet, no account, no keys of yours, nothing installed or stored. We never see your randomness; only the public result is uploaded. We keep no IP addresses beyond short-lived rate limiting.</li>
-      <li><b>Please.</b> Use a device you trust, close other tabs, keep this one open and awake until it says &ldquo;Done&rdquo;.</li>
+      <li><b>Why.</b> At least one participant must contribute using honest software on a trusted device and keep their randomness unknown.</li>
+      <li><b>You.</b> The reviewed client mixes fresh device randomness into the current keys and uploads the public result. Estimated queue time per person: <span id="eta">a few</span> minute(s); actual timing depends on your device and connection.</li>
+      <li><b>Trust boundary.</b> This website supplies your code: using it trusts the operator not to replace it. For the strongest path, independently obtain, audit and reproducibly build the CLI as described in the repository README. Same-origin integrity hashes do not authenticate the operator.</li>
+      <li><b>Privacy.</b> The reviewed client does not intentionally send secret randomness. Names and contributions are public. Hosting providers may keep network logs; JavaScript cannot guarantee memory erasure.</li>
+      <li><b>Please.</b> Use a trusted device, never paste existing secrets, and keep this tab open until Done. Then close it.</li>
     </ul>
 
     <label for="name">Name to show in the public list <span class="muted">(optional)</span></label>
@@ -53,7 +53,7 @@
     <progress id="bar" max="1" value="0"></progress>
     <p id="run-detail" class="muted"></p>
     <p id="run-clock" class="muted small"></p>
-    <p class="muted small">Keep this tab open. Nothing secret leaves your device. <button id="cancel" type="button" class="link">Leave the queue</button></p>
+    <p class="muted small">Keep this tab open. The reviewed client uploads public keys only. <button id="cancel" type="button" class="link">Leave the queue</button></p>
   </section>
 
   <section id="done" class="card" hidden>
@@ -64,14 +64,14 @@
       <button id="copy" type="button" class="soft">Copy</button>
     </div>
     <h3>Post this to attest</h3>
-    <p class="muted small">Anyone can check that your contribution is in the final keys. Posting the hash somewhere public (not here) is what makes it count as proof.</p>
+    <p class="muted small">Retain and publish your attestation independently, then require it with the verifier's receipt check. A self-consistent transcript alone does not prove inclusion.</p>
     <textarea id="post" rows="4" readonly></textarea>
     <p class="links"><a id="share-x" target="_blank" rel="noopener noreferrer">Post on X</a> <a id="share-bsky" target="_blank" rel="noopener noreferrer">Post on Bluesky</a> <a id="share-mail" rel="noopener noreferrer">Email it to yourself</a> <button id="copy-post" type="button" class="soft">Copy text</button></p>
     <details>
       <summary>Per-circuit contribution hashes</summary>
       <div id="circuit-hashes"></div>
     </details>
-    <p class="muted small">You can close this page now. Nothing about your randomness exists anywhere any more.</p>
+    <p class="muted small">Close this page now. Inputs have been cleared and the worker terminated; JavaScript and the operating system cannot guarantee secret-memory erasure.</p>
   </section>
 
   <section id="failed" class="card error" hidden>
@@ -84,7 +84,7 @@
     <h2>Contributors</h2>
     <p class="muted" id="roster-summary"></p>
     <ol id="roster" class="roster"></ol>
-    <p class="muted small">Verify everything yourself: <code>node verify-ceremony.mjs <span class="origin"></span></code> (see the README).</p>
+    <p class="muted small">For final adoption use <code>--strict --ceremony ceremony.json --checkpoint closed.json --receipt YOUR_HASH</code> with the repository verifier; see the README for independent authentication.</p>
   </section>
 
   <footer class="muted small">

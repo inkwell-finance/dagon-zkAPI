@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { bls12_381 } from "@noble/curves/bls12-381";
 
 // Public randomness for the final contribution. The source is committed in ceremony.json before the ceremony closes:
 //   { "source": "drand",   "round": N,  "chain": "<hash>", "applyAfter": "<ISO UTC>" }
@@ -6,6 +7,8 @@ import { createHash } from "node:crypto";
 // Every value is fetched from TWO independent public services and must agree; otherwise nothing is applied.
 
 export const DRAND_DEFAULT_CHAIN = "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971"; // quicknet, 3 s period
+export const DRAND_PUBLIC_KEY = "83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a";
+export const drandRoundTime = (round) => (1692803367 + (round - 1) * 3) * 1000;
 export const DRAND_RELAYS = ["https://api.drand.sh", "https://api2.drand.sh"];
 export const BITCOIN_APIS = ["https://blockstream.info/api", "https://mempool.space/api"];
 export const BITCOIN_CONFIRMATIONS = 6;
@@ -33,11 +36,18 @@ function requireAgreement(observations, what) {
 
 async function drandValue(spec, { fetch: fetcher, relays = DRAND_RELAYS }) {
   const chain = spec.chain ?? DRAND_DEFAULT_CHAIN;
+  if (chain !== DRAND_DEFAULT_CHAIN) throw new Error("only the authenticated drand quicknet chain is supported");
+  if (Date.parse(spec.applyAfter) !== drandRoundTime(spec.round)) throw new Error("drand applyAfter must equal the scheduled round time");
   const observations = [];
   for (const relay of relays) {
     const url = `${relay}/${chain}/public/${spec.round}`;
     const body = await getJson(fetcher, url);
     if (body.round !== spec.round) throw new Error(`${url}: answered round ${body.round}`);
+    if (typeof body.signature !== "string" || !/^[0-9a-f]{96}$/.test(body.signature)) throw new Error(`${url}: invalid BLS signature encoding`);
+    const roundBytes = Buffer.alloc(8);
+    roundBytes.writeBigUInt64BE(BigInt(spec.round));
+    const message = createHash("sha256").update(roundBytes).digest();
+    if (!bls12_381.verifyShortSignature(body.signature, message, DRAND_PUBLIC_KEY)) throw new Error(`${url}: invalid drand BLS signature`);
     const expected = createHash("sha256").update(Buffer.from(body.signature, "hex")).digest("hex");
     if (body.randomness !== expected) throw new Error(`${url}: randomness is not sha256(signature)`);
     observations.push({ url, value: body.randomness });

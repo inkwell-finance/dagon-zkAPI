@@ -53,6 +53,6 @@ export async function applyBeacon({ zkeyIn, zkeyOut, name, beaconHex, iterations
 }
 
 async function inMemory(file) {
-  return typeof file === "string" ? { type: "mem", data: new Uint8Array(await readFile(file)) } : file;
+  return typeof file === "string" ? { type: "mem", data: await readFile(file) } : file;
 }
 

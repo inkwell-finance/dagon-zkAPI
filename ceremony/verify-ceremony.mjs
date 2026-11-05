@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Re-verifies a whole Dagon zkAPI ceremony with no trust in the coordinator.
+// Re-verifies published algebra and artifacts using an independently obtained client and pinned configuration.
 //
 //   node verify-ceremony.mjs https://ceremony.dagon.so --ceremony ceremony.json
 //   node verify-ceremony.mjs ./copy-of-the-data-directory --ceremony ceremony.json --r1cs-dir ./my-own-r1cs
@@ -14,7 +14,6 @@
 //    initial zkey and checks every contribution and the beacon in the file)
 //  * the final beacon matches the value re-fetched from the public source named in ceremony.json
 //  * the verification keys, and the sha256 of every final key
-import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -22,9 +21,9 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { zKey } from "snarkjs";
 import { attestationHash } from "./lib/attestation.mjs";
-import { fetchBeacon } from "./lib/beacon.mjs";
+import { DEFAULT_ITERATIONS_EXP, fetchBeacon } from "./lib/beacon.mjs";
 import { validateConfig } from "./lib/config.mjs";
-import { downloadTo, hashFile } from "./lib/files.mjs";
+import { downloadTo, hashFile, jsonSha256, writeJsonAtomic } from "./lib/files.mjs";
 import { hermezPin } from "./lib/hermez.mjs";
 import { ptauFileName } from "./lib/ptau.mjs";
 import { BN254_SCALAR_FIELD, ptauPowerNeeded, readR1csHeader } from "./lib/r1cs-info.mjs";
@@ -41,13 +40,21 @@ const USAGE = `Usage: node verify-ceremony.mjs <coordinator URL | directory> [op
   --all-rounds        run the full snarkjs verification on EVERY round, not just the final one (slow)
   --offline           do not re-fetch the beacon value from its public source
   --require-final     fail unless the final beacon has been applied
+  --strict            require finality, all rounds, online beacon authentication, pinned config and checkpoint
+  --checkpoint FILE   independently retained pre-beacon closed.json; requires exact tip inclusion
+  --receipt HASH      expected participant attestation (repeatable)
+  --manifest FILE     write an adoption manifest only after strict verification succeeds
   --allow-custom-ptau accept a Powers of Tau file that is not in the Hermez list (tests only)
   --json              print the report as JSON`;
 
 /**
  * @returns {Promise<{ok: boolean, finalized: boolean, checks: Array<{ok: boolean|null, name: string, detail?: string}>, keys: Record<string, object>}>}
  */
-export async function verifyCeremony({ source: sourceArg, ceremonyFile, r1csDir, ptauFile, cacheDir = join(tmpdir(), "dagon-ceremony-verify"), finalOnly = false, allRounds = false, offline = false, requireFinal = false, allowCustomPtau = false, fetch: fetcher = fetch, now = Date.now, log = () => {} }) {
+export async function verifyCeremony({ source: sourceArg, ceremonyFile, r1csDir, ptauFile, cacheDir = join(tmpdir(), "dagon-ceremony-verify"), finalOnly = false, allRounds = false, offline = false, requireFinal = false, strict = false, checkpointFile, receipts = [], manifestFile, allowCustomPtau = false, fetch: fetcher = fetch, now = Date.now, log = () => {} }) {
+  if (manifestFile && !strict) throw new Error("--manifest requires --strict");
+  if (strict && (!ceremonyFile || !checkpointFile || offline || finalOnly)) throw new Error("--strict requires --ceremony and --checkpoint, and forbids --offline/--final-only");
+  if (allRounds && finalOnly) throw new Error("--all-rounds cannot be combined with --final-only");
+  if (strict) { allRounds = true; requireFinal = true; }
   const checks = [];
   // ok: true = PASS, false = FAIL, null = informational
   const check = (ok, name, detail) => {
@@ -105,6 +112,20 @@ export async function verifyCeremony({ source: sourceArg, ceremonyFile, r1csDir,
   const contributionRounds = rounds.filter((r) => r.kind === "contribution");
   check(null, `${contributionRounds.length} contribution(s)${finalized ? " and the final beacon" : ", the final beacon has NOT been applied yet"}`);
   if (requireFinal) check(finalized, "the ceremony is finalized (final beacon applied)");
+  check(contributionRounds.every((r) => Number.isFinite(Date.parse(r.time)) && Date.parse(r.time) < Date.parse(config.contributionsCloseAt)), "every recorded contribution precedes the committed cutoff", "coordinator timestamps require independent checkpoint publication for historical assurance");
+  for (const receipt of receipts) check(contributionRounds.some((r) => r.attestation === receipt), `expected participant receipt ${receipt} is included`);
+  let checkpoint;
+  if (finalized || checkpointFile) {
+    checkpoint = await source.json("closed.json");
+    const tip = finalized ? rounds[rounds.length - 2] : last;
+    check(tip?.kind === "contribution" && checkpoint.round === tip.round && checkpoint.attestation === tip.attestation && config.circuits.every((c) => checkpoint.circuits?.[c.id] === tip.circuits[c.id].sha256), "closure checkpoint binds the accepted pre-beacon tip");
+    check(Number.isFinite(Date.parse(checkpoint.time)) && Date.parse(checkpoint.time) < Date.parse(config.beacon.applyAfter), "closure was recorded before beacon availability");
+    if (ceremonyFile) check(checkpoint.ceremonySha256 === await hashFile(ceremonyFile), "closure binds the exact independently pinned configuration bytes");
+    if (checkpointFile) {
+      const expected = JSON.parse(await readFile(checkpointFile, "utf8"));
+      check(JSON.stringify(sortKeys(expected)) === JSON.stringify(sortKeys(checkpoint)), "published closure equals the independently retained checkpoint");
+    } else check(null, "no independent checkpoint: inclusion/completeness is not certified");
+  }
 
   // 4. circuits
   const r1csPaths = {};
@@ -113,13 +134,13 @@ export async function verifyCeremony({ source: sourceArg, ceremonyFile, r1csDir,
     const path = r1csDir ? join(r1csDir, c.r1cs) : await source.file(`r1cs/${c.r1cs}`, initInfo.r1csSha256);
     r1csPaths[c.id] = path;
     const sha = await hashFile(path);
+    if (!check(sha === initInfo.r1csSha256, `${c.id}: r1cs ${r1csDir ? "you exported" : "published"} has the sha256 recorded at round 0`, sha)) return { ok: false, finalized, checks, keys };
+    if (c.r1csSha256 !== undefined && !check(sha === c.r1csSha256, `${c.id}: r1cs sha256 equals the pin in ceremony.json`)) return { ok: false, finalized, checks, keys };
     const header = await readR1csHeader(path);
-    check(sha === initInfo.r1csSha256, `${c.id}: r1cs ${r1csDir ? "you exported" : "published"} has the sha256 recorded at round 0`, sha);
-    if (c.r1csSha256 !== undefined) check(sha === c.r1csSha256, `${c.id}: r1cs sha256 equals the pin in ceremony.json`);
     check(header.prime === BN254_SCALAR_FIELD && header.nPubOut === 0 && header.nPubIn === c.publicInputs && ptauPowerNeeded(header) <= config.ptau.power, `${c.id}: r1cs is BN254, has ${c.publicInputs} public inputs and fits the Powers of Tau`, `${header.nConstraints} constraints`);
     if (r1csDir) {
-      const published = await source.file(`r1cs/${c.r1cs}`, initInfo.r1csSha256).catch(() => undefined);
-      if (published) check((await hashFile(published)) === sha, `${c.id}: the coordinator's published r1cs equals the one you exported`);
+      const published = await source.file(`r1cs/${c.r1cs}`, initInfo.r1csSha256);
+      check((await hashFile(published)) === sha, `${c.id}: the coordinator's published r1cs equals the one you exported`);
     }
   }
 
@@ -181,9 +202,24 @@ export async function verifyCeremony({ source: sourceArg, ceremonyFile, r1csDir,
   }
   check(attestationsOk, "every attestation hash equals sha256 of that round's contribution hashes");
 
+  // Bound attacker-controlled beacon work before snarkjs derives it, not after.
+  if (finalized) {
+    const recorded = last.beacon;
+    const specSame = JSON.stringify(sortKeys(recorded.spec)) === JSON.stringify(sortKeys(config.beacon));
+    check(specSame, "the beacon applied is the one committed in ceremony.json before the ceremony");
+    check(recorded.iterationsExp === (config.beacon.iterationsExp ?? DEFAULT_ITERATIONS_EXP), "beacon work factor equals the committed effective exponent");
+    for (const c of config.circuits) {
+      const mpc = await readMpcFromFile(zkeyPath[`${lastRound}/${c.id}`]);
+      const tail = mpc.contributions[mpc.contributions.length - 1];
+      check(tail?.type === BEACON && tail.beaconHash === recorded.value && tail.numIterationsExp === recorded.iterationsExp, `${c.id}: the zkey's last contribution is the beacon ${recorded.value.slice(0, 16)}... with 2^${recorded.iterationsExp} iterations`);
+    }
+  }
+  // A failed hash, history/type/prefix or policy check cannot be rescued by algebra.
+  if (checks.some((c) => c.ok === false)) return { ok: false, finalized, checks, keys };
+
   // 6. snarkjs verification
   for (const c of config.circuits) {
-    const targets = allRounds ? rounds.slice(1) : [last];
+    const targets = allRounds ? rounds : [last];
     for (const round of targets) {
       log(`${c.id}: snarkjs zkey verify, round ${round.round}`);
       const result = await verifyZkey({ r1cs: r1csPaths[c.id], ptau, zkey: zkeyPath[`${round.round}/${c.id}`] });
@@ -194,13 +230,6 @@ export async function verifyCeremony({ source: sourceArg, ceremonyFile, r1csDir,
   // 7. beacon
   if (finalized) {
     const recorded = last.beacon;
-    const specSame = JSON.stringify(sortKeys(recorded.spec)) === JSON.stringify(sortKeys(config.beacon));
-    check(specSame, "the beacon applied is the one committed in ceremony.json before the ceremony");
-    for (const c of config.circuits) {
-      const mpc = await readMpcFromFile(zkeyPath[`${lastRound}/${c.id}`]);
-      const tail = mpc.contributions[mpc.contributions.length - 1];
-      check(tail.type === BEACON && tail.beaconHash === recorded.value && tail.numIterationsExp === recorded.iterationsExp, `${c.id}: the zkey's last contribution is the beacon ${recorded.value.slice(0, 16)}... with 2^${recorded.iterationsExp} iterations`);
-    }
     if (offline) {
       check(null, "the beacon value was NOT re-fetched (--offline)", recorded.description);
     } else {
@@ -214,13 +243,16 @@ export async function verifyCeremony({ source: sourceArg, ceremonyFile, r1csDir,
     // 8. verification keys
     for (const c of config.circuits) {
       const vk = await zKey.exportVerificationKey(zkeyPath[`${lastRound}/${c.id}`]);
-      const vkJson = `${JSON.stringify(vk, null, 2)}\n`;
-      const vkSha = createHash("sha256").update(vkJson).digest("hex");
-      keys[c.id] = { zkeySha256: last.circuits[c.id].sha256, verificationKeySha256: vkSha, constraints: rounds[0].circuits[c.id].constraints };
-      if (last.circuits[c.id].verificationKeySha256) check(last.circuits[c.id].verificationKeySha256 === vkSha, `${c.id}: the exported verification key equals the one in the transcript`);
-      if (await source.exists(`final/${c.id}_final.zkey`).catch(() => false)) {
-        const publishedFinal = await source.file(`final/${c.id}_final.zkey`, last.circuits[c.id].sha256);
+      const vkSha = jsonSha256(vk);
+      keys[c.id] = { zkeySha256: last.circuits[c.id].sha256, verificationKeySha256: vkSha, r1csSha256: rounds[0].circuits[c.id].r1csSha256, constraints: rounds[0].circuits[c.id].constraints };
+      check(last.circuits[c.id].verificationKeySha256 === vkSha, `${c.id}: the exported verification key equals the one in the transcript`);
+      try {
+        const publishedVk = await source.file(`final/${c.id}_verification_key.json`);
+        check(await hashFile(publishedVk) === vkSha, `${c.id}: published verification-key JSON equals the derived key`);
+        const publishedFinal = await source.file(`final/${c.id}_final.zkey`);
         check((await hashFile(publishedFinal)) === last.circuits[c.id].sha256, `${c.id}: final/${c.id}_final.zkey equals the last round`);
+      } catch (error) {
+        check(false, `${c.id}: all final artifacts are present and readable`, error.message);
       }
     }
   } else {
@@ -228,7 +260,12 @@ export async function verifyCeremony({ source: sourceArg, ceremonyFile, r1csDir,
   }
 
   await terminateThreads();
-  return { ok: checks.every((c) => c.ok !== false), finalized, checks, keys };
+  const ok = checks.every((c) => c.ok !== false);
+  if (manifestFile && ok) await writeJsonAtomic(manifestFile, {
+    version: 1, finalized: true, strict: true, ceremonySha256: await hashFile(ceremonyFile),
+    checkpoint, round: last.round, beacon: last.beacon, keys,
+  });
+  return { ok, finalized, checks, keys };
 }
 
 function sortKeys(value) {
@@ -250,12 +287,12 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   try {
     const { positionals, values } = parseArgs({
       allowPositionals: true,
-      options: { ceremony: { type: "string" }, "r1cs-dir": { type: "string" }, ptau: { type: "string" }, cache: { type: "string" }, "final-only": { type: "boolean" }, "all-rounds": { type: "boolean" }, offline: { type: "boolean" }, "require-final": { type: "boolean" }, "allow-custom-ptau": { type: "boolean" }, json: { type: "boolean" }, help: { type: "boolean", short: "h" } },
+      options: { ceremony: { type: "string" }, "r1cs-dir": { type: "string" }, ptau: { type: "string" }, cache: { type: "string" }, "final-only": { type: "boolean" }, "all-rounds": { type: "boolean" }, offline: { type: "boolean" }, "require-final": { type: "boolean" }, strict: { type: "boolean" }, checkpoint: { type: "string" }, receipt: { type: "string", multiple: true }, manifest: { type: "string" }, "allow-custom-ptau": { type: "boolean" }, json: { type: "boolean" }, help: { type: "boolean", short: "h" } },
     });
     if (positionals.length !== 1 || values.help) {
       console.error(USAGE);
     } else {
-      const report = await verifyCeremony({ source: positionals[0], ceremonyFile: values.ceremony && resolve(values.ceremony), r1csDir: values["r1cs-dir"] && resolve(values["r1cs-dir"]), ptauFile: values.ptau && resolve(values.ptau), cacheDir: values.cache && resolve(values.cache), finalOnly: values["final-only"], allRounds: values["all-rounds"], offline: values.offline, requireFinal: values["require-final"], allowCustomPtau: values["allow-custom-ptau"], log: (m) => console.error(m) });
+      const report = await verifyCeremony({ source: positionals[0], ceremonyFile: values.ceremony && resolve(values.ceremony), r1csDir: values["r1cs-dir"] && resolve(values["r1cs-dir"]), ptauFile: values.ptau && resolve(values.ptau), cacheDir: values.cache && resolve(values.cache), finalOnly: values["final-only"], allRounds: values["all-rounds"], offline: values.offline, requireFinal: values["require-final"], strict: values.strict, checkpointFile: values.checkpoint && resolve(values.checkpoint), receipts: values.receipt, manifestFile: values.manifest && resolve(values.manifest), allowCustomPtau: values["allow-custom-ptau"], log: (m) => console.error(m) });
       console.log(values.json ? JSON.stringify(report, null, 2) : formatReport(report));
       code = report.ok ? 0 : 1;
     }

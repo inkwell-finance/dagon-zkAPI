@@ -8,6 +8,19 @@ export class CeremonyError extends Error {
   }
 }
 
+const GATEWAY_STATUSES = new Set([502, 503, 504]);
+
+/**
+ * Error for a non-2xx answer. A 502/503/504 without the coordinator's JSON error code comes from the hosting edge
+ * (a lost upstream response): the request may still have reached the coordinator, so it is as uncertain as a dropped
+ * connection and is classified the same way.
+ */
+export function httpError(status, body) {
+  const code = typeof body?.error === "string" ? body.error : undefined;
+  if (!code && GATEWAY_STATUSES.has(status)) return new CeremonyError("network", `The ceremony server's gateway answered HTTP ${status}.`, status);
+  return new CeremonyError(code ?? "http_error", typeof body?.message === "string" ? body.message : `The server answered HTTP ${status}.`, status);
+}
+
 export class CeremonyClient {
   #base;
   #fetch;
@@ -29,22 +42,29 @@ export class CeremonyClient {
       throw new CeremonyError("network", `Could not reach the ceremony server (${error instanceof Error ? [error.message, error.cause?.code ?? error.cause?.message].filter(Boolean).join(": ") : error}).`);
     }
     if (response.ok) return response;
-    const body = await response.json().catch(() => ({}));
-    throw new CeremonyError(body.error ?? "http_error", body.message ?? `The server answered HTTP ${response.status}.`, response.status);
+    throw httpError(response.status, await response.json().catch(() => undefined));
+  }
+
+  async #json(path, init) {
+    const response = await this.#request(path, init);
+    try {
+      return await response.json();
+    } catch (error) {
+      if (error instanceof SyntaxError) throw new CeremonyError("bad_response", "The ceremony server returned invalid JSON.");
+      throw new CeremonyError("network", "The response from the ceremony server was interrupted.");
+    }
   }
 
   async status() {
-    return (await this.#request("api/status")).json();
+    return this.#json("api/status");
   }
 
   async join(name) {
-    return (
-      await this.#request("api/queue", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name }) })
-    ).json();
+    return this.#json("api/queue", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name }) });
   }
 
   async poll(ticket) {
-    return (await this.#request("api/ticket", { headers: { authorization: `Bearer ${ticket}` } })).json();
+    return this.#json("api/ticket", { headers: { authorization: `Bearer ${ticket}` } });
   }
 
   async leave(ticket) {
@@ -76,7 +96,6 @@ export class CeremonyClient {
 
   /** Uploads the bundle. The page replaces this with an XMLHttpRequest version to show upload progress. */
   async upload(ticket, blob) {
-    const response = await this.#request("api/contribution", { method: "PUT", headers: { authorization: `Bearer ${ticket}`, "content-type": "application/octet-stream", "content-length": String(blob.size) }, body: blob });
-    return response.json();
+    return this.#json("api/contribution", { method: "PUT", headers: { authorization: `Bearer ${ticket}`, "content-type": "application/octet-stream", "content-length": String(blob.size) }, body: blob });
   }
 }

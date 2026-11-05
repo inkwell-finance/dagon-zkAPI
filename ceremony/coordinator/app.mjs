@@ -32,7 +32,7 @@ export function buildApp({ coordinator, assets, now, trustProxy = false, limits,
   const app = new Hono();
   const limiter = new RateLimiter({ now, limits });
   const ids = coordinator.circuitIds.join("|");
-  const publicFile = new RegExp(`^(ceremony\\.json|transcript\\.json|closed\\.json|r1cs/(${ids})\\.r1cs|rounds/\\d{4}/(${ids})\\.zkey|rounds/\\d{4}/entry\\.json|final/FINAL\\.md|final/(${ids})_(final\\.zkey|verification_key\\.json))$`);
+  const publicFile = new RegExp(`^(ceremony\\.json|transcript\\.json|closed\\.json|r1cs/(${ids})\\.r1cs|rounds/\\d{4,}/(${ids})\\.zkey|rounds/\\d{4,}/entry\\.json|final/FINAL\\.md|final/(${ids})_(final\\.zkey|verification_key\\.json))$`);
 
   app.use("*", async (c, next) => {
     await next();
@@ -83,7 +83,26 @@ export function buildApp({ coordinator, assets, now, trustProxy = false, limits,
   app.post("/api/queue", limited("join"), async (c) => {
     const declared = Number(c.req.header("content-length") ?? 0);
     if (declared > maxPingBytes) throw new QueueError("too_large", "Request body too large.", 413);
-    const body = await c.req.json().catch(() => ({}));
+    const reader = c.req.raw.body?.getReader();
+    const chunks = [];
+    let size = 0;
+    try {
+      while (reader) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > maxPingBytes) {
+          void reader.cancel().catch(() => {});
+          throw new QueueError("too_large", "Request body too large.", 413);
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader?.releaseLock();
+    }
+    let body;
+    try { body = JSON.parse(Buffer.concat(chunks, size).toString("utf8")); }
+    catch { throw new QueueError("bad_json", "Request body must be JSON.", 400); }
     const ticket = await coordinator.join({ name: body?.name, key: clientKey(c) });
     return c.json({ ticket: ticket.token, ...coordinator.view(ticket) }, 201, { "cache-control": "no-store" });
   });

@@ -14,20 +14,40 @@ function bad(message, status = 400) {
   return new QueueError("bad_upload", message, status);
 }
 
-/** Pulls exact byte counts out of a web ReadableStream, enforcing a wall-clock budget between chunks. */
+/** Pulls exact byte counts, with cancellation covering stalled reads and the end-of-stream probe. */
 class Cursor {
-  #iterator;
+  #reader;
   #rest = new Uint8Array(0);
   #expired;
+  #signal;
 
-  constructor(stream, expired) {
-    this.#iterator = stream[Symbol.asyncIterator]();
+  constructor(stream, expired, signal) {
+    this.#reader = stream.getReader();
     this.#expired = expired;
+    this.#signal = signal;
+  }
+
+  async read() {
+    if (this.#expired()) throw bad("The upload took too long.", 408);
+    this.#signal?.throwIfAborted();
+    const cancel = () => { void this.#reader.cancel(this.#signal.reason).catch(() => {}); };
+    this.#signal?.addEventListener("abort", cancel, { once: true });
+    try {
+      const result = await this.#reader.read();
+      this.#signal?.throwIfAborted();
+      return result;
+    } finally {
+      this.#signal?.removeEventListener("abort", cancel);
+    }
+  }
+
+  async close() {
+    await this.#reader.cancel().catch(() => {});
+    this.#reader.releaseLock();
   }
 
   async #next() {
-    if (this.#expired()) throw bad("The upload took too long.", 408);
-    const { value, done } = await this.#iterator.next();
+    const { value, done } = await this.read();
     if (done) throw bad("The upload ended early.");
     return value;
   }
@@ -54,7 +74,7 @@ class Cursor {
       const chunk = this.#rest.subarray(0, Math.min(left, this.#rest.length));
       this.#rest = this.#rest.subarray(chunk.length);
       hash.update(chunk);
-      await handle.write(chunk);
+      await handle.writeFile(chunk);
       left -= chunk.length;
     }
     return hash.digest("hex");
@@ -62,7 +82,7 @@ class Cursor {
 
   async atEnd() {
     if (this.#rest.length > 0) return false;
-    const { done } = await this.#iterator.next();
+    const { done } = await this.read();
     return done === true;
   }
 }
@@ -77,8 +97,9 @@ class Cursor {
  * @param {Record<string, number>} args.previousBytes size of each circuit's latest zkey
  * @param {() => boolean} args.expired
  */
-export async function receiveBundle({ body, contentLength, circuitIds, round, previousBytes, dir, expired }) {
-  const cursor = new Cursor(body, expired);
+export async function receiveBundle({ body, contentLength, circuitIds, round, previousBytes, dir, expired, signal }) {
+  const cursor = new Cursor(body, expired, signal);
+  try {
   const head = await cursor.take(8);
   if (new TextDecoder().decode(head.subarray(0, 4)) !== BUNDLE_MAGIC) throw bad("This is not a contribution bundle.");
   const metaLength = new DataView(head.buffer).getUint32(4);
@@ -116,4 +137,7 @@ export async function receiveBundle({ body, contentLength, circuitIds, round, pr
   }
   if (!(await cursor.atEnd())) throw bad("The bundle has trailing data.");
   return meta;
+  } finally {
+    await cursor.close();
+  }
 }

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// Contribute to the Dagon zkAPI trusted setup from a terminal. No wallet, no keys, nothing is installed or kept.
+// Contribute using independently obtained code. Receipts are public; JavaScript cannot guarantee memory zeroization.
 //
 //   node contribute.mjs --server https://ceremony.dagon.so --name "Alice"
 //
 // Everything below the argument parsing is shared with the web page (lib/flow.mjs, lib/contribute-core.mjs).
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -14,12 +14,12 @@ import { contributeToCeremony } from "./lib/flow.mjs";
 import { prettyHash } from "./lib/hex.mjs";
 import { terminateThreads } from "./lib/snark.mjs";
 
-const USAGE = `Usage: node contribute.mjs --server URL [--name NAME] [--entropy-text TEXT] [--receipt FILE]
+const USAGE = `Usage: node contribute.mjs --server URL --ceremony FILE [--name NAME] [--receipt FILE]
 
   --server         the ceremony coordinator, for example https://ceremony.dagon.so
   --name           the name shown in the public transcript (optional; default "Anonymous")
-  --entropy-text   anything unpredictable you type; it is mixed into your randomness (optional,
-                   the operating system's random generator is always used as well)
+  --ceremony FILE  independently authenticated ceremony.json (required)
+                   OS cryptographic randomness is always used; do not pass existing secrets on the command line
   --receipt FILE   where to save your contribution receipt (default: ./dagon-ceremony-receipt-<round>.json)
 `;
 
@@ -29,13 +29,13 @@ const mib = (bytes) => (bytes / 2 ** 20).toFixed(1);
 export async function main(argv, { fetch: fetcher, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), out = (line) => console.log(line), err = (line) => console.error(line) } = {}) {
   let parsed;
   try {
-    parsed = parseArgs({ args: argv, options: { server: { type: "string" }, name: { type: "string", default: "" }, "entropy-text": { type: "string", default: "" }, receipt: { type: "string" }, help: { type: "boolean", short: "h" } } });
+    parsed = parseArgs({ args: argv, options: { server: { type: "string" }, ceremony: { type: "string" }, name: { type: "string", default: "" }, receipt: { type: "string" }, help: { type: "boolean", short: "h" } } });
   } catch (error) {
     err(`${error.message}\n\n${USAGE}`);
     return 2;
   }
   const { values } = parsed;
-  if (values.help || !values.server) {
+  if (values.help || !values.server || !values.ceremony) {
     (values.help ? out : err)(USAGE);
     return values.help ? 0 : 2;
   }
@@ -64,10 +64,15 @@ export async function main(argv, { fetch: fetcher, sleep = (ms) => new Promise((
   };
 
   try {
+    const pinned = JSON.parse(await readFile(values.ceremony, "utf8"));
+    const response = await (fetcher ?? fetch)(new URL("/files/ceremony.json", values.server));
+    if (!response.ok) throw new Error(`Cannot fetch ceremony configuration: HTTP ${response.status}`);
+    const published = await response.json();
+    if (JSON.stringify(pinned) !== JSON.stringify(published)) throw new Error("Server configuration differs from your independently pinned ceremony.json");
     const result = await contributeToCeremony({
       client,
       name: values.name,
-      entropyText: values["entropy-text"],
+      entropyText: "",
       sleep,
       onEvent,
       contribute: contributeZkey,
@@ -82,7 +87,7 @@ export async function main(argv, { fetch: fetcher, sleep = (ms) => new Promise((
     out("");
     for (const c of result.contributions) out(`${c.id} contribution hash:\n${prettyHash(c.contributionHash)}\n`);
     out(`Suggested post: I contributed randomness to the Dagon zkAPI trusted setup, round ${result.round}. Attestation: ${result.attestation}`);
-    out(`Receipt saved to ${receiptPath}. It contains no secrets; nothing secret was ever stored.`);
+    out(`Receipt saved to ${receiptPath}. It contains public data only. Exit this process; memory erasure is best-effort, not guaranteed.`);
     return 0;
   } catch (error) {
     err(error instanceof CeremonyError ? `\nStopped: ${error.message}` : `\nUnexpected error: ${error instanceof Error ? error.stack : error}`);

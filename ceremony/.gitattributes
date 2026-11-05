@@ -1,0 +1,5 @@
+# Byte-exact on every checkout: reproducible bundle digests, the ceremony.json identity hash and the container entrypoint.
+* text=auto eol=lf
+*.r1cs binary
+*.zkey binary
+*.ptau binary

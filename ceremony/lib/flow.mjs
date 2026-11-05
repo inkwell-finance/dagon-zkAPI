@@ -4,7 +4,11 @@ import { CeremonyError } from "./client.mjs";
 import { sha256Hex } from "./hex.mjs";
 
 const RESUMABLE = new Set(["slot_expired", "unknown_ticket", "stale_round"]);
+// Consecutive transport failures a poll tolerates. They back off exponentially (6 s doubling to a 60 s cap), so a
+// contributor rides out about 2.5 minutes offline: the coordinator keeps a finished ticket's receipt for 15 minutes,
+// and no single gap reaches the 3-minute heartbeat that keeps a waiting ticket in the queue.
 const TRANSIENT_POLL_FAILURES = 5;
+const MAX_POLL_BACKOFF_MS = 60_000;
 
 /**
  * One whole contribution, the same for the browser page and the CLI: join the queue, wait for the turn, download the
@@ -31,20 +35,21 @@ export async function contributeToCeremony({ client, name, entropyText, contribu
 
   async function pollSettled(ticket, isDone) {
     let failures = 0;
-    let state = await client.poll(ticket);
+    let pollMs = 3000;
     for (;;) {
       signal?.throwIfAborted();
-      if (isDone(state)) return state;
-      if (state.state === "expired") throw new CeremonyError("slot_expired", state.error?.message ?? "Your place in the queue ran out.");
-      if (state.state === "rejected") throw new CeremonyError("rejected", state.error?.message ?? "The contribution was rejected.");
-      onEvent({ phase: state.state === "waiting" ? "waiting" : state.state, ahead: state.ahead, queueLength: state.queueLength, etaSeconds: state.etaSeconds });
-      await sleep(state.pollMs ?? 3000);
       try {
-        state = await client.poll(ticket);
+        const state = await client.poll(ticket);
         failures = 0;
+        if (isDone(state)) return state;
+        if (state.state === "expired") throw new CeremonyError("slot_expired", state.error?.message ?? "Your place in the queue ran out.");
+        if (state.state === "rejected") throw new CeremonyError("rejected", state.error?.message ?? "The contribution was rejected.");
+        onEvent({ phase: state.state === "waiting" ? "waiting" : state.state, ahead: state.ahead, queueLength: state.queueLength, etaSeconds: state.etaSeconds });
+        pollMs = state.pollMs ?? 3000;
       } catch (error) {
         if (error.code !== "network" || ++failures > TRANSIENT_POLL_FAILURES) throw error;
       }
+      await sleep(failures ? Math.min(pollMs * 2 ** failures, MAX_POLL_BACKOFF_MS) : pollMs);
     }
   }
 
@@ -76,6 +81,7 @@ export async function contributeToCeremony({ client, name, entropyText, contribu
       if (downloaded.round !== current.round) throw new CeremonyError("stale_round", "The ceremony moved on while downloading.");
       const actual = await sha256Hex(downloaded.bytes);
       if (actual !== downloaded.sha256 || actual !== expected) throw new CeremonyError("corrupt_download", `The ${id} download does not match the published hash.`);
+      signal?.throwIfAborted();
       const result = await contribute({ zkey: downloaded.bytes, name: display, entropyText, circuit: id, onProgress: (fraction) => onEvent({ phase: "contributing", circuit: id, index, total: circuits.length, fraction }) });
       zkeys.push(result.zkey);
       meta.circuits.push({ id, bytes: result.zkey.length, sha256: await sha256Hex(result.zkey), contributionHash: result.contributionHash });
@@ -87,11 +93,17 @@ export async function contributeToCeremony({ client, name, entropyText, contribu
     onEvent({ phase: "uploading", total: blob.size });
     const send = upload ?? ((t, b) => client.upload(t, b));
     for (let tries = 1; ; tries++) {
+      signal?.throwIfAborted();
       try {
         await send(ticket, blob, (sent, total) => onEvent({ phase: "uploading", sent, total }));
         break;
       } catch (error) {
-        if (error.code !== "network" || tries >= 3) throw error;
+        if (error.code !== "network" && !(tries > 1 && error.code === "not_your_turn")) throw error;
+        // A lost response does not mean the upload was lost. Wait for that receive to
+        // finish before retrying; an admitted upload must continue to its own receipt.
+        const state = await pollSettled(ticket, (s) => s.state === "verifying" || s.state === "done" || (s.state === "active" && !s.uploading));
+        if (state.state !== "active") break;
+        if (tries >= 3) throw error;
         await sleep(2000);
       }
     }

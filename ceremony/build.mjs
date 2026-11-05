@@ -4,6 +4,8 @@
 import { build } from "esbuild";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+import { readFile, writeFile } from "node:fs/promises";
 
 const root = (path) => fileURLToPath(new URL(path, import.meta.url));
 
@@ -28,12 +30,17 @@ export async function buildAssets({ outdir = root("web/dist"), logLevel = "info"
     bundle: true,
     format: "esm",
     platform: "node",
-    target: "node20",
+    target: "node24",
     alias: { "web-worker": root("web/node-worker.mjs") },
     legalComments: "none",
     banner: { js: 'import { createRequire as __createRequire } from "node:module"; const require = __createRequire(import.meta.url);' },
     logLevel,
   });
+  const hashes = [];
+  for (const name of ["app.js", "worker.js", "contribute.mjs"]) {
+    hashes.push(`${createHash("sha256").update(await readFile(`${outdir}/${name}`)).digest("hex")}  ${name}`);
+  }
+  await writeFile(`${outdir}/SHA256SUMS`, `${hashes.join("\n")}\n`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await buildAssets();

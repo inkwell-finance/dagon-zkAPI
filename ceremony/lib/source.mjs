@@ -1,6 +1,6 @@
 import { mkdir, readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { downloadTo, hashFile } from "./files.mjs";
+import { downloadTo, fetchWithRetry, hashFile } from "./files.mjs";
 
 // Where verify-ceremony reads the published ceremony from. Both kinds share the layout the coordinator serves under
 // /files/ (ceremony.json, transcript.json, r1cs/, rounds/NNNN/, final/): a coordinator URL, or a directory holding a
@@ -39,13 +39,9 @@ export class UrlSource {
   }
 
   async json(rel) {
-    const response = await this.fetch(this.#url(rel));
+    const response = await fetchWithRetry(this.#url(rel), { fetch: this.fetch });
     if (!response.ok) throw new Error(`GET ${this.#url(rel)}: HTTP ${response.status}`);
     return response.json();
-  }
-
-  async exists(rel) {
-    return (await this.fetch(this.#url(rel), { method: "HEAD" })).ok;
   }
 
   /** Downloads into the cache (reusing a cached copy whose sha256 is `expectedSha256`) and returns the local path. */

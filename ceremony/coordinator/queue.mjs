@@ -93,6 +93,7 @@ export class SlotQueue {
   }
 
   #end(ticket, state, error) {
+    ticket.uploadController?.abort(new QueueError("slot_expired", "The upload ticket was released.", 410));
     ticket.state = state;
     ticket.finishedAt = this.#now();
     ticket.uploading = false;
@@ -129,8 +130,11 @@ export class SlotQueue {
   }
 
   startUpload(ticket) {
+    if (ticket.state !== "active" || this.holder() !== ticket || ticket.uploading) throw new QueueError("not_your_turn", "The upload no longer owns the slot.", 409);
     ticket.uploading = true;
     ticket.uploadStartedAt = this.#now();
+    ticket.uploadController = new AbortController();
+    return ticket.uploadController;
   }
 
   cancelUpload(ticket) {
@@ -138,6 +142,7 @@ export class SlotQueue {
   }
 
   startVerify(ticket) {
+    if (ticket.state !== "active" || this.holder() !== ticket || !ticket.uploading || ticket.uploadController?.signal.aborted) throw new QueueError("not_your_turn", "The upload no longer owns the slot.", 409);
     ticket.state = "verifying";
     ticket.uploading = false;
   }

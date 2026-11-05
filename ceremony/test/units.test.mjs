@@ -11,6 +11,7 @@ import { fetchBeacon } from "../lib/beacon.mjs";
 import { validateConfig } from "../lib/config.mjs";
 import { fromHex, prettyHash, toHex } from "../lib/hex.mjs";
 import { hermezPin } from "../lib/hermez.mjs";
+import { httpError } from "../lib/client.mjs";
 import { ensurePtau } from "../lib/ptau.mjs";
 import { readR1csHeader, ptauPowerNeeded } from "../lib/r1cs-info.mjs";
 import { parseMpcSection } from "../lib/zkey-info.mjs";
@@ -145,6 +146,15 @@ describe("helpers", () => {
     assert.throws(broken((c) => (c.beacon.source = "weather")), /beacon.source/);
     assert.throws(broken((c) => (c.beacon.applyAfter = "tomorrow")), /applyAfter/);
     assert.throws(broken((c) => (c.circuits[0].publicInputs = -1)), /publicInputs/);
+  });
+
+  test("only edge-generated 5xx answers are classified as uncertain transport failures", () => {
+    assert.equal(httpError(502, undefined).code, "network");
+    assert.equal(httpError(504, { message: "edge timeout" }).code, "network");
+    assert.equal(httpError(503, { error: "queue_full", message: "full" }).code, "queue_full");
+    assert.equal(httpError(500, { error: "internal" }).code, "internal");
+    assert.equal(httpError(500, undefined).code, "http_error");
+    assert.equal(httpError(409, { error: "not_your_turn" }).status, 409);
   });
 });
 

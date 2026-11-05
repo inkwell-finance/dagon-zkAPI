@@ -85,9 +85,10 @@ export async function makeFixture(dir, { power = 5, beacon } = {}) {
     name: "Test ceremony",
     version: 1,
     curve: "bn128",
+    contributionsCloseAt: "2023-09-06T00:00:00Z",
     ptau: { url: "https://example.invalid/tiny.ptau", hash: createHash("blake2b512").update(prepared.data).digest("hex"), hashAlgorithm: "blake2b-512", power },
     circuits: Object.entries(TINY_CIRCUITS).map(([id, c]) => ({ id, r1cs: `${id}.r1cs`, publicInputs: c.nPubIn })),
-    beacon: beacon ?? { source: "drand", chain: "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971", round: 424242, applyAfter: "2026-12-01T00:00:00Z", iterationsExp: 10 },
+    beacon: beacon ?? { source: "drand", chain: "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971", round: 424242, applyAfter: "2023-09-07T08:41:30Z", iterationsExp: 10 },
   };
   const configPath = join(dir, "ceremony.json");
   await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`);
@@ -95,7 +96,7 @@ export async function makeFixture(dir, { power = 5, beacon } = {}) {
 }
 
 /** A manually advanced clock: nothing in the suite waits for real time. */
-export function fakeClock(start = Date.parse("2026-11-01T12:00:00Z")) {
+export function fakeClock(start = Date.parse("2023-09-01T12:00:00Z")) {
   return {
     t: start,
     now() {
@@ -107,9 +108,10 @@ export function fakeClock(start = Date.parse("2026-11-01T12:00:00Z")) {
   };
 }
 
-/** fetch() stand-in for the drand relays: serves a deterministic randomness for one round. */
+/** Offline relay fixture for a real, BLS-authenticated historical quicknet round, never a production beacon. */
 export function fakeDrand({ chain, round, agree = true }) {
-  const signature = createHash("sha256").update(`signature-${round}`).digest("hex") + "00".repeat(16);
+  if (round !== 424242) throw new Error("the authenticated fixture only covers round 424242");
+  const signature = "b66f8efb68da63badf91791f3fb9b5ede0b65f5fb2a3bb13ae6af77341bca15c71b358add2821621d96dda82b9b9cc03";
   const randomness = createHash("sha256").update(Buffer.from(signature, "hex")).digest("hex");
   let calls = 0;
   const fetcher = async (url) => {

@@ -3,7 +3,9 @@
 #   docker build -t dagon-ceremony .
 #   docker run --rm -p 8788:8788 -v ceremony-data:/data dagon-ceremony              # serve (after init)
 #   docker run --rm -v ceremony-data:/data -v ./r1cs:/in:ro dagon-ceremony init --r1cs-dir /in
-#   docker run --rm -v ceremony-data:/data dagon-ceremony finalize                   # with the server stopped
+#   docker run --rm -v ceremony-data:/data dagon-ceremony close                      # server stopped, before the beacon
+#   docker run --rm -v ceremony-data:/data dagon-ceremony finalize                   # server stopped, after applyAfter
+# On Railway the start command replaces ENTRYPOINT: use `docker-entrypoint.sh close` / `docker-entrypoint.sh finalize`.
 #
 # Environment (all optional): DATA_DIR=/data HOST=0.0.0.0 PORT=8788 TRUST_PROXY=1 (behind Railway's proxy)
 #   SLOT_MINUTES=25 MAX_QUEUE=100 VERIFY_TIMEOUT_MINUTES=30

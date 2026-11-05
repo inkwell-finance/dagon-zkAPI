@@ -43,7 +43,7 @@ Verify with `snarkjs r1cs info`.
 
 ```sh
 cargo run --release --manifest-path protocol/rust/Cargo.toml -p zkapi-proof \
-  --example ceremony_import -- ZKEY_DIR OUT_DIR
+  --example ceremony_import -- ZKEY_DIR OUT_DIR adoption.json INDEPENDENTLY_ACCEPTED_MANIFEST_SHA256
 ```
 
 `ZKEY_DIR` holds `{request,withdrawal,transition}_final.zkey`. Writes
@@ -56,6 +56,8 @@ every point on-curve and every G2 point in the prime-order subgroup,
 `e(beta_1,g2) = e(g1,beta_2)`, `e(delta_1,g2) = e(g1,delta_2)`, `gamma_2 = g2`,
 and a random-linear-combination pairing check that the `B1` and `B2` queries agree.
 It does **not** replace `snarkjs zkey verify` against the r1cs and ptau.
+
+First run `verify-ceremony.mjs ... --strict --ceremony ceremony.json --checkpoint closed.json --receipt HASH --manifest adoption.json` using an independently retained pre-beacon checkpoint. Independently accept the manifest SHA256, not a digest supplied by an untrusted mirror. Import hashes the exact decoded buffers, serializes each circuit compiled into the importer with the exporter and requires its SHA256 to equal the manifest's verified `r1csSha256` (circuit drift since the ceremony is refused), requires strict finality and matching counts, and writes `ceremony-provenance.json` and its digest. Manifest assertions are meaningful only because a trusted verifier produced and independently accepted them.
 
 ## Key kind
 
@@ -82,29 +84,18 @@ two contributions plus a beacon, throwaway ptau) that is read, proved against wi
 `CircomReduction` and verified, and the exporter output is compared byte for byte
 to the committed `.r1cs`.
 
-## Dry run (full-size circuits, throwaway ptau)
+## Full-size release gate
+
+Use the coordinator lifecycle, not loose zkeys: initialize a disposable directory with exported r1cs and hash-checked ptau, make two CLI contributions, close/retain the checkpoint before beacon availability, finalize and strictly verify to emit `adoption.json`. Historical test beacons must use an explicitly simulated clock and never replace production pins.
 
 ```sh
-# 1. export
-cargo run --release --manifest-path protocol/rust/Cargo.toml -p zkapi-proof \
-  --example ceremony_export -- /tmp/cer/r1cs
-# 2. local ptau (power 16), NOT for production; use the Hermez Perpetual Powers of Tau file there
-npx snarkjs powersoftau new bn128 16 p0.ptau
-npx snarkjs powersoftau contribute p0.ptau p1.ptau --name=dry -e="entropy"
-npx snarkjs powersoftau prepare phase2 p1.ptau pot16.ptau          # ~15-25 min
-# 3. per circuit c in request withdrawal transition
-npx snarkjs zkey new r1cs/$c.r1cs pot16.ptau zk/${c}_0000.zkey
-npx snarkjs zkey contribute zk/${c}_0000.zkey zk/${c}_0001.zkey --name=alice -e="..."
-npx snarkjs zkey contribute zk/${c}_0001.zkey zk/${c}_0002.zkey --name=bob -e="..."
-npx snarkjs zkey beacon zk/${c}_0002.zkey zk/${c}_final.zkey <64-hex> 10 -n="Final Beacon"
-npx snarkjs zkey verify r1cs/$c.r1cs pot16.ptau zk/${c}_final.zkey
-# 4. import into a scratch directory outside the repository
-cargo run --release --manifest-path protocol/rust/Cargo.toml -p zkapi-proof \
-  --example ceremony_import -- zk /tmp/cer/imported
-# 5. prove and verify request, withdrawal and transition with the new key kind
-ZKAPI_CEREMONY_IMPORT_DIR=/tmp/cer/imported cargo test --release \
+cargo run --release --locked --manifest-path protocol/rust/Cargo.toml -p zkapi-proof \
+  --example ceremony_import -- DATA/final OUT_DIR adoption.json ACCEPTED_MANIFEST_SHA256
+ZKAPI_CEREMONY_IMPORT_DIR=OUT_DIR cargo test --release --locked \
   --manifest-path protocol/rust/Cargo.toml -p zkapi-proof --lib -- --ignored imported_ceremony_keys
 ```
+
+Compare all imported manifest VK coordinates against published snarkjs VKs, then prove/verify request, withdrawal and transition. Never adopt round-zero/unverified loose keys just because dimensions and pairings pass.
 
 Solana verifier path (nothing is written into the repository): build a scratch tree
 `S/` with `S/protocol/setup/v2` and `S/protocol/setup/solana-transition-v1` copied from the

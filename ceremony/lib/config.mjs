@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { DRAND_DEFAULT_CHAIN, drandRoundTime } from "./beacon.mjs";
 
 const ID = /^[a-z][a-z0-9-]{0,31}$/;
 const HASH_ALGORITHMS = new Set(["blake2b-512", "sha256"]);
@@ -21,8 +22,9 @@ function validateBeacon(beacon) {
     fail("beacon.iterationsExp must be an integer between 10 and 40");
   }
   if (beacon.source === "drand") {
-    if (!Number.isInteger(beacon.round) || beacon.round < 1) fail("a drand beacon needs a positive integer round");
-    if (beacon.chain !== undefined && !HEX64.test(beacon.chain)) fail("beacon.chain must be a 64 digit hex chain hash");
+    if (!Number.isSafeInteger(beacon.round) || beacon.round < 1) fail("a drand beacon needs a positive safe integer round");
+    if ((beacon.chain ?? DRAND_DEFAULT_CHAIN) !== DRAND_DEFAULT_CHAIN) fail("beacon.chain must be the authenticated quicknet chain");
+    if (Date.parse(beacon.applyAfter) !== drandRoundTime(beacon.round)) fail("beacon.applyAfter must equal the scheduled drand round time");
   } else if (beacon.source === "bitcoin") {
     if (!Number.isInteger(beacon.height) || beacon.height < 1) fail("a bitcoin beacon needs a positive integer height");
   } else {
@@ -48,6 +50,8 @@ export function validateConfig(config) {
     if (c.r1csSha256 !== undefined && !HEX64.test(c.r1csSha256)) fail(`circuit ${c.id}: r1csSha256 must be 64 hex digits`);
   }
   validateBeacon(config.beacon);
+  if (!Number.isFinite(Date.parse(config.contributionsCloseAt)) || !/Z$/.test(config.contributionsCloseAt)) fail("contributionsCloseAt must be an ISO UTC timestamp");
+  if (config.beacon && Date.parse(config.contributionsCloseAt) >= Date.parse(config.beacon.applyAfter)) fail("contributionsCloseAt must precede beacon.applyAfter");
   return config;
 }
 

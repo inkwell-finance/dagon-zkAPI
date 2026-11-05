@@ -57,12 +57,30 @@ describe("the web page and its bundles", () => {
     assert.doesNotMatch(html, /__[A-Z]+_INTEGRITY__/);
   });
 
+  test("the page defines every statically referenced UI element", async () => {
+    const html = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
+    const source = await readFile(new URL("../web/app.js", import.meta.url), "utf8");
+    const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]));
+    for (const match of source.matchAll(/\bel(?:\.([a-zA-Z]\w*)|\["([^"]+)"\])/g)) {
+      assert.ok(ids.has(match[1] ?? match[2]), `missing UI element ${match[1] ?? match[2]}`);
+    }
+  });
+
   test("the bundles are self-contained: no network URLs, no CDN, no dynamic remote imports", async () => {
     for (const name of ["app.js", "worker.js"]) {
       const code = await readFile(join(web, "dist", name), "utf8");
       assert.doesNotMatch(code, /import\(\s*["']https?:/, name);
       assert.doesNotMatch(code, /from\s*["']https?:/, name);
       assert.doesNotMatch(code, /cdn\.|unpkg|jsdelivr|googleapis/i, name);
+    }
+  });
+
+  test("locked builds reproduce independent bundle SHA256 digests", async () => {
+    const second = join(root, "rebuilt");
+    await buildAssets({ outdir: second, logLevel: "silent" });
+    assert.equal(await readFile(join(web, "dist", "SHA256SUMS"), "utf8"), await readFile(join(second, "SHA256SUMS"), "utf8"));
+    for (const name of ["app.js", "worker.js", "contribute.mjs"]) {
+      assert.deepEqual(await readFile(join(web, "dist", name)), await readFile(join(second, name)));
     }
   });
 

@@ -96,12 +96,13 @@ export function parseMpcSection(buf) {
   return { csHash: toHex(buf.subarray(0, 64)), contributions };
 }
 
-async function readMpc(readAt, size) {
+async function readMpc(readAt, size, maxMpcBytes = Infinity) {
   const head = await readAt(0, 12);
   const headView = new DataView(head.buffer, head.byteOffset, head.byteLength);
   if (head.length < 12 || toHex(head.subarray(0, 4)) !== "7a6b6579") throw new Error("not a zkey file");
   if (headView.getUint32(4, true) !== 1) throw new Error("unsupported zkey version");
   const sections = headView.getUint32(8, true);
+  if (sections !== 10) throw new Error("Groth16 zkey must have exactly 10 sections");
   let pos = 12;
   for (let i = 0; i < sections; i++) {
     const sh = await readAt(pos, 12);
@@ -111,7 +112,10 @@ async function readMpc(readAt, size) {
     const len = Number(shView.getBigUint64(4, true));
     pos += 12;
     if (pos + len > size) throw new Error("zkey section runs past the end of the file");
-    if (type === SECTION_MPC) return parseMpcSection(await readAt(pos, len));
+    if (type === SECTION_MPC) {
+      if (len > maxMpcBytes) throw new Error("MPC section exceeds the permitted contribution growth");
+      return parseMpcSection(await readAt(pos, len));
+    }
     pos += len;
   }
   throw new Error("zkey has no contribution section");
@@ -122,7 +126,7 @@ export function readMpcFromBytes(bytes) {
   return readMpc((pos, len) => Promise.resolve(bytes.subarray(pos, pos + len)), bytes.length);
 }
 
-export async function readMpcFromFile(path) {
+export async function readMpcFromFile(path, { maxMpcBytes } = {}) {
   const handle = await open(path, "r");
   try {
     const { size } = await handle.stat();
@@ -130,7 +134,7 @@ export async function readMpcFromFile(path) {
       const buf = Buffer.alloc(len);
       const { bytesRead } = await handle.read(buf, 0, len, pos);
       return buf.subarray(0, bytesRead);
-    }, size);
+    }, size, maxMpcBytes);
   } finally {
     await handle.close();
   }

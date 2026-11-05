@@ -2,9 +2,11 @@ import { parseArgs } from "node:util";
 import { resolve } from "node:path";
 import { finalizeCeremony } from "./finalize.mjs";
 import { initCeremony } from "./init.mjs";
+import { closeCeremony } from "./close.mjs";
 
 const USAGE = `Usage:
   node coordinator/cli.mjs init     --r1cs-dir DIR [--config ceremony.json] [--ptau FILE] [--data DIR]
+  node coordinator/cli.mjs close    [--data DIR] (stop server first; before beacon)
   node coordinator/cli.mjs finalize [--data DIR]
 DATA_DIR (or --data) defaults to ./data. Start the server with: node coordinator/server.mjs`;
 
@@ -25,6 +27,8 @@ try {
     await initCeremony({ configPath: resolve(values.config), r1csDir: resolve(values["r1cs-dir"]), dataDir, ptauFile: values.ptau && resolve(values.ptau), log });
   } else if (positionals[0] === "finalize") {
     await finalizeCeremony({ dataDir, log });
+  } else if (positionals[0] === "close") {
+    console.log(JSON.stringify(await closeCeremony({ dataDir }), null, 2));
   } else {
     console.error(USAGE);
     process.exitCode = 2;

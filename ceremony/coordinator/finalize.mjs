@@ -1,9 +1,9 @@
-import { copyFile, mkdir, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { zKey } from "snarkjs";
 import { fetchBeacon } from "../lib/beacon.mjs";
 import { loadConfig } from "../lib/config.mjs";
-import { hashFile, writeJsonAtomic } from "../lib/files.mjs";
+import { hashFile, jsonSha256, writeJsonAtomic } from "../lib/files.mjs";
 import { ptauFileName } from "../lib/ptau.mjs";
 import { applyBeacon, terminateThreads, verifyZkey } from "../lib/snark.mjs";
 import { BEACON, extensionProblem, readMpcFromFile } from "../lib/zkey-info.mjs";
@@ -18,30 +18,35 @@ export function beaconContributionName(spec) {
 /**
  * Applies the pre-announced public beacon to the newest round of every circuit, verifies the result with snarkjs,
  * exports the verification keys and writes final/ (<id>_final.zkey, <id>_verification_key.json, FINAL.md).
- * Stop the coordinator first; closed.json is written so a server that is still running stops accepting uploads.
+ * Stop the coordinator and run `close` before beacon availability. Reruns resume final publication.
  */
 export async function finalizeCeremony({ dataDir, fetch: fetcher = fetch, now = Date.now, log = () => {} }) {
   const store = new Store(dataDir);
   const config = await loadConfig(store.path("ceremony.json"));
   const rounds = await store.rounds();
   if (rounds.length === 0) throw new Error("nothing to finalize: no rounds");
-  if (rounds.some((r) => r.kind === "beacon")) throw new Error("this ceremony already has its final beacon");
-  const base = rounds[rounds.length - 1];
-  if (base.kind !== "contribution") throw new Error("the ceremony has no contributions yet");
+  const existing = rounds.find((r) => r.kind === "beacon");
+  const base = existing ? rounds[rounds.length - 2] : rounds[rounds.length - 1];
+  if (base?.kind !== "contribution") throw new Error("the ceremony has no contributions yet");
   if (!config.beacon) throw new Error("ceremony.json names no beacon");
+  const checkpoint = JSON.parse(await readFile(store.path("closed.json"), "utf8").catch(() => { throw new Error("run close and publish its checkpoint before beacon availability"); }));
+  if (!(Date.parse(checkpoint.time) < Date.parse(config.beacon.applyAfter)) || checkpoint.round !== base.round || checkpoint.attestation !== base.attestation || checkpoint.ceremonySha256 !== await hashFile(store.path("ceremony.json")) || config.circuits.some((c) => checkpoint.circuits[c.id] !== base.circuits[c.id].sha256)) throw new Error("closed checkpoint does not bind the pre-beacon accepted tip");
+  if (rounds.filter((r) => r.kind === "contribution").some((r) => !(Date.parse(r.time) < Date.parse(config.contributionsCloseAt)))) throw new Error("contribution after committed cutoff");
+  if (existing) {
+    await publishFinal(store, config, existing);
+    return { entry: existing, dir: store.path("final") };
+  }
 
   const beacon = await fetchBeacon(config.beacon, { fetch: fetcher, now });
   log(`beacon: ${beacon.description}`);
   for (const url of beacon.urls) log(`  fetched from ${url}`);
   log(`  value ${beacon.value}, ${beacon.iterationsExp} hash iteration exponent`);
 
-  await writeJsonAtomic(store.path("closed.json"), { time: new Date(now()).toISOString(), reason: "finalize" });
+  await store.requireSpace(Object.values(base.circuits).reduce((sum, c) => sum + c.bytes, 0) * 3);
   const ptau = store.path("ptau", ptauFileName(config));
   const staging = await store.newStaging();
-  const finalDir = store.path("final");
-  await mkdir(finalDir, { recursive: true });
+  try {
   const circuits = {};
-  const vkHashes = {};
 
   for (const c of config.circuits) {
     const zkey = join(staging, `${c.id}.zkey`);
@@ -57,11 +62,8 @@ export async function finalizeCeremony({ dataDir, fetch: fetcher = fetch, now = 
     const check = await verifyZkey({ r1cs: store.path("r1cs", c.r1cs), ptau, zkey });
     if (!check.ok) throw new Error(`${c.id}: the final zkey does not verify: ${check.errors.join("; ")}`);
 
-    const vk = await zKey.exportVerificationKey(zkey);
-    const vkPath = join(finalDir, `${c.id}_verification_key.json`);
-    await writeFile(vkPath, `${JSON.stringify(vk, null, 2)}\n`);
-    vkHashes[c.id] = await hashFile(vkPath);
-    circuits[c.id] = { sha256: await hashFile(zkey), bytes: (await stat(zkey)).size, contributionHash: last.hash, contributions: next.contributions.length, verificationKeySha256: vkHashes[c.id] };
+    const verificationKeySha256 = jsonSha256(await zKey.exportVerificationKey(zkey));
+    circuits[c.id] = { sha256: await hashFile(zkey), bytes: (await stat(zkey)).size, contributionHash: last.hash, contributions: next.contributions.length, verificationKeySha256 };
   }
 
   if ((await store.latest()).round !== base.round) throw new Error("a round was added while finalizing; stop the coordinator and run finalize again");
@@ -72,14 +74,32 @@ export async function finalizeCeremony({ dataDir, fetch: fetcher = fetch, now = 
     beacon: { spec: config.beacon, description: beacon.description, urls: beacon.urls, value: beacon.value, iterationsExp: beacon.iterationsExp },
     circuits,
   };
-  await store.promote(staging, entry);
-  for (const c of config.circuits) await copyFile(join(store.roundDir(entry.round), `${c.id}.zkey`), join(finalDir, `${c.id}_final.zkey`));
+  await store.promote(staging, entry).catch((error) => { if (!error.committed) throw error; });
+  await publishFinal(store, config, entry);
+  log(`final keys written to ${store.path("final")}`);
+  return { entry, dir: store.path("final") };
+  } finally {
+    await store.discard(staging);
+    await terminateThreads();
+  }
+}
 
+async function publishFinal(store, config, entry) {
+  const finalDir = store.path("final");
+  await mkdir(finalDir, { recursive: true });
+  for (const c of config.circuits) {
+    const source = join(store.roundDir(entry.round), `${c.id}.zkey`);
+    if (await hashFile(source) !== entry.circuits[c.id].sha256) throw new Error(`${c.id}: committed final key is corrupt`);
+    const vk = await zKey.exportVerificationKey(source);
+    if (jsonSha256(vk) !== entry.circuits[c.id].verificationKeySha256) throw new Error(`${c.id}: committed verification key hash mismatch`);
+    await writeJsonAtomic(join(finalDir, `${c.id}_verification_key.json`), vk);
+    const dest = join(finalDir, `${c.id}_final.zkey`);
+    await copyFile(source, `${dest}.tmp`);
+    await rename(`${dest}.tmp`, dest);
+  }
   const transcript = await store.writeTranscript();
   await writeFile(join(finalDir, "FINAL.md"), finalReport(config, transcript.rounds));
   await terminateThreads();
-  log(`final keys written to ${finalDir}`);
-  return { entry, dir: finalDir };
 }
 
 export function finalReport(config, rounds) {
@@ -92,13 +112,13 @@ export function finalReport(config, rounds) {
   for (const c of config.circuits) {
     lines.push(`| ${c.id} | ${init.circuits[c.id].constraints} | \`${init.circuits[c.id].r1csSha256}\` | \`${last.circuits[c.id].sha256}\` | \`${last.circuits[c.id].verificationKeySha256}\` |`);
   }
-  lines.push("", "## Contributions", "", "Attestation = sha256 of the text `dagon-zkapi-ceremony-v1`, `round:N`, then one `<circuit>:<contribution hash>` line per circuit.", "");
+  lines.push("", "## Contributions", "", "Attestation = sha256 of `dagon-zkapi-ceremony-v1` plus newline, `round:N` plus newline, then one `<circuit>:<contribution hash>` line per circuit in config order, each with a trailing newline.", "");
   lines.push("| round | contributor | time (UTC) | attestation |", "|---|---|---|---|");
   for (const r of rounds.filter((x) => x.kind === "contribution")) lines.push(`| ${r.round} | ${mdEscape(r.name)} | ${r.time} | \`${r.attestation}\` |`);
   for (const c of config.circuits) {
     lines.push("", `### ${c.id}: contribution hashes (blake2b-512)`, "");
     for (const r of rounds.filter((x) => x.kind !== "init")) lines.push(`- round ${r.round} ${r.kind === "beacon" ? "(beacon)" : mdEscape(r.name)}: \`${r.circuits[c.id].contributionHash}\``);
   }
-  lines.push("", "## Verify it yourself", "", "```", "node verify-ceremony.mjs <coordinator URL or a copy of the data directory> --ceremony ceremony.json", "```", "");
+  lines.push("", "## Verify it yourself", "", "Independently authenticate the client/config and retain closed.json before beacon availability. Require participant receipts for inclusion; this report alone does not prove completeness.", "", "```", "node verify-ceremony.mjs <URL or directory> --ceremony ceremony.json --strict --checkpoint closed.json --receipt YOUR_ATTESTATION --manifest adoption.json", "```", "");
   return lines.join("\n");
 }

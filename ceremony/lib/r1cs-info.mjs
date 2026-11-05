@@ -8,21 +8,33 @@ export const BN254_SCALAR_FIELD = 2188824287183927522224640574525727508854836440
 export async function readR1csHeader(path) {
   const handle = await open(path, "r");
   try {
+    const { size: fileSize } = await handle.stat();
+    const readAt = async (buffer, position) => {
+      let offset = 0;
+      while (offset < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, position + offset);
+        if (bytesRead === 0) throw new Error("truncated r1cs header or section table");
+        offset += bytesRead;
+      }
+    };
     const pre = Buffer.alloc(12);
-    await handle.read(pre, 0, 12, 0);
+    await readAt(pre, 0);
     if (pre.toString("latin1", 0, 4) !== "r1cs") throw new Error(`${path} is not an r1cs file`);
     if (pre.readUInt32LE(4) !== 1) throw new Error("unsupported r1cs version");
     const sections = pre.readUInt32LE(8);
+    if (sections > Math.floor((fileSize - 12) / 12)) throw new Error("r1cs section count exceeds the file size");
+    const sh = Buffer.alloc(12);
     let pos = 12;
     for (let i = 0; i < sections; i++) {
-      const sh = Buffer.alloc(12);
-      await handle.read(sh, 0, 12, pos);
+      await readAt(sh, pos);
       const type = sh.readUInt32LE(0);
-      const size = Number(sh.readBigUInt64LE(4));
+      const size = sh.readBigUInt64LE(4);
       pos += 12;
+      if (size > BigInt(fileSize - pos)) throw new Error("r1cs section runs past the end of the file");
       if (type === 1) {
-        const buf = Buffer.alloc(size);
-        await handle.read(buf, 0, size, pos);
+        if (size !== 64n) throw new Error("BN254 r1cs header must be exactly 64 bytes");
+        const buf = Buffer.alloc(64);
+        await readAt(buf, pos);
         const n8 = buf.readUInt32LE(0);
         if (n8 !== 32) throw new Error(`unsupported r1cs field size ${n8}`);
         let prime = 0n;
@@ -37,7 +49,7 @@ export async function readR1csHeader(path) {
           nConstraints: buf.readUInt32LE(o + 24),
         };
       }
-      pos += size;
+      pos += Number(size);
     }
     throw new Error("r1cs has no header section");
   } finally {

@@ -8,6 +8,7 @@ import { main as contribute } from "../contribute.mjs";
 import { buildApp } from "../coordinator/app.mjs";
 import { Coordinator } from "../coordinator/coordinator.mjs";
 import { finalizeCeremony } from "../coordinator/finalize.mjs";
+import { closeCeremony } from "../coordinator/close.mjs";
 import { initCeremony } from "../coordinator/init.mjs";
 import { childVerifier } from "../coordinator/verify-child.mjs";
 import { verifyCeremony, formatReport } from "../verify-ceremony.mjs";
@@ -92,7 +93,7 @@ describe("ceremony, end to end", { concurrency: false }, () => {
     for (const [round, name] of [[1, "Alice"], [2, "Bob \u00e9"], [3, ""]]) {
       const lines = [];
       const receipt = join(root, `receipt-${round}.json`);
-      const code = await contribute(["--server", url, "--name", name, "--entropy-text", `typed by ${name || "nobody"}`, "--receipt", receipt], {
+      const code = await contribute(["--server", url, "--ceremony", fx.configPath, "--name", name, "--receipt", receipt], {
         sleep: () => coordinator.settled(),
         out: lines.push.bind(lines),
         err: () => {},
@@ -329,13 +330,34 @@ describe("ceremony, end to end", { concurrency: false }, () => {
     assert.deepEqual(events.filter((p) => ["turn", "expired"].includes(p)), ["turn", "expired", "turn"]);
   });
 
+  test("cutoff reached during verification prevents promotion", async () => {
+    const { ticket, meta, zkeys } = await takeTurn("Cutoff race");
+    const savedTime = clock.t;
+    const savedVerify = coordinator.verify;
+    coordinator.verify = async () => {
+      clock.t = Date.parse(fx.config.contributionsCloseAt);
+      return { ok: true, errors: [] };
+    };
+    try {
+      await client.upload(ticket, encodeBundle(meta, zkeys));
+      await coordinator.settled();
+      assert.equal(coordinator.ticket(ticket).state, "rejected");
+      assert.equal(coordinator.latest.round, 4);
+    } finally {
+      coordinator.verify = savedVerify;
+      clock.t = savedTime;
+    }
+  });
+
   describe("finalize, verify, tamper", () => {
-    test("finalize refuses before the committed time, and when the beacon sources disagree", async () => {
-      await assert.rejects(finalizeCeremony({ dataDir, fetch: drand.fetch, now: clock.now.bind(clock) }), /may not be applied before 2026-12-01/);
-      clock.t = Date.parse("2026-12-02T00:00:00Z");
-      const disagreeing = fakeDrand({ chain: "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971", round: 424242, agree: false });
-      await assert.rejects(finalizeCeremony({ dataDir, fetch: disagreeing.fetch, now: clock.now.bind(clock) }), /sources disagree/);
-      assert.equal(await coordinator.store.isClosed(), false, "nothing was closed by a failed attempt");
+    test("closure is explicit and finalization authenticates the scheduled beacon", async () => {
+      await assert.rejects(finalizeCeremony({ dataDir, fetch: drand.fetch, now: clock.now.bind(clock) }), /run close/);
+      await closeCeremony({ dataDir, now: clock.now.bind(clock) });
+      await assert.rejects(finalizeCeremony({ dataDir, fetch: drand.fetch, now: clock.now.bind(clock) }), /may not be applied before/);
+      clock.t = Date.parse("2023-09-08T00:00:00Z");
+      const disagreeing = fakeDrand({ chain: fx.config.beacon.chain, round: 424242, agree: false });
+      await assert.rejects(finalizeCeremony({ dataDir, fetch: disagreeing.fetch, now: clock.now.bind(clock) }));
+      assert.equal(await coordinator.store.isClosed(), true, "a failed beacon fetch cannot reopen closure");
     });
 
     test("finalize applies the beacon, verifies, exports keys and writes the report", async () => {
@@ -364,7 +386,9 @@ describe("ceremony, end to end", { concurrency: false }, () => {
       await assert.rejects(client.join("Late"), (error) => error.code === "ceremony_closed" && error.status === 410);
       assert.equal((await client.status()).finalized, true);
       assert.equal((await fetch(`${url}/files/final/request_final.zkey`)).status, 200);
-      await assert.rejects(finalizeCeremony({ dataDir, fetch: drand.fetch, now: clock.now.bind(clock) }), /already has its final beacon/);
+      await rm(join(dir, "request_final.zkey"));
+      await finalizeCeremony({ dataDir, fetch: drand.fetch, now: clock.now.bind(clock) });
+      assert.equal(await sha256Hex(await readFile(join(dir, "request_final.zkey"))), entry.circuits.request.sha256, "rerun repairs interrupted publication");
     });
 
     const options = () => ({ ceremonyFile: fx.configPath, r1csDir: fx.r1csDir, ptauFile: fx.ptauPath, allowCustomPtau: true, fetch: drand.fetch, now: clock.now.bind(clock) });
@@ -385,6 +409,97 @@ describe("ceremony, end to end", { concurrency: false }, () => {
       assert.equal(report.ok, true, formatReport(report));
     });
 
+    test("strict verification binds checkpoint, receipts, round zero and adoption manifest", async () => {
+      const manifest = join(root, "adoption.json");
+      const report = await verifyCeremony({ source: dataDir, ...options(), strict: true, checkpointFile: join(dataDir, "closed.json"), receipts: [coordinator.entries[1].attestation], manifestFile: manifest });
+      assert.equal(report.ok, true, formatReport(report));
+      assert.ok(report.checks.some((c) => c.ok && /snarkjs zkey verify passes for round 0/.test(c.name)));
+      const adopted = JSON.parse(await readFile(manifest, "utf8"));
+      assert.equal(adopted.strict, true);
+      for (const id of CIRCUITS) assert.equal(adopted.keys[id].r1csSha256, await sha256Hex(await readFile(join(fx.r1csDir, `${id}.r1cs`))));
+      const absent = await verifyCeremony({ source: dataDir, ...options(), receipts: ["0".repeat(64)] });
+      assert.equal(absent.ok, false);
+    });
+
+    test("final verification rejects substituted VKs and absent final zkeys", async () => {
+      const dir = join(root, "bad-final");
+      await cp(dataDir, dir, { recursive: true });
+      await writeFile(join(dir, "final", "request_verification_key.json"), '{"protocol":"NOT_A_KEY"}');
+      let report = await verifyCeremony({ source: dir, ...options(), requireFinal: true });
+      assert.equal(report.ok, false);
+      await cp(join(dataDir, "final", "request_verification_key.json"), join(dir, "final", "request_verification_key.json"));
+      await rm(join(dir, "final", "request_final.zkey"));
+      report = await verifyCeremony({ source: dir, ...options(), requireFinal: true });
+      assert.equal(report.ok, false);
+    });
+
+    test("full-history mode rejects corrupted init algebra even with rewritten transcript hash", async () => {
+      const dir = join(root, "bad-history");
+      await cp(dataDir, dir, { recursive: true });
+      const path = join(dir, "rounds", "0000", "request.zkey");
+      const bytes = await readFile(path);
+      for (let pos = 12; pos < bytes.length;) {
+        const id = bytes.readUInt32LE(pos), length = Number(bytes.readBigUInt64LE(pos + 4));
+        if (id === 5) { bytes[pos + 12] ^= 1; break; }
+        pos += 12 + length;
+      }
+      await writeFile(path, bytes);
+      const transcript = JSON.parse(await readFile(join(dir, "transcript.json"), "utf8"));
+      transcript.rounds[0].circuits.request.sha256 = await sha256Hex(bytes);
+      await writeFile(join(dir, "transcript.json"), JSON.stringify(transcript));
+      const report = await verifyCeremony({ source: dir, ...options(), allRounds: true });
+      assert.equal(report.ok, false);
+      assert.ok(report.checks.some((c) => c.ok === false && /snarkjs zkey verify passes for round 0/.test(c.name)));
+    });
+
+    test("an uncommitted beacon exponent is rejected before any snarkjs work", { timeout: 10_000 }, async () => {
+      const dir = join(root, "expensive-beacon");
+      await cp(dataDir, dir, { recursive: true });
+      const path = join(dir, "rounds", "0005", "request.zkey");
+      const tail = (await readMpcFromFile(path)).contributions.at(-1);
+      const bytes = await readFile(path);
+      const start = bytes.indexOf(tail.raw);
+      assert.ok(start >= 0);
+      let parameter = start + 384 + 8;
+      assert.equal(bytes[parameter], 1, "the generated beacon starts with its name");
+      parameter += 2 + bytes[parameter + 1];
+      assert.equal(bytes[parameter], 2, "the next parameter is the work factor");
+      bytes[parameter + 1] = 40;
+      await writeFile(path, bytes);
+      const transcript = JSON.parse(await readFile(join(dir, "transcript.json"), "utf8"));
+      transcript.rounds.at(-1).circuits.request.sha256 = await sha256Hex(bytes);
+      await writeFile(join(dir, "transcript.json"), JSON.stringify(transcript));
+      const logs = [];
+      const report = await verifyCeremony({ source: dir, ...options(), log: (message) => logs.push(message) });
+      assert.equal(report.ok, false);
+      assert.deepEqual(logs, [], "reject before entering the expensive cryptographic verifier");
+      assert.ok(report.checks.some((c) => c.ok === false && /request: the zkey's last contribution/.test(c.name)));
+    });
+
+    test("beacon exponent is bound to configuration, not just transcript fields", async () => {
+      const dir = join(root, "bad-exponent");
+      await cp(dataDir, dir, { recursive: true });
+      const cfg = structuredClone(fx.config);
+      cfg.beacon.iterationsExp = 20;
+      const path = join(dir, "ceremony.json");
+      await writeFile(path, JSON.stringify(cfg));
+      const transcript = JSON.parse(await readFile(join(dir, "transcript.json"), "utf8"));
+      transcript.rounds.at(-1).beacon.spec = cfg.beacon;
+      await writeFile(join(dir, "transcript.json"), JSON.stringify(transcript));
+      const report = await verifyCeremony({ source: dir, ...options(), ceremonyFile: path });
+      assert.ok(report.checks.some((c) => c.ok === false && /work factor/.test(c.name)));
+    });
+
+    test("a cached final artifact cannot conceal a missing public release file", async () => {
+      const dispatch = async (target, init) => {
+        if (String(target).endsWith("/final/request_final.zkey")) return new Response("missing", { status: 404 });
+        return String(target).startsWith(url) ? fetch(target, init) : drand.fetch(target);
+      };
+      const report = await verifyCeremony({ source: url, ...options(), cacheDir: join(root, "cache"), fetch: dispatch, requireFinal: true });
+      assert.equal(report.ok, false);
+      assert.ok(report.checks.some((c) => c.ok === false && /artifacts are present/.test(c.name)));
+    });
+
     test("verify-ceremony fails on a different pinned ceremony.json, a different r1cs and a Powers of Tau that is not Hermez", async () => {
       const other = join(root, "other.json");
       const config = JSON.parse(await readFile(fx.configPath, "utf8"));
@@ -400,6 +515,10 @@ describe("ceremony, end to end", { concurrency: false }, () => {
       const swapped = await verifyCeremony({ source: dataDir, ...options(), r1csDir: otherR1cs, offline: true });
       assert.equal(swapped.ok, false);
       assert.match(formatReport(swapped), /FAIL  request: r1cs you exported has the sha256 recorded at round 0/);
+      await writeFile(join(otherR1cs, "request.r1cs"), "untrusted malformed r1cs");
+      const malformed = await verifyCeremony({ source: dataDir, ...options(), r1csDir: otherR1cs, offline: true });
+      assert.equal(malformed.ok, false);
+      assert.match(formatReport(malformed), /FAIL  request: r1cs you exported has the sha256 recorded at round 0/);
 
       const strict = await verifyCeremony({ source: dataDir, ...options(), allowCustomPtau: false, offline: true });
       assert.equal(strict.ok, false);
@@ -456,4 +575,96 @@ describe("ceremony, end to end", { concurrency: false }, () => {
       assert.equal(wrongCircuit.ok, false);
     });
   });
+});
+
+test("lost upload responses recover the same ticket and receipt without duplicate contributions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ceremony-upload-response-"));
+  let coordinator, release;
+  try {
+    const fx = await makeFixture(join(root, "fixture"));
+    const dataDir = join(root, "data");
+    await initCeremony({ configPath: fx.configPath, r1csDir: fx.r1csDir, dataDir, ptauFile: fx.ptauPath });
+    const clock = fakeClock();
+    coordinator = await Coordinator.open({ dataDir, now: clock.now.bind(clock), verify: verifyZkey });
+    const app = buildApp({ coordinator, assets: new Map(), now: clock.now.bind(clock) });
+    const requireSpace = coordinator.store.requireSpace.bind(coordinator.store);
+    const interruptedJson = () => new Response(new ReadableStream({
+      start(controller) { controller.error(new Error("response body disconnected after headers")); },
+    }), { headers: { "content-type": "application/json" } });
+    // What Railway's edge answers when the upstream response is lost: not the coordinator's JSON error.
+    const gateway = () => new Response("<html>Application failed to respond</html>", { status: 502, headers: { "content-type": "text/html" } });
+    let round = 0;
+    for (const phase of ["before", "uploading", "verifying", "done", "late", "headers", "gateway"]) {
+      let uploads = 0, losePoll = false, pending, delayed;
+      const gate = Promise.withResolvers();
+      release = gate.resolve;
+      const started = Promise.withResolvers();
+      coordinator.store.requireSpace = async (bytes) => {
+        if (phase === "uploading") { started.resolve(); await gate.promise; }
+        return requireSpace(bytes);
+      };
+      coordinator.verify = async (args) => {
+        if (phase === "verifying") { started.resolve(); await gate.promise; }
+        return verifyZkey(args);
+      };
+      const client = new CeremonyClient({ server: "http://local", fetch: async (url, init) => {
+        if (String(url).endsWith("/api/ticket") && init.method !== "DELETE" && losePoll) {
+          losePoll = false;
+          if (phase === "headers") return interruptedJson();
+          if (phase === "gateway") return gateway();
+          throw new Error("first recovery poll disconnected");
+        }
+        if (init.method !== "PUT") return app.request(url, init);
+        uploads++;
+        if (uploads !== 1) return app.request(url, init);
+        if (phase === "late") delayed = () => app.request(url, init);
+        else if (phase !== "before") {
+          pending = app.request(url, init);
+          if (phase === "uploading") await started.promise;
+          else {
+            assert.equal((await pending).status, 202);
+            if (phase === "verifying") await started.promise;
+            else await coordinator.settled();
+          }
+        }
+        losePoll = phase === "before" || phase === "done" || phase === "headers" || phase === "gateway";
+        if (phase === "headers") return interruptedJson();
+        if (phase === "gateway") return gateway();
+        throw new Error("upload response disconnected");
+      } });
+      const result = await contributeToCeremony({
+        client, name: `Lost ${phase}`, entropyText: "", contribute: contributeZkey,
+        sleep: async () => { gate.resolve(); if (delayed) { pending = delayed(); delayed = undefined; } await pending; await coordinator.settled(); },
+      });
+      assert.equal(result.round, ++round, phase);
+      assert.equal(result.attestation, coordinator.latest.attestation, phase);
+      assert.equal(uploads, phase === "before" || phase === "late" ? 2 : 1, phase);
+      assert.equal(coordinator.latest.round, round, "no duplicate contribution");
+    }
+  } finally {
+    release?.();
+    await coordinator?.shutdown();
+    await terminateThreads();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a two-minute outage while the coordinator verifies does not lose the receipt", async () => {
+  // Flow-only: no circuits, so the policy under test is the receipt poll, not the cryptography covered above.
+  const attestation = await attestationHash(1, []);
+  let offlineMs = 0, polls = 0, uploads = 0;
+  const client = {
+    status: async () => ({ closed: false, finalized: false, round: 0, circuits: [] }),
+    join: async () => ({ ticket: "t" }),
+    leave: async () => {},
+    upload: async () => { uploads++; return { state: "verifying" }; },
+    poll: async () => {
+      if (++polls === 1) return { state: "active" };
+      if (offlineMs < 120_000) throw new CeremonyError("network", "offline");
+      return { state: "done", result: { round: 1, attestation } };
+    },
+  };
+  const result = await contributeToCeremony({ client, name: "", entropyText: "", contribute: assert.fail, sleep: async (ms) => { offlineMs += ms; } });
+  assert.equal(result.attestation, attestation);
+  assert.equal(uploads, 1);
 });
