@@ -1,0 +1,41 @@
+{
+  "name": "Dagon zkAPI Groth16 trusted setup",
+  "version": 1,
+  "curve": "bn128",
+  "ptau": {
+    "url": "https://circom.info/powersOfTau28_hez_final_16.ptau",
+    "hash": "6a6277a2f74e1073601b4f9fed6e1e55226917efb0f0db8a07d98ab01df1ccf43eb0e8c3159432acd4960e2f29fe84a4198501fa54c8dad9e43297453efec125",
+    "hashAlgorithm": "blake2b-512",
+    "power": 16
+  },
+  "circuits": [
+    {
+      "id": "request",
+      "r1cs": "request.r1cs",
+      "publicInputs": 12,
+      "constraints": 30821,
+      "r1csSha256": "f652f7fe3e1dcf6233e3fa42647ed33b0a837ce286bc4139df611929fb4f4837"
+    },
+    {
+      "id": "withdrawal",
+      "r1cs": "withdrawal.r1cs",
+      "publicInputs": 14,
+      "constraints": 35969,
+      "r1csSha256": "75aafc61319371af849a00c4a1a3b51e22543bf09d46fbf795f82b2b6aa795ad"
+    },
+    {
+      "id": "transition",
+      "r1cs": "transition.r1cs",
+      "publicInputs": 10,
+      "constraints": 31810,
+      "r1csSha256": "a9cd49c195bd2d6e80664672f0994542baa12aa661e8e93bd9563f3bed8ad1c1"
+    }
+  ],
+  "beacon": {
+    "source": "drand",
+    "chain": "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971",
+    "round": 34599412,
+    "applyAfter": "2026-12-07T00:00:00Z",
+    "iterationsExp": 20
+  }
+}

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Dagon zkAPI trusted setup: add your randomness</title>
+  <meta name="description" content="Help secure the Dagon zkAPI proofs: contribute randomness to the trusted setup from your browser in a few minutes. No wallet, no install.">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css" integrity="__CSS_INTEGRITY__">
+</head>
+<body>
+<main>
+  <header>
+    <p class="eyebrow">Dagon zkAPI</p>
+    <h1>Trusted setup ceremony</h1>
+    <p class="lede">Add your randomness to the keys that secure private payments. One click, a few minutes, nothing to install.</p>
+  </header>
+
+  <noscript><p class="card error">This page needs JavaScript: the contribution is computed in your browser.</p></noscript>
+  <p id="unsupported" class="card error" hidden></p>
+
+  <section id="intro" class="card">
+    <h2>What happens when you press the button</h2>
+    <ul class="points">
+      <li><b>Why.</b> Zero-knowledge proofs need public keys that were made from secret random numbers. Whoever knows those secrets could forge proofs, so the secrets must be destroyed. Many people each add their own randomness; the secrets are gone unless <em>every single one</em> of them cheated.</li>
+      <li><b>You.</b> Your browser downloads the current keys, mixes in fresh randomness from your device (and anything you type or wiggle below), sends the changed keys back and forgets the randomness. About <span id="eta">a few</span> minute(s).</li>
+      <li><b>One honest person is enough.</b> You do not have to trust us, or anyone: if you are honest, the setup is safe, and anyone can re-check the whole chain afterwards.</li>
+      <li><b>What it does not do.</b> No wallet, no account, no keys of yours, nothing installed or stored. We never see your randomness; only the public result is uploaded. We keep no IP addresses beyond short-lived rate limiting.</li>
+      <li><b>Please.</b> Use a device you trust, close other tabs, keep this one open and awake until it says &ldquo;Done&rdquo;.</li>
+    </ul>
+
+    <label for="name">Name to show in the public list <span class="muted">(optional)</span></label>
+    <input id="name" type="text" maxlength="64" autocomplete="off" placeholder="Anonymous" spellcheck="false">
+
+    <label for="entropy">Extra randomness <span class="muted">(optional: mash the keyboard, type anything)</span></label>
+    <textarea id="entropy" rows="2" autocomplete="off" spellcheck="false" placeholder="Anything unpredictable. Moving the mouse or your finger over this page also adds to it."></textarea>
+    <p class="muted small" id="entropy-note">Your device&rsquo;s secure random generator is always used. What you add here is mixed in on top and can only make the result stronger.</p>
+
+    <button id="start" class="big" type="button" disabled>Contribute my randomness</button>
+    <p class="muted small" id="status-line">Connecting to the ceremony&hellip;</p>
+  </section>
+
+  <section id="run" class="card" hidden aria-live="polite">
+    <h2 id="run-title">Working&hellip;</h2>
+    <ol class="steps" id="steps">
+      <li data-step="queue">Wait for your turn</li>
+      <li data-step="download">Download the current keys</li>
+      <li data-step="mix">Mix in your randomness</li>
+      <li data-step="upload">Send the result back</li>
+      <li data-step="verify">Coordinator checks it</li>
+    </ol>
+    <progress id="bar" max="1" value="0"></progress>
+    <p id="run-detail" class="muted"></p>
+    <p id="run-clock" class="muted small"></p>
+    <p class="muted small">Keep this tab open. Nothing secret leaves your device. <button id="cancel" type="button" class="link">Leave the queue</button></p>
+  </section>
+
+  <section id="done" class="card" hidden>
+    <h2>Done. Thank you!</h2>
+    <p>Your contribution is round <b id="done-round"></b>. This is your attestation hash:</p>
+    <div class="hash-row">
+      <code id="attestation" class="hash" tabindex="0"></code>
+      <button id="copy" type="button" class="soft">Copy</button>
+    </div>
+    <h3>Post this to attest</h3>
+    <p class="muted small">Anyone can check that your contribution is in the final keys. Posting the hash somewhere public (not here) is what makes it count as proof.</p>
+    <textarea id="post" rows="4" readonly></textarea>
+    <p class="links"><a id="share-x" target="_blank" rel="noopener noreferrer">Post on X</a> <a id="share-bsky" target="_blank" rel="noopener noreferrer">Post on Bluesky</a> <a id="share-mail" rel="noopener noreferrer">Email it to yourself</a> <button id="copy-post" type="button" class="soft">Copy text</button></p>
+    <details>
+      <summary>Per-circuit contribution hashes</summary>
+      <div id="circuit-hashes"></div>
+    </details>
+    <p class="muted small">You can close this page now. Nothing about your randomness exists anywhere any more.</p>
+  </section>
+
+  <section id="failed" class="card error" hidden>
+    <h2>That did not work</h2>
+    <p id="failed-message"></p>
+    <button id="retry" type="button">Try again</button>
+  </section>
+
+  <section class="card" id="roster-card">
+    <h2>Contributors</h2>
+    <p class="muted" id="roster-summary"></p>
+    <ol id="roster" class="roster"></ol>
+    <p class="muted small">Verify everything yourself: <code>node verify-ceremony.mjs <span class="origin"></span></code> (see the README).</p>
+  </section>
+
+  <footer class="muted small">
+    <p>This page is plain JavaScript served from this same address, with no third-party scripts, fonts or trackers. Its files: <span id="assets"></span></p>
+  </footer>
+</main>
+<script type="module" src="/app.js" integrity="__APP_INTEGRITY__"></script>
+</body>
+</html>

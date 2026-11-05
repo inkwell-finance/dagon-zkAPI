@@ -1,0 +1,27 @@
+{
+  "name": "dagon-zkapi-ceremony",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Multi-party trusted setup for the three Groth16 circuits of Dagon zkAPI: coordinator, browser page, CLI contributor and public verifier (snarkjs, phase 2 on the Hermez Perpetual Powers of Tau).",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "start": "node coordinator/server.mjs",
+    "init": "node coordinator/cli.mjs init",
+    "finalize": "node coordinator/cli.mjs finalize",
+    "contribute": "node contribute.mjs",
+    "verify": "node verify-ceremony.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@hono/node-server": "2.1.5",
+    "hono": "4.13.14",
+    "snarkjs": "0.7.6"
+  },
+  "devDependencies": {
+    "esbuild": "0.27.2"
+  }
+}
