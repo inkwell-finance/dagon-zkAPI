@@ -4,7 +4,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 use zkapi_serverd::{
-    config::{OpenRouterLeaseConfig, OpenRouterLeaseSourceConfig, ServerConfig},
+    config::{LedgerBackend, OpenRouterLeaseConfig, OpenRouterLeaseSourceConfig, ServerConfig},
     native_billing::NativeBillingConfig,
     nullifier_store::NullifierStore,
     processor::RequestProcessor,
@@ -18,6 +18,7 @@ const PASSWORD: &str = "testnet-integration-password";
 
 fn router(protected: bool) -> axum::Router {
     let config = ServerConfig {
+        backend: LedgerBackend::Evm,
         chain_id: if protected { SEPOLIA_CHAIN_ID } else { 1 },
         contract_address: Felt252::from_u64(123),
         testnet_password: protected.then(|| TestnetPassword::new(PASSWORD).unwrap()),

@@ -329,36 +329,49 @@ fn decode_log(log: &RpcLog) -> anyhow::Result<Option<(VaultEvent, Option<Felt252
         topic
             if topic
                 == event_topic(
-                    "EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)",
+                    "EscapeWithdrawalInitiated(uint32,uint256,uint256,uint128,uint128,address,uint64)",
                 ) =>
         {
-            if log.topics.len() < 2 || data_words.len() != 5 {
+            if log.topics.len() < 2 || data_words.len() != 6 {
                 return Err(anyhow!("malformed EscapeWithdrawalInitiated log"));
             }
-            let new_root = word_to_felt(&data_words[4]);
             Ok(Some((
                 VaultEvent::EscapeWithdrawalInitiated {
                     note_id: topic_to_u32(&log.topics[1])?,
                     nullifier: word_to_felt(&data_words[0]),
-                    final_balance: word_to_u128(&data_words[1]),
-                    challenge_deadline: word_to_u64(&data_words[3]),
-                    new_root,
+                    next_nullifier: word_to_felt(&data_words[1]),
+                    final_balance: word_to_u128(&data_words[2]),
+                    conceded: word_to_u128(&data_words[3]),
+                    challenge_deadline: word_to_u64(&data_words[5]),
                 },
-                Some(new_root),
+                None,
             )))
         }
-        topic if topic == event_topic("EscapeWithdrawalChallenged(uint32,uint256,uint256)") => {
+        topic if topic == event_topic("EscapeWithdrawalDefeated(uint32,uint256,uint256)") => {
             if log.topics.len() < 2 || data_words.len() != 2 {
-                return Err(anyhow!("malformed EscapeWithdrawalChallenged log"));
+                return Err(anyhow!("malformed EscapeWithdrawalDefeated log"));
             }
-            let restored_root = word_to_felt(&data_words[1]);
             Ok(Some((
-                VaultEvent::EscapeWithdrawalChallenged {
+                VaultEvent::EscapeWithdrawalDefeated {
                     note_id: topic_to_u32(&log.topics[1])?,
                     nullifier: word_to_felt(&data_words[0]),
-                    restored_root,
+                    next_nullifier: word_to_felt(&data_words[1]),
                 },
-                Some(restored_root),
+                None,
+            )))
+        }
+        topic if topic == event_topic("EscapeConcessionRaised(uint32,uint256,uint128,uint128)") => {
+            if log.topics.len() < 2 || data_words.len() != 3 {
+                return Err(anyhow!("malformed EscapeConcessionRaised log"));
+            }
+            Ok(Some((
+                VaultEvent::EscapeConcessionRaised {
+                    note_id: topic_to_u32(&log.topics[1])?,
+                    nullifier: word_to_felt(&data_words[0]),
+                    conceded: word_to_u128(&data_words[1]),
+                    final_balance: word_to_u128(&data_words[2]),
+                },
+                None,
             )))
         }
         topic
@@ -377,18 +390,51 @@ fn decode_log(log: &RpcLog) -> anyhow::Result<Option<(VaultEvent, Option<Felt252
                 None,
             )))
         }
-        topic if topic == event_topic("ExpiredClaimed(uint32,uint128,uint256)") => {
-            if log.topics.len() < 2 || data_words.len() != 2 {
+        topic if topic == event_topic("ExpiredClaimed(uint32,uint128)") => {
+            if log.topics.len() < 2 || data_words.len() != 1 {
                 return Err(anyhow!("malformed ExpiredClaimed log"));
             }
-            let new_root = word_to_felt(&data_words[1]);
             Ok(Some((
                 VaultEvent::ExpiredClaimed {
                     note_id: topic_to_u32(&log.topics[1])?,
                     deposit_amount: word_to_u128(&data_words[0]),
+                },
+                None,
+            )))
+        }
+        topic if topic == event_topic("ClosedLeafRetired(uint32,uint256)") => {
+            if log.topics.len() < 2 || data_words.len() != 1 {
+                return Err(anyhow!("malformed ClosedLeafRetired log"));
+            }
+            let new_root = word_to_felt(&data_words[0]);
+            Ok(Some((
+                VaultEvent::ClosedLeafRetired {
+                    note_id: topic_to_u32(&log.topics[1])?,
                     new_root,
                 },
                 Some(new_root),
+            )))
+        }
+        topic if topic == event_topic("VaultPaused(uint64)") => {
+            if data_words.len() != 1 {
+                return Err(anyhow!("malformed VaultPaused log"));
+            }
+            Ok(Some((
+                VaultEvent::VaultPaused {
+                    paused_at: word_to_u64(&data_words[0]),
+                },
+                None,
+            )))
+        }
+        topic if topic == event_topic("VaultUnpaused(uint64)") => {
+            if data_words.len() != 1 {
+                return Err(anyhow!("malformed VaultUnpaused log"));
+            }
+            Ok(Some((
+                VaultEvent::VaultUnpaused {
+                    unpaused_at: word_to_u64(&data_words[0]),
+                },
+                None,
             )))
         }
         _ => Ok(None),
@@ -520,6 +566,154 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
         assert_eq!(expected_root, Some(new_root));
+    }
+
+    fn log(signature: &str, note_id: Option<u64>, words: &[String]) -> RpcLog {
+        let mut topics = vec![event_topic(signature)];
+        topics.extend(note_id.map(|note| Felt252::from_u64(note).to_hex()));
+        RpcLog {
+            block_number: "0x2".to_string(),
+            topics,
+            data: format!("0x{}", words.concat()),
+        }
+    }
+
+    #[test]
+    fn decodes_concession_exit_events_and_rejects_removed_shapes() {
+        let nullifier = Felt252::from_u64(999);
+        let next = Felt252::from_u64(1_000);
+        let escape = log(
+            "EscapeWithdrawalInitiated(uint32,uint256,uint256,uint128,uint128,address,uint64)",
+            Some(3),
+            &[
+                encode_word(nullifier),
+                encode_word(next),
+                encode_u128(850),
+                encode_u128(150),
+                encode_word(Felt252::from_u64(0xbeef)),
+                encode_u64(1_700_086_400),
+            ],
+        );
+        let (event, root) = decode_log(&escape).unwrap().unwrap();
+        assert!(root.is_none(), "exits are root-free");
+        match event {
+            VaultEvent::EscapeWithdrawalInitiated {
+                note_id,
+                nullifier: n,
+                next_nullifier,
+                final_balance,
+                conceded,
+                challenge_deadline,
+            } => {
+                assert_eq!(
+                    (
+                        note_id,
+                        n,
+                        next_nullifier,
+                        final_balance,
+                        conceded,
+                        challenge_deadline
+                    ),
+                    (3, nullifier, next, 850, 150, 1_700_086_400)
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let defeated = log(
+            "EscapeWithdrawalDefeated(uint32,uint256,uint256)",
+            Some(3),
+            &[encode_word(nullifier), encode_word(next)],
+        );
+        assert!(matches!(
+            decode_log(&defeated).unwrap().unwrap(),
+            (VaultEvent::EscapeWithdrawalDefeated { note_id: 3, nullifier: n, next_nullifier: m }, None)
+                if n == nullifier && m == next
+        ));
+        let raised = log(
+            "EscapeConcessionRaised(uint32,uint256,uint128,uint128)",
+            Some(3),
+            &[encode_word(nullifier), encode_u128(300), encode_u128(700)],
+        );
+        assert!(matches!(
+            decode_log(&raised).unwrap().unwrap(),
+            (
+                VaultEvent::EscapeConcessionRaised {
+                    note_id: 3,
+                    conceded: 300,
+                    final_balance: 700,
+                    ..
+                },
+                None
+            )
+        ));
+        let claimed = log(
+            "ExpiredClaimed(uint32,uint128)",
+            Some(3),
+            &[encode_u128(1_000)],
+        );
+        assert!(matches!(
+            decode_log(&claimed).unwrap().unwrap(),
+            (
+                VaultEvent::ExpiredClaimed {
+                    note_id: 3,
+                    deposit_amount: 1_000
+                },
+                None
+            )
+        ));
+        let new_root = Felt252::from_u64(4242);
+        let retired = log(
+            "ClosedLeafRetired(uint32,uint256)",
+            Some(3),
+            &[encode_word(new_root)],
+        );
+        assert!(matches!(
+            decode_log(&retired).unwrap().unwrap(),
+            (VaultEvent::ClosedLeafRetired { note_id: 3, .. }, Some(root)) if root == new_root
+        ));
+        for (signature, field) in [("VaultPaused(uint64)", 7u64), ("VaultUnpaused(uint64)", 9)] {
+            let (event, root) = decode_log(&log(signature, None, &[encode_u64(field)]))
+                .unwrap()
+                .unwrap();
+            assert!(root.is_none());
+            match event {
+                VaultEvent::VaultPaused { paused_at } => assert_eq!(paused_at, 7),
+                VaultEvent::VaultUnpaused { unpaused_at } => assert_eq!(unpaused_at, 9),
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+
+        // Removed events and the pre-concession shapes are not recognized,
+        // and a malformed new-shape log is rejected.
+        for removed in [
+            log(
+                "EscapeWithdrawalChallenged(uint32,uint256)",
+                Some(3),
+                &[encode_word(nullifier)],
+            ),
+            log(
+                "ChallengedNoteRestored(uint32,uint256)",
+                Some(3),
+                &[encode_word(new_root)],
+            ),
+            log(
+                "EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)",
+                Some(3),
+                &vec![encode_word(nullifier); 5],
+            ),
+            log(
+                "ExpiredClaimed(uint32,uint128,uint256)",
+                Some(3),
+                &[encode_u128(1), encode_word(new_root)],
+            ),
+        ] {
+            assert!(decode_log(&removed).unwrap().is_none());
+        }
+        let malformed = RpcLog {
+            data: format!("0x{}", encode_word(nullifier)),
+            ..defeated
+        };
+        assert!(decode_log(&malformed).is_err());
     }
 
     #[test]

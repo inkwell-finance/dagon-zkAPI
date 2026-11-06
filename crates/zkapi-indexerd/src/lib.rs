@@ -10,11 +10,13 @@ pub mod events;
 pub mod http;
 pub mod poller;
 pub mod service;
+pub mod solana_poller;
 pub mod tree_mirror;
 
-pub use http::{create_router, run_indexer, IndexerConfig};
+pub use http::{create_router, run_indexer, IndexerConfig, IndexerLedger};
 pub use poller::{JsonRpcLogPoller, PollerConfig};
 pub use service::{
     IndexerService, NextNoteIdResponse, TreePathResponse, TreeRootResponse, TreeSnapshotResponse,
 };
+pub use solana_poller::{SolanaAccountPoller, SolanaPollerConfig};
 pub use tree_mirror::TreeMirror;

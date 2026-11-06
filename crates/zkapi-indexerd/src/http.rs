@@ -14,17 +14,22 @@ use crate::poller::{spawn_json_rpc_log_poller, PollerConfig};
 use crate::service::{
     IndexerService, NextNoteIdResponse, TreePathResponse, TreeRootResponse, TreeSnapshotResponse,
 };
+use crate::solana_poller::{spawn_solana_account_poller, SolanaPollerConfig};
 use crate::tree_mirror::TreeMirror;
+
+#[derive(Debug, Clone)]
+pub enum IndexerLedger {
+    Ethereum(PollerConfig),
+    Solana(SolanaPollerConfig),
+    Disabled,
+}
 
 /// Runtime configuration for the indexer HTTP server.
 #[derive(Debug, Clone)]
 pub struct IndexerConfig {
     pub listen_addr: String,
-    pub rpc_url: String,
-    pub contract_address: String,
-    pub from_block: u64,
     pub poll_interval_ms: u64,
-    pub cursor_path: Option<String>,
+    pub ledger: IndexerLedger,
 }
 
 impl Default for IndexerConfig {
@@ -32,11 +37,8 @@ impl Default for IndexerConfig {
         let poller = PollerConfig::default();
         Self {
             listen_addr: "0.0.0.0:3001".to_string(),
-            rpc_url: poller.rpc_url,
-            contract_address: poller.contract_address,
-            from_block: poller.from_block,
             poll_interval_ms: 1_000,
-            cursor_path: poller.cursor_path,
+            ledger: IndexerLedger::Ethereum(poller),
         }
     }
 }
@@ -44,25 +46,25 @@ impl Default for IndexerConfig {
 type AppState = Arc<IndexerService>;
 
 pub async fn run_indexer(config: IndexerConfig) -> anyhow::Result<()> {
-    let polling_enabled =
-        !config.rpc_url.trim().is_empty() && !config.contract_address.trim().is_empty();
+    let polling_enabled = !matches!(config.ledger, IndexerLedger::Disabled);
     let mirror = Arc::new(RwLock::new(TreeMirror::new()));
     let service = Arc::new(if polling_enabled {
         IndexerService::new_syncing(mirror)
     } else {
         IndexerService::new(mirror)
     });
-    if polling_enabled {
-        spawn_json_rpc_log_poller(
+    match config.ledger {
+        IndexerLedger::Ethereum(poller) => spawn_json_rpc_log_poller(
             service.clone(),
-            PollerConfig {
-                rpc_url: config.rpc_url,
-                contract_address: config.contract_address,
-                from_block: config.from_block,
-                cursor_path: config.cursor_path,
-            },
+            poller,
             Duration::from_millis(config.poll_interval_ms),
-        );
+        ),
+        IndexerLedger::Solana(poller) => spawn_solana_account_poller(
+            service.clone(),
+            poller,
+            Duration::from_millis(config.poll_interval_ms),
+        ),
+        IndexerLedger::Disabled => {}
     }
 
     let router = create_router(service);

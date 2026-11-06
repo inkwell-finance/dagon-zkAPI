@@ -1,44 +1,137 @@
-//! Reconstruct v2 escape challenges from finalized or issued-lease evidence.
+//! Concession-exit challenger policy over the server's append-only evidence.
+//!
+//! For each pending escape `(n, N, N⁺, B, c, deadline)`:
+//!
+//! 1. **Defeat** if verified request evidence exists at `N⁺`: the owner
+//!    held and spent the successor of the escaped state, so the escape is
+//!    stale. Defeat is root-independent.
+//! 2. Otherwise **raise** to `Ω(N)` once it is final and `Ω > c`. `Ω` is the
+//!    settled charge of the request at `N`, or, when that request may have
+//!    delivered access and is still unsettled at `deadline − raise_lead`, its
+//!    solvency bound. The raise amount is `min(Ω, sb, B)`.
+//! 3. Otherwise do nothing: an honest fresh escape has no evidence at `N` or
+//!    `N⁺` and is never touched.
+//!
+//! A defeat supersedes an unmined raise; a raise never replaces a defeat.
+//! Evidence comes only from `request_evidence`, which is written with the
+//! reservation and is immutable.
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
-use zkapi_types::{Felt252, RequestPublicInputsV2, MERKLE_DEPTH};
+use zkapi_proof::compact::RequestVerifier;
+use zkapi_types::wire::Groth16ProofWire;
+use zkapi_types::{Felt252, RequestPublicInputsV2};
 
-use crate::nullifier_store::{NullifierStore, TranscriptRecord};
+use crate::nullifier_store::{NullifierStore, OaProvisioningOutcome, RequestEvidence};
 
-pub const CHALLENGE_SIGNATURE: &str = "challengeEscapeWithdrawal(uint32,(uint16,uint64,address,uint256,uint256,uint256,uint64,uint128,uint256,uint256,uint256,uint256),bytes,uint256[32])";
+const REQUEST_TUPLE: &str =
+    "(uint16,uint64,address,uint256,uint256,uint256,uint64,uint128,uint256,uint256,uint256,uint256)";
 
-/// Fully reconstructed challenge action for the v2 vault.
+/// `challengeEscapeWithdrawal(uint32,RequestPublicInputs,bytes)`: defeat.
+pub fn defeat_signature() -> String {
+    format!("challengeEscapeWithdrawal(uint32,{REQUEST_TUPLE},bytes)")
+}
+
+/// `raiseEscapeConcession(uint32,RequestPublicInputs,bytes,uint128)`.
+pub fn raise_signature() -> String {
+    format!("raiseEscapeConcession(uint32,{REQUEST_TUPLE},bytes,uint128)")
+}
+
+/// One pending escape as the vault reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingEscape {
+    pub note_id: u32,
+    pub nullifier: Felt252,
+    pub next_nullifier: Felt252,
+    pub state_balance: u128,
+    pub conceded: u128,
+    pub deadline: u64,
+}
+
+/// The vault call a decision makes due.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ActionKind {
+    Defeat,
+    Raise {
+        #[serde(with = "decimal_u128")]
+        amount: u128,
+    },
+}
+
+/// Internally tagged enums buffer their fields, and that buffer cannot carry a
+/// `u128`, so checkpoints persist the raise amount as a decimal string. An
+/// integer amount (older checkpoints) still loads.
+mod decimal_u128 {
+    use serde::{de, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(amount: &u128, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(amount)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u128, D::Error> {
+        struct Amount;
+        impl de::Visitor<'_> for Amount {
+            type Value = u128;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a decimal u128 string or an unsigned integer")
+            }
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<u128, E> {
+                Ok(value.into())
+            }
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<u128, E> {
+                value.parse().map_err(E::custom)
+            }
+        }
+        deserializer.deserialize_any(Amount)
+    }
+}
+
+impl ActionKind {
+    pub fn is_defeat(self) -> bool {
+        matches!(self, Self::Defeat)
+    }
+}
+
+/// A fully reconstructed challenger call.
 #[derive(Debug, Clone)]
 pub struct ChallengeAction {
     pub note_id: u32,
+    pub kind: ActionKind,
     pub request_inputs: RequestPublicInputsV2,
-    /// Eight big-endian BN254 coordinates, in the archived Groth16 wire order.
-    pub proof_artifact: Vec<u8>,
-    /// Current zero-slot path, independent of the historical request root.
-    pub siblings: [Felt252; MERKLE_DEPTH],
+    pub proof: Groth16ProofWire,
 }
 
 impl ChallengeAction {
-    /// ABI-encode the exact v2 tuple and archived proof for the vault.
+    /// ABI-encode the EVM vault call with the exact request tuple and proof.
     pub fn calldata(&self) -> Result<Vec<u8>, String> {
         let p = &self.request_inputs;
         if p.protocol_version != 2 {
-            return Err("unsupported archived request protocol version".into());
+            return Err("unsupported evidence protocol version".into());
         }
         if p.contract_address.as_bytes()[..12]
             .iter()
             .any(|byte| *byte != 0)
         {
-            return Err("archived contract address exceeds 20 bytes".into());
+            return Err("evidence contract address exceeds 20 bytes".into());
         }
-        if self.proof_artifact.len() != 256 {
-            return Err("archived Groth16 proof must contain eight 32-byte coordinates".into());
+        let proof = RequestEvidence {
+            nullifier: p.request_nullifier,
+            client_request_id: String::new(),
+            request_inputs: p.clone(),
+            proof: self.proof.clone(),
+            created_at: 0,
         }
-        // noteId + static 12-word tuple + bytes offset + static 32-word array.
-        let head_words = 1 + 12 + 1 + MERKLE_DEPTH;
-        let mut data = Keccak256::digest(CHALLENGE_SIGNATURE.as_bytes())[..4].to_vec();
+        .proof_bytes()?;
+        // noteId + static 12-word tuple + bytes offset (+ amount for a raise).
+        let (signature, amount) = match self.kind {
+            ActionKind::Defeat => (defeat_signature(), None),
+            ActionKind::Raise { amount } => (raise_signature(), Some(amount)),
+        };
+        let head_words = 1 + 12 + 1 + usize::from(amount.is_some());
+        let mut data = Keccak256::digest(signature.as_bytes())[..4].to_vec();
         for value in [
             Felt252::from_u64(self.note_id as u64),
             Felt252::from_u64(p.protocol_version as u64),
@@ -57,334 +150,398 @@ impl ChallengeAction {
         ] {
             data.extend_from_slice(value.as_bytes());
         }
-        for sibling in self.siblings {
-            data.extend_from_slice(sibling.as_bytes());
+        if let Some(amount) = amount {
+            data.extend_from_slice(Felt252::from_u128(amount).as_bytes());
         }
-        data.extend_from_slice(Felt252::from_u64(256).as_bytes());
-        data.extend_from_slice(&self.proof_artifact);
+        data.extend_from_slice(Felt252::from_u64(proof.len() as u64).as_bytes());
+        data.extend_from_slice(&proof);
         Ok(data)
+    }
+}
+
+/// What the policy wants done for one pending escape now.
+#[derive(Debug, Clone)]
+pub enum Decision {
+    Act(ChallengeAction),
+    /// `Ω(N)` is not final yet; decide again before `deadline − raise_lead`.
+    Wait,
+    Nothing,
+}
+
+/// Verifies archived request evidence before it is submitted.
+pub trait EvidenceVerifier: Send + Sync {
+    fn verify(
+        &self,
+        inputs: &RequestPublicInputsV2,
+        proof: &Groth16ProofWire,
+    ) -> anyhow::Result<bool>;
+}
+
+impl EvidenceVerifier for RequestVerifier {
+    fn verify(
+        &self,
+        inputs: &RequestPublicInputsV2,
+        proof: &Groth16ProofWire,
+    ) -> anyhow::Result<bool> {
+        RequestVerifier::verify(self, inputs, proof)
     }
 }
 
 pub struct ChallengeWatcher {
     store: Arc<NullifierStore>,
+    verifier: Box<dyn EvidenceVerifier>,
+    raise_lead_seconds: u64,
+    chain_id: u64,
+    protocol_binding: Felt252,
 }
 
 impl ChallengeWatcher {
-    pub fn new(store: Arc<NullifierStore>) -> Self {
-        Self { store }
+    pub fn new(
+        store: Arc<NullifierStore>,
+        verifier: Box<dyn EvidenceVerifier>,
+        raise_lead_seconds: u64,
+        chain_id: u64,
+        protocol_binding: Felt252,
+    ) -> Self {
+        Self {
+            store,
+            verifier,
+            raise_lead_seconds,
+            chain_id,
+            protocol_binding,
+        }
     }
 
-    /// Finalized usage is not required once a runtime key may have been given
-    /// to the user. Its exact accepted proof is durable before activation.
-    /// Provisioning alone is insufficient: a key may never have been returned.
-    pub fn challenge_transcript(&self, nullifier: &Felt252) -> Option<TranscriptRecord> {
-        use crate::nullifier_store::api_request_binding;
-        use base64::Engine;
-        let mut record = self.store.lookup_by_nullifier(nullifier)?;
-        if record.status == zkapi_types::NullifierStatus::Finalized {
-            return Some(record);
-        }
-        if record.status != zkapi_types::NullifierStatus::Reserved
-            || record.reservation_kind != "openrouter_lease"
-        {
-            return None;
-        }
-        let id = record.client_request_id.as_deref()?;
-        let lease = self.store.lookup_openrouter_lease(id)?;
-        let request = &lease.api_request;
-        // Retirement has already stopped or is stopping future key use, but
-        // the issued authorization remains consumed until settlement completes.
-        if !matches!(
-            lease.status.as_str(),
-            "active" | "retiring" | "disabled" | "revoking"
-        ) || lease.key_hash.is_none()
-            || lease.client_request_id != id
-            || request.client_request_id != id
-            || lease.request_nullifier != *nullifier
-            || request.public_inputs.request_nullifier != *nullifier
-            || record.payload_hash != Some(request.payload_hash)
-            || record.api_request_binding.as_deref()
-                != Some(api_request_binding(request).ok()?.as_str())
-            || request.proof.backend != zkapi_types::wire::ProofBackendWire::Groth16Bn254
-        {
-            return None;
-        }
-        record.request_inputs_json = Some(serde_json::to_string(&request.public_inputs).ok()?);
-        record.proof_blob = Some(
-            base64::engine::general_purpose::STANDARD
-                .decode(&request.proof.proof)
-                .ok()?,
-        );
-        Some(record)
-    }
-
-    pub fn build_challenge_action(
-        &self,
-        note_id: u32,
-        nullifier: &Felt252,
-        siblings: [Felt252; MERKLE_DEPTH],
-    ) -> Result<ChallengeAction, String> {
-        let record = self
-            .challenge_transcript(nullifier)
-            .ok_or_else(|| "no finalized or issued-lease evidence for nullifier".to_string())?;
-        let request_inputs: RequestPublicInputsV2 = serde_json::from_str(
-            &record
-                .request_inputs_json
-                .ok_or("missing archived request inputs")?,
-        )
-        .map_err(|error| format!("invalid archived v2 request inputs: {error}"))?;
-        if request_inputs.request_nullifier != *nullifier {
-            return Err("archived request nullifier mismatch".to_string());
-        }
-        let action = ChallengeAction {
-            note_id,
-            request_inputs,
-            proof_artifact: record.proof_blob.ok_or("missing archived proof blob")?,
-            siblings,
+    /// Evidence at `nullifier` that verifies for this deployment.
+    fn verified_evidence(&self, nullifier: &Felt252) -> anyhow::Result<Option<RequestEvidence>> {
+        let Some(evidence) = self.store.request_evidence(nullifier) else {
+            return Ok(None);
         };
-        // Fail at the compatibility boundary, before submitting malformed calldata.
-        action.calldata()?;
-        Ok(action)
+        let inputs = &evidence.request_inputs;
+        if inputs.request_nullifier != *nullifier
+            || inputs.chain_id != self.chain_id
+            || inputs.contract_address != self.protocol_binding
+        {
+            tracing::error!(%nullifier, "request evidence belongs to another deployment");
+            return Ok(None);
+        }
+        if !self.verifier.verify(inputs, &evidence.proof)? {
+            tracing::error!(%nullifier, "request evidence failed verification");
+            return Ok(None);
+        }
+        Ok(Some(evidence))
+    }
+
+    /// `Ω(N)` when final: the settled charge, or the bound when access may
+    /// have been delivered and the request is unsettled at the raise lead.
+    /// `None` means not final yet.
+    fn final_charge(&self, evidence: &RequestEvidence, deadline: u64, now: u64) -> Option<u128> {
+        let record = self.store.lookup_by_nullifier(&evidence.nullifier);
+        if let Some(charge) = record.as_ref().and_then(|record| {
+            record
+                .settled_charge
+                .or((record.status == zkapi_types::NullifierStatus::Finalized)
+                    .then_some(record.charge_applied)
+                    .flatten())
+        }) {
+            return Some(charge);
+        }
+        let possibly_delivered = self
+            .store
+            .lookup_openrouter_lease(&evidence.client_request_id)
+            .filter(|lease| lease.request_nullifier == evidence.nullifier)
+            .is_none_or(|lease| {
+                lease.key_hash.is_some()
+                    || lease.oa_provisioning_outcome == OaProvisioningOutcome::MayHaveIssued
+            });
+        if !possibly_delivered {
+            // Access was provably never issued: nothing is owed.
+            return Some(0);
+        }
+        (now >= deadline.saturating_sub(self.raise_lead_seconds))
+            .then_some(evidence.request_inputs.solvency_bound)
+    }
+
+    /// Apply the concession policy to one pending escape at chain time `now`.
+    pub fn decide(&self, escape: &PendingEscape, now: u64) -> anyhow::Result<Decision> {
+        if escape.next_nullifier != Felt252::ZERO {
+            if let Some(evidence) = self.verified_evidence(&escape.next_nullifier)? {
+                return Ok(Decision::Act(ChallengeAction {
+                    note_id: escape.note_id,
+                    kind: ActionKind::Defeat,
+                    request_inputs: evidence.request_inputs,
+                    proof: evidence.proof,
+                }));
+            }
+        }
+        let Some(evidence) = self.verified_evidence(&escape.nullifier)? else {
+            return Ok(Decision::Nothing);
+        };
+        let Some(omega) = self.final_charge(&evidence, escape.deadline, now) else {
+            return Ok(Decision::Wait);
+        };
+        let amount = omega
+            .min(evidence.request_inputs.solvency_bound)
+            .min(escape.state_balance);
+        if amount <= escape.conceded {
+            return Ok(Decision::Nothing);
+        }
+        Ok(Decision::Act(ChallengeAction {
+            note_id: escape.note_id,
+            kind: ActionKind::Raise { amount },
+            request_inputs: evidence.request_inputs,
+            proof: evidence.proof,
+        }))
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::{config::ServerConfig, processor::RequestProcessor, signer::ServerSigner};
     use base64::Engine;
-    use zkapi_core::v2 as core;
-    use zkapi_proof::compact::{balance_commitment, RequestProver, RequestWitnessData};
-    use zkapi_types::wire::ApiRequestV2;
-    use zkapi_types::{canonical_payload_hash, canonical_request_context};
+    use zkapi_types::wire::{ApiRequestV2, ProofBackendWire};
 
-    /// A real v2 proof accepted and archived by the active processor, rather
-    /// than a hand-constructed transcript that could drift from its writer.
-    pub(crate) async fn finalized_v2_request() -> (Arc<NullifierStore>, ApiRequestV2) {
-        static FIXTURE: tokio::sync::OnceCell<(Arc<NullifierStore>, ApiRequestV2)> =
-            tokio::sync::OnceCell::const_new();
-        FIXTURE
-            .get_or_init(|| async {
-                let setup_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../protocol/setup/v2");
-                let signer = Arc::new(ServerSigner::new(
-                    &Felt252::from_u64(11),
-                    &Felt252::from_u64(12),
-                ));
-                let key = signer.state_public_key();
-                let secret = Felt252::from_u64(42);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                let expiry = now + 86_400;
-                let siblings = core::zero_hashes()[..MERKLE_DEPTH].try_into().unwrap();
-                let registration = core::registration_commitment(&secret);
-                let leaf = core::note_leaf(0, &registration, 100, expiry);
-                let root = core::merkle_root(0, &leaf, &siblings);
-                let nullifier = core::nullifier(&secret, &Felt252::ONE);
-                let test_config = ServerConfig {
-                    native_billing: Some(crate::test_support::native_config()),
-                    openrouter_leases: Some(crate::test_support::lease_config()),
-                    ..Default::default()
-                };
-                let payload = crate::test_support::lease_payload(&test_config, now);
-                let payload_hash = canonical_payload_hash(payload.as_bytes());
-                let request_context = canonical_request_context("challenge-v2", &payload_hash);
-                let blind = Felt252::from_u64(17);
-                let anonymous = balance_commitment(100, &blind, &leaf);
-                let public = RequestPublicInputsV2 {
-                    protocol_version: 2,
-                    chain_id: 1,
-                    contract_address: Felt252::from_u64(0xdead),
-                    active_root: root,
-                    state_signing_key_x: key.x,
-                    state_signing_key_y: key.y,
-                    request_time: now,
-                    solvency_bound: 1,
-                    request_nullifier: nullifier,
-                    authorization_tag: core::authorization_tag(&nullifier, &request_context),
-                    anonymous_commitment_x: anonymous.x,
-                    anonymous_commitment_y: anonymous.y,
-                };
-                let proof = RequestProver::load(&setup_dir)
-                    .unwrap()
-                    .prove(
-                        &public,
-                        RequestWitnessData {
-                            secret,
-                            request_context,
-                            note_id: 0,
-                            deposit_amount: 100,
-                            expiry,
-                            merkle_siblings: siblings,
-                            current_balance: 100,
-                            current_blinding: Felt252::ZERO,
-                            rerandomization: blind,
-                            current_anchor: Felt252::ONE,
-                            is_genesis: true,
-                            state_signature: None,
-                        },
-                    )
-                    .unwrap();
-                let request = ApiRequestV2 {
-                    client_request_id: "challenge-v2".into(),
-                    payload_hash,
-                    payload,
-                    public_inputs: public.clone(),
-                    proof,
-                };
-                let store = Arc::new(NullifierStore::in_memory().unwrap());
-                let processor = RequestProcessor::try_new(
-                    ServerConfig {
-                        contract_address: public.contract_address,
-                        request_charge_cap: 1,
-                        proof_setup_dir: setup_dir.to_string_lossy().into_owned(),
-                        ..test_config
-                    },
-                    store.clone(),
-                    signer,
-                    root,
-                )
-                .unwrap();
-                processor.finalize_test_lease(&request, 1).unwrap();
-                (store, request)
-            })
-            .await
-            .clone()
+    pub(crate) const BINDING: u64 = 0xdead;
+
+    /// Accepts evidence whose proof is not the literal `invalid` marker.
+    pub(crate) struct StubVerifier;
+
+    impl EvidenceVerifier for StubVerifier {
+        fn verify(
+            &self,
+            _inputs: &RequestPublicInputsV2,
+            proof: &Groth16ProofWire,
+        ) -> anyhow::Result<bool> {
+            Ok(proof.proof != base64::engine::general_purpose::STANDARD.encode([0xffu8; 256]))
+        }
     }
 
-    #[tokio::test]
-    async fn active_lease_can_be_challenged_without_receipt_but_provisioning_or_changed_binding_cannot(
-    ) {
-        let (_, request) = finalized_v2_request().await;
-        let store = Arc::new(NullifierStore::in_memory().unwrap());
-        store.reserve_openrouter_lease(&request).unwrap();
-        store
-            .create_openrouter_lease(&request, "oa_org", 1, 2, 3, 1.0)
-            .unwrap();
-        let watcher = ChallengeWatcher::new(store.clone());
-        let nullifier = request.public_inputs.request_nullifier;
-        assert!(
-            watcher.challenge_transcript(&nullifier).is_none(),
-            "provisioning does not establish that a key was returned"
-        );
-        store
-            .activate_openrouter_lease(&request.client_request_id, "issued-key-hash")
-            .unwrap();
-        let action = watcher
-            .build_challenge_action(0, &nullifier, [Felt252::ZERO; MERKLE_DEPTH])
-            .unwrap();
-        assert_eq!(
-            action.request_inputs.active_root,
-            request.public_inputs.active_root
-        );
-        assert_eq!(
-            action.proof_artifact,
-            base64::engine::general_purpose::STANDARD
-                .decode(&request.proof.proof)
-                .unwrap()
-        );
-        let reservation = store.lookup_by_nullifier(&nullifier).unwrap();
-        assert_eq!(reservation.status, zkapi_types::NullifierStatus::Reserved);
-        assert!(reservation.response_hash.is_none());
-        assert!(
-            reservation.proof_blob.is_none(),
-            "read-only reconstruction must not finalize usage"
-        );
-
-        let changed_store = Arc::new(NullifierStore::in_memory().unwrap());
-        changed_store.reserve_openrouter_lease(&request).unwrap();
-        let mut changed = request.clone();
-        changed.public_inputs.active_root = Felt252::from_u64(999);
-        changed_store
-            .create_openrouter_lease(&changed, "oa_org", 1, 2, 3, 1.0)
-            .unwrap();
-        changed_store
-            .activate_openrouter_lease(&changed.client_request_id, "issued-key-hash")
-            .unwrap();
-        assert!(ChallengeWatcher::new(changed_store)
-            .challenge_transcript(&nullifier)
-            .is_none());
+    pub(crate) fn synthetic_request(id: &str, nullifier: Felt252, bound: u128) -> ApiRequestV2 {
+        ApiRequestV2 {
+            client_request_id: id.into(),
+            payload: "{}".into(),
+            payload_hash: Felt252::from_u64(88),
+            public_inputs: RequestPublicInputsV2 {
+                protocol_version: 2,
+                chain_id: 1,
+                contract_address: Felt252::from_u64(BINDING),
+                active_root: Felt252::from_u64(3),
+                state_signing_key_x: Felt252::from_u64(4),
+                state_signing_key_y: Felt252::from_u64(5),
+                request_time: 6,
+                solvency_bound: bound,
+                request_nullifier: nullifier,
+                authorization_tag: Felt252::from_u64(7),
+                anonymous_commitment_x: Felt252::from_u64(8),
+                anonymous_commitment_y: Felt252::from_u64(9),
+            },
+            proof: Groth16ProofWire {
+                backend: ProofBackendWire::Groth16Bn254,
+                proof: base64::engine::general_purpose::STANDARD
+                    .encode([nullifier.as_bytes()[31]; 256]),
+            },
+        }
     }
 
-    #[tokio::test]
-    async fn direct_key_retirement_preserves_challenge_evidence_until_finalization() {
-        let (_, request) = finalized_v2_request().await;
-        let store = Arc::new(NullifierStore::in_memory().unwrap());
+    /// Reserve a request (evidence) and give it an issued key.
+    pub(crate) fn served(store: &NullifierStore, id: &str, nullifier: Felt252, bound: u128) {
+        let request = synthetic_request(id, nullifier, bound);
         store.reserve_openrouter_lease(&request).unwrap();
         store
             .create_openrouter_lease(&request, "openrouter", 1, 2, 3, 1.0)
             .unwrap();
         store
-            .activate_openrouter_lease(&request.client_request_id, "issued-key-hash")
+            .activate_openrouter_lease(id, &format!("key-{id}"))
             .unwrap();
-        let watcher = ChallengeWatcher::new(store.clone());
-        let nullifier = request.public_inputs.request_nullifier;
-        for (from, to) in [
-            ("active", "retiring"),
-            ("retiring", "disabled"),
-            ("disabled", "revoking"),
-        ] {
-            store
-                .advance_openrouter_retirement(&request.client_request_id, from, to, 0, None)
-                .unwrap();
-            let action = watcher
-                .build_challenge_action(0, &nullifier, [Felt252::ZERO; MERKLE_DEPTH])
-                .unwrap_or_else(|error| panic!("{to} must remain challengeable: {error}"));
-            assert_eq!(
-                action.request_inputs.active_root,
-                request.public_inputs.active_root
-            );
-            assert_eq!(
-                action.proof_artifact,
-                base64::engine::general_purpose::STANDARD
-                    .decode(&request.proof.proof)
-                    .unwrap()
-            );
-            let reservation = store.lookup_by_nullifier(&nullifier).unwrap();
-            assert_eq!(reservation.status, zkapi_types::NullifierStatus::Reserved);
-            assert!(reservation.response_hash.is_none());
+    }
+
+    pub(crate) fn watcher(store: Arc<NullifierStore>) -> ChallengeWatcher {
+        ChallengeWatcher::new(
+            store,
+            Box::new(StubVerifier),
+            600,
+            1,
+            Felt252::from_u64(BINDING),
+        )
+    }
+
+    fn escape(nullifier: u64, next: u64, conceded: u128) -> PendingEscape {
+        PendingEscape {
+            note_id: 4,
+            nullifier: Felt252::from_u64(nullifier),
+            next_nullifier: Felt252::from_u64(next),
+            state_balance: 1_000,
+            conceded,
+            deadline: 10_000,
         }
     }
 
-    #[tokio::test]
-    async fn active_v2_processor_transcript_builds_challenge_calldata() {
-        let (store, request) = finalized_v2_request().await;
-        let nullifier = request.public_inputs.request_nullifier;
-        let watcher = ChallengeWatcher::new(store);
-        let action = watcher
-            .build_challenge_action(0, &nullifier, [Felt252::ZERO; MERKLE_DEPTH])
+    /// Threat: stale-state escape after spending the successor. Evidence at
+    /// `N⁺` exists, so the policy defeats; this supersedes any raise.
+    #[test]
+    fn stale_escape_with_evidence_at_the_successor_is_defeated() {
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        served(&store, "k", Felt252::from_u64(10), 300);
+        served(&store, "k+1", Felt252::from_u64(11), 300);
+        store
+            .record_settlement(&Felt252::from_u64(10), 120, 200, "{}")
             .unwrap();
+        let Decision::Act(action) = watcher(store).decide(&escape(10, 11, 0), 0).unwrap() else {
+            panic!("expected a defeat");
+        };
+        assert_eq!(action.kind, ActionKind::Defeat);
         assert_eq!(
-            serde_json::to_value(&action.request_inputs).unwrap(),
-            serde_json::to_value(&request.public_inputs).unwrap()
+            action.request_inputs.request_nullifier,
+            Felt252::from_u64(11)
+        );
+    }
+
+    /// Threat: under-concession. Only evidence at `N`, settled at 120: raise
+    /// to the settled charge, never above the bound or the state balance.
+    #[test]
+    fn under_concession_is_raised_to_the_settled_charge() {
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        served(&store, "k", Felt252::from_u64(10), 300);
+        let watcher = watcher(store.clone());
+        assert!(
+            matches!(
+                watcher.decide(&escape(10, 11, 0), 0).unwrap(),
+                Decision::Wait
+            ),
+            "an unsettled possibly-delivered request waits for the raise lead"
+        );
+        let Decision::Act(action) = watcher.decide(&escape(10, 11, 0), 9_400).unwrap() else {
+            panic!("expected a bound raise at the lead");
+        };
+        assert_eq!(action.kind, ActionKind::Raise { amount: 300 });
+        store
+            .record_settlement(&Felt252::from_u64(10), 120, 200, "{}")
+            .unwrap();
+        let Decision::Act(action) = watcher.decide(&escape(10, 11, 0), 0).unwrap() else {
+            panic!("expected a raise");
+        };
+        assert_eq!(action.kind, ActionKind::Raise { amount: 120 });
+        assert!(matches!(
+            watcher.decide(&escape(10, 11, 120), 0).unwrap(),
+            Decision::Nothing
+        ));
+        let mut small = escape(10, 11, 0);
+        small.state_balance = 50;
+        let Decision::Act(action) = watcher.decide(&small, 0).unwrap() else {
+            panic!("expected a capped raise");
+        };
+        assert_eq!(action.kind, ActionKind::Raise { amount: 50 });
+    }
+
+    /// An honest fresh escape (no request at `N` or `N⁺`) is never touched,
+    /// nor is an escape whose request provably never issued access.
+    #[test]
+    fn honest_fresh_escape_and_unissued_requests_are_left_alone() {
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        let watcher = watcher(store.clone());
+        assert!(matches!(
+            watcher.decide(&escape(10, 11, 0), 9_999).unwrap(),
+            Decision::Nothing
+        ));
+        let request = synthetic_request("never-issued", Felt252::from_u64(20), 300);
+        store.reserve_openrouter_lease(&request).unwrap();
+        store
+            .create_openrouter_lease_with_oa_id(&request, "oa_org", 1, 2, 3, 1.0, Some("b"))
+            .unwrap();
+        assert!(matches!(
+            watcher.decide(&escape(20, 21, 0), 9_999).unwrap(),
+            Decision::Nothing
+        ));
+    }
+
+    /// Griefing: evidence that fails verification or belongs to another
+    /// deployment is never submitted.
+    #[test]
+    fn invalid_or_foreign_evidence_is_ignored() {
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        let mut forged = synthetic_request("forged", Felt252::from_u64(11), 300);
+        forged.proof.proof = base64::engine::general_purpose::STANDARD.encode([0xffu8; 256]);
+        store.reserve_openrouter_lease(&forged).unwrap();
+        let mut foreign = synthetic_request("foreign", Felt252::from_u64(31), 300);
+        foreign.public_inputs.chain_id = 2;
+        store.reserve_openrouter_lease(&foreign).unwrap();
+        let watcher = watcher(store);
+        assert!(matches!(
+            watcher.decide(&escape(10, 11, 0), 0).unwrap(),
+            Decision::Nothing
+        ));
+        assert!(matches!(
+            watcher.decide(&escape(30, 31, 0), 0).unwrap(),
+            Decision::Nothing
+        ));
+    }
+
+    /// Threat: a challenger that cannot restart. Checkpoints persist the
+    /// in-flight action; a raise must reload (including checkpoints written
+    /// with a numeric amount), or the daemon refuses to start.
+    #[test]
+    fn action_kind_survives_a_checkpoint_round_trip() {
+        for kind in [ActionKind::Defeat, ActionKind::Raise { amount: 120 }] {
+            let json = serde_json::to_string(&Some(kind)).unwrap();
+            let restored: Option<ActionKind> = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, Some(kind));
+        }
+        let legacy: ActionKind = serde_json::from_str(r#"{"kind":"raise","amount":120}"#).unwrap();
+        assert_eq!(legacy, ActionKind::Raise { amount: 120 });
+    }
+
+    #[test]
+    fn calldata_encodes_defeat_and_raise_with_the_exact_tuple_and_proof() {
+        let request = synthetic_request("k", Felt252::from_u64(11), 300);
+        let proof = base64::engine::general_purpose::STANDARD
+            .decode(&request.proof.proof)
+            .unwrap();
+        let mut action = ChallengeAction {
+            note_id: 4,
+            kind: ActionKind::Defeat,
+            request_inputs: request.public_inputs.clone(),
+            proof: request.proof.clone(),
+        };
+        let defeat = action.calldata().unwrap();
+        assert_eq!(
+            &defeat[..4],
+            &Keccak256::digest(defeat_signature().as_bytes())[..4]
+        );
+        // The defeat selector is unchanged from the pre-concession vault.
+        assert_eq!(&defeat[..4], &[0xda, 0x0c, 0xe4, 0x3d]);
+        assert_eq!(defeat.len(), 4 + (14 + 1 + 8) * 32);
+        assert_eq!(
+            &defeat[4 + 9 * 32..4 + 10 * 32],
+            Felt252::from_u64(11).as_bytes()
         );
         assert_eq!(
-            action.proof_artifact,
-            base64::engine::general_purpose::STANDARD
-                .decode(&request.proof.proof)
-                .unwrap()
+            &defeat[4 + 13 * 32..4 + 14 * 32],
+            Felt252::from_u64(14 * 32).as_bytes()
         );
-        let calldata = action.calldata().unwrap();
-        assert_eq!(&calldata[..4], &[0x8a, 0x43, 0x46, 0x7c]);
-        assert_eq!(calldata.len(), 4 + (46 + 1 + 8) * 32);
+        assert_eq!(&defeat[4 + 15 * 32..], proof.as_slice());
+
+        action.kind = ActionKind::Raise { amount: 77 };
+        let raise = action.calldata().unwrap();
         assert_eq!(
-            &calldata[4 + 4 * 32..4 + 5 * 32],
-            request.public_inputs.active_root.as_bytes()
+            &raise[..4],
+            &Keccak256::digest(raise_signature().as_bytes())[..4]
         );
-        assert_eq!(&calldata[4 + 9 * 32..4 + 10 * 32], nullifier.as_bytes());
+        assert_eq!(raise.len(), 4 + (15 + 1 + 8) * 32);
         assert_eq!(
-            &calldata[4 + 13 * 32..4 + 14 * 32],
-            Felt252::from_u64(46 * 32).as_bytes()
+            &raise[4 + 13 * 32..4 + 14 * 32],
+            Felt252::from_u64(15 * 32).as_bytes()
         );
-        assert_eq!(&calldata[4 + 47 * 32..], action.proof_artifact);
-        let mut malformed = action.clone();
-        malformed.proof_artifact.pop();
-        assert!(malformed.calldata().is_err());
-        malformed = action;
-        malformed.request_inputs.protocol_version = 1;
-        assert!(malformed.calldata().is_err());
+        assert_eq!(
+            &raise[4 + 14 * 32..4 + 15 * 32],
+            Felt252::from_u128(77).as_bytes()
+        );
+        assert_eq!(
+            &raise[4 + 15 * 32..4 + 16 * 32],
+            Felt252::from_u64(256).as_bytes()
+        );
+        assert_eq!(&raise[4 + 16 * 32..], proof.as_slice());
+
+        action.request_inputs.protocol_version = 1;
+        assert!(action.calldata().is_err());
     }
 }

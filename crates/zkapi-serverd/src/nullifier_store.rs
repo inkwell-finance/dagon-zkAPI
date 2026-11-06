@@ -1,7 +1,16 @@
 //! SQLite-backed nullifier and transcript store.
 //!
 //! Stores nullifier reservations and finalized transcripts. Each nullifier
-//! progresses through: Reserved -> Finalized (or ClearanceReserved for withdrawals).
+//! progresses through: Reserved -> (settled) -> Finalized (or
+//! ClearanceReserved for withdrawals). A settled request whose nullifier an
+//! exit consumed on chain is `exit_deferred`; when the deferral window passes
+//! without a defeat releasing the nullifier it becomes `exited_unsigned` and
+//! its successor is never signed (O7).
+//!
+//! `request_evidence` is append-only: SQLite triggers refuse every UPDATE and
+//! DELETE. It is written in the same transaction as the reservation, so the
+//! challenger's defeat/raise evidence never depends on mutable lease rows or
+//! on finalization.
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha3::{Digest, Keccak256};
@@ -9,8 +18,8 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use zkapi_types::wire::ApiRequestV2;
-use zkapi_types::{Felt252, NullifierStatus, SchnorrSignature};
+use zkapi_types::wire::{ApiRequestV2, Groth16ProofWire, ProofBackendWire};
+use zkapi_types::{Felt252, NullifierStatus, RequestPublicInputsV2, SchnorrSignature};
 
 use crate::error::ServerError;
 
@@ -40,6 +49,58 @@ pub struct TranscriptRecord {
     pub api_request_binding: Option<String>,
     pub created_at: u64,
     pub finalized_at: Option<u64>,
+    /// Charge persisted when the request settled; the successor is signed at
+    /// exactly this charge (settle-then-sign, O7).
+    pub settled_charge: Option<u128>,
+    pub settled_at: Option<u64>,
+    /// First time the settled request's nullifier was seen consumed on chain.
+    pub exit_deferred_since: Option<u64>,
+    /// Terminal: the consuming exit was never defeated; never signed.
+    pub exited_unsigned_at: Option<u64>,
+}
+
+impl TranscriptRecord {
+    /// Settled, not yet signed and not terminally unsigned.
+    pub fn settled_unsigned(&self) -> bool {
+        self.status == NullifierStatus::Reserved
+            && self.settled_charge.is_some()
+            && self.exited_unsigned_at.is_none()
+    }
+}
+
+/// Immutable request evidence: the exact accepted public inputs and Groth16
+/// proof, recorded with the nullifier reservation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestEvidence {
+    pub nullifier: Felt252,
+    pub client_request_id: String,
+    pub request_inputs: RequestPublicInputsV2,
+    pub proof: Groth16ProofWire,
+    pub created_at: u64,
+}
+
+impl RequestEvidence {
+    /// The proof as eight 32-byte coordinates (the vault's `bytes proof`).
+    pub fn proof_bytes(&self) -> Result<Vec<u8>, String> {
+        use base64::Engine;
+        if self.proof.backend != ProofBackendWire::Groth16Bn254 {
+            return Err("evidence proof is not Groth16/BN254".into());
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&self.proof.proof)
+            .map_err(|error| format!("evidence proof is not base64: {error}"))?;
+        if bytes.len() != 256 {
+            return Err("evidence proof must contain eight 32-byte coordinates".into());
+        }
+        Ok(bytes)
+    }
+}
+
+/// Result of recording that a settled request's nullifier is consumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureDeferral {
+    Deferred { since: u64 },
+    ExitedUnsigned,
 }
 
 /// Whether an OA provisioning attempt can safely be cancelled without usage.
@@ -134,8 +195,26 @@ impl NullifierStore {
                 request_inputs_json TEXT,
                 api_request_binding TEXT,
                 created_at INTEGER NOT NULL,
-                finalized_at INTEGER
+                finalized_at INTEGER,
+                settled_charge INTEGER,
+                settled_at INTEGER,
+                exit_deferred_since INTEGER,
+                exited_unsigned_at INTEGER
             );
+            CREATE TABLE IF NOT EXISTS request_evidence (
+                nullifier TEXT PRIMARY KEY,
+                client_request_id TEXT NOT NULL,
+                request_inputs_json TEXT NOT NULL,
+                proof_backend TEXT NOT NULL,
+                proof TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS request_evidence_no_update
+                BEFORE UPDATE ON request_evidence
+                BEGIN SELECT RAISE(ABORT, 'request_evidence is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS request_evidence_no_delete
+                BEFORE DELETE ON request_evidence
+                BEGIN SELECT RAISE(ABORT, 'request_evidence is append-only'); END;
             CREATE TABLE IF NOT EXISTS openrouter_leases (
                 client_request_id TEXT PRIMARY KEY,
                 request_nullifier TEXT NOT NULL UNIQUE,
@@ -181,6 +260,14 @@ impl NullifierStore {
             "ALTER TABLE openrouter_leases ADD COLUMN oa_client_request_id TEXT",
             [],
         );
+        for column in [
+            "settled_charge INTEGER",
+            "settled_at INTEGER",
+            "exit_deferred_since INTEGER",
+            "exited_unsigned_at INTEGER",
+        ] {
+            let _ = conn.execute(&format!("ALTER TABLE nullifiers ADD COLUMN {column}"), []);
+        }
         migrate_oa_provisioning_outcome(&conn)?;
         backfill_openrouter_request_bindings(&conn)?;
 
@@ -219,25 +306,30 @@ impl NullifierStore {
         client_request_id: &str,
         payload_hash: &Felt252,
     ) -> Result<(), ServerError> {
-        self.reserve_with_kind(nullifier, client_request_id, payload_hash, "proxy", None)
+        self.reserve_with_kind(
+            nullifier,
+            client_request_id,
+            payload_hash,
+            "proxy",
+            None,
+            None,
+        )
     }
 
+    /// Reserve a lease request's nullifier and append its evidence (exact
+    /// public inputs and proof) in one transaction.
     pub fn reserve_openrouter_lease(&self, request: &ApiRequestV2) -> Result<(), ServerError> {
-        self.reserve_bound_v2(request, "openrouter_lease")
-    }
-
-    fn reserve_bound_v2(
-        &self,
-        request: &ApiRequestV2,
-        reservation_kind: &str,
-    ) -> Result<(), ServerError> {
         let binding = api_request_binding(request)?;
+        let inputs = serde_json::to_string(&request.public_inputs).map_err(|error| {
+            ServerError::Internal(format!("failed to serialize request evidence: {error}"))
+        })?;
         self.reserve_with_kind(
             &request.public_inputs.request_nullifier,
             &request.client_request_id,
             &request.payload_hash,
-            reservation_kind,
+            "openrouter_lease",
             Some(&binding),
+            Some((&inputs, &request.proof)),
         )
     }
 
@@ -248,42 +340,223 @@ impl NullifierStore {
         payload_hash: &Felt252,
         reservation_kind: &str,
         api_request_binding: Option<&str>,
+        evidence: Option<(&str, &Groth16ProofWire)>,
     ) -> Result<(), ServerError> {
-        let conn = self
+        let mut conn = self
             .conn
             .lock()
             .map_err(|e| ServerError::Database(format!("lock poisoned: {}", e)))?;
         let now = current_timestamp();
         let null_hex = nullifier.to_hex();
-
-        conn.execute(
-            "INSERT INTO nullifiers (
-                nullifier, status, reservation_kind, client_request_id, payload_hash,
-                api_request_binding, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                null_hex,
-                status_to_str(NullifierStatus::Reserved),
-                reservation_kind,
-                client_request_id,
-                payload_hash.to_hex(),
-                api_request_binding,
-                now as i64,
-            ],
-        )
-        .map_err(|e| {
-            if let rusqlite::Error::SqliteFailure(ref err, _) = e {
+        let conflict = |e: rusqlite::Error| {
+            if let rusqlite::Error::SqliteFailure(err, _) = &e {
                 if err.code == rusqlite::ErrorCode::ConstraintViolation {
                     return ServerError::Replay;
                 }
             }
             ServerError::Database(format!("insert failed: {}", e))
-        })?;
-
+        };
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| ServerError::Database(format!("reservation transaction failed: {e}")))?;
+        transaction
+            .execute(
+                "INSERT INTO nullifiers (
+                    nullifier, status, reservation_kind, client_request_id, payload_hash,
+                    api_request_binding, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    null_hex,
+                    status_to_str(NullifierStatus::Reserved),
+                    reservation_kind,
+                    client_request_id,
+                    payload_hash.to_hex(),
+                    api_request_binding,
+                    now as i64,
+                ],
+            )
+            .map_err(conflict)?;
+        if let Some((inputs, proof)) = evidence {
+            let backend = serde_json::to_value(proof.backend)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .ok_or_else(|| ServerError::Internal("unencodable proof backend".into()))?;
+            transaction
+                .execute(
+                    "INSERT INTO request_evidence (
+                        nullifier, client_request_id, request_inputs_json, proof_backend,
+                        proof, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        null_hex,
+                        client_request_id,
+                        inputs,
+                        backend,
+                        proof.proof,
+                        now as i64
+                    ],
+                )
+                .map_err(conflict)?;
+        }
+        transaction
+            .commit()
+            .map_err(|e| ServerError::Database(format!("reservation commit failed: {e}")))?;
         Ok(())
     }
 
-    /// Finalize a previously reserved nullifier with the full transcript.
+    /// The immutable evidence recorded with a request's reservation.
+    pub fn request_evidence(&self, nullifier: &Felt252) -> Option<RequestEvidence> {
+        let conn = self.conn.lock().ok()?;
+        conn.query_row(
+            "SELECT nullifier, client_request_id, request_inputs_json, proof_backend, proof,
+                    created_at
+             FROM request_evidence WHERE nullifier = ?1",
+            params![nullifier.to_hex()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(
+            |(null_hex, client_request_id, inputs, backend, proof, created_at)| {
+                let request_inputs: RequestPublicInputsV2 = serde_json::from_str(&inputs).ok()?;
+                let backend: ProofBackendWire =
+                    serde_json::from_value(serde_json::Value::String(backend)).ok()?;
+                let nullifier = Felt252::from_hex(&null_hex).ok()?;
+                (request_inputs.request_nullifier == nullifier).then_some(RequestEvidence {
+                    nullifier,
+                    client_request_id,
+                    request_inputs,
+                    proof: Groth16ProofWire { backend, proof },
+                    created_at: created_at as u64,
+                })
+            },
+        )
+    }
+
+    /// Persist a request's settled charge and provider response once. A
+    /// settled charge is final: a later settlement attempt returns the stored
+    /// record unchanged.
+    pub fn record_settlement(
+        &self,
+        nullifier: &Felt252,
+        charge: u128,
+        response_code: u16,
+        response_payload: &str,
+    ) -> Result<TranscriptRecord, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {}", e)))?;
+        conn.execute(
+            "UPDATE nullifiers SET settled_charge = ?1, settled_at = ?2, response_code = ?3,
+                response_payload = ?4
+             WHERE nullifier = ?5 AND status = ?6 AND settled_charge IS NULL",
+            params![
+                i64::try_from(charge)
+                    .map_err(|_| ServerError::Internal("settled charge exceeds i64".into()))?,
+                current_timestamp() as i64,
+                response_code as i32,
+                response_payload,
+                nullifier.to_hex(),
+                status_to_str(NullifierStatus::Reserved),
+            ],
+        )
+        .map_err(|e| ServerError::Database(format!("settlement failed: {e}")))?;
+        conn.query_row(
+            "SELECT * FROM nullifiers WHERE nullifier = ?1",
+            params![nullifier.to_hex()],
+            row_to_record,
+        )
+        .optional()
+        .map_err(|e| ServerError::Database(format!("settlement read failed: {e}")))?
+        .filter(|record| record.settled_charge.is_some())
+        .ok_or_else(|| ServerError::Internal("request nullifier is not reserved".into()))
+    }
+
+    /// Record that a settled, unsigned request's nullifier is consumed on
+    /// chain. The first observation starts the deferral; once `window`
+    /// seconds have passed the request is terminally `exited_unsigned`.
+    pub fn defer_signature(
+        &self,
+        nullifier: &Felt252,
+        now: u64,
+        window: u64,
+    ) -> Result<SignatureDeferral, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {}", e)))?;
+        conn.execute(
+            "UPDATE nullifiers SET exit_deferred_since = ?1
+             WHERE nullifier = ?2 AND status = ?3 AND settled_charge IS NOT NULL
+               AND exit_deferred_since IS NULL",
+            params![
+                now as i64,
+                nullifier.to_hex(),
+                status_to_str(NullifierStatus::Reserved)
+            ],
+        )
+        .map_err(|e| ServerError::Database(format!("deferral failed: {e}")))?;
+        let (since, ended): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT exit_deferred_since, exited_unsigned_at FROM nullifiers
+                 WHERE nullifier = ?1 AND status = ?2 AND settled_charge IS NOT NULL",
+                params![nullifier.to_hex(), status_to_str(NullifierStatus::Reserved)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| ServerError::Database(format!("deferral read failed: {e}")))?
+            .ok_or_else(|| ServerError::Internal("request is not settled and unsigned".into()))?;
+        if ended.is_some() {
+            return Ok(SignatureDeferral::ExitedUnsigned);
+        }
+        let since = since.unwrap_or(now as i64) as u64;
+        if now >= since.saturating_add(window) {
+            conn.execute(
+                "UPDATE nullifiers SET exited_unsigned_at = ?1
+                 WHERE nullifier = ?2 AND exited_unsigned_at IS NULL",
+                params![now as i64, nullifier.to_hex()],
+            )
+            .map_err(|e| ServerError::Database(format!("exit marking failed: {e}")))?;
+            return Ok(SignatureDeferral::ExitedUnsigned);
+        }
+        Ok(SignatureDeferral::Deferred { since })
+    }
+
+    /// Settled requests whose successor is neither signed nor terminally
+    /// unsigned, oldest first: the signing sweep's work list.
+    pub fn settled_unsigned_entries(&self) -> Vec<TranscriptRecord> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+        let Ok(mut statement) = conn.prepare(
+            "SELECT * FROM nullifiers WHERE status = ?1 AND settled_charge IS NOT NULL
+               AND exited_unsigned_at IS NULL ORDER BY settled_at ASC",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = statement.query_map(
+            params![status_to_str(NullifierStatus::Reserved)],
+            row_to_record,
+        ) else {
+            return Vec::new();
+        };
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// Record the signed successor of a settled request. The transcript's
+    /// charge must equal the persisted settled charge, and a terminally
+    /// unsigned request can never be finalized.
     pub fn finalize(
         &self,
         nullifier: &Felt252,
@@ -321,7 +594,8 @@ impl NullifierStore {
                     proof_blob = ?15,
                     request_inputs_json = ?16,
                     finalized_at = ?17
-                 WHERE nullifier = ?18 AND status = ?19",
+                 WHERE nullifier = ?18 AND status = ?19 AND settled_charge = ?2
+                   AND exited_unsigned_at IS NULL",
                 params![
                     status_to_str(NullifierStatus::Finalized),
                     transcript.charge_applied.map(|c| c as i64),
@@ -348,7 +622,8 @@ impl NullifierStore {
 
         if rows == 0 {
             return Err(ServerError::Internal(
-                "nullifier not in Reserved state or does not exist".to_string(),
+                "nullifier is not settled at this charge, not reserved, or exited unsigned"
+                    .to_string(),
             ));
         }
 
@@ -996,6 +1271,16 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRecord> 
         api_request_binding,
         created_at: created_at as u64,
         finalized_at: finalized_at.map(|t| t as u64),
+        settled_charge: row
+            .get::<_, Option<i64>>("settled_charge")?
+            .map(|c| c as u128),
+        settled_at: row.get::<_, Option<i64>>("settled_at")?.map(|t| t as u64),
+        exit_deferred_since: row
+            .get::<_, Option<i64>>("exit_deferred_since")?
+            .map(|t| t as u64),
+        exited_unsigned_at: row
+            .get::<_, Option<i64>>("exited_unsigned_at")?
+            .map(|t| t as u64),
     })
 }
 
@@ -1350,14 +1635,135 @@ mod tests {
             api_request_binding: None,
             created_at: 0,
             finalized_at: None,
+            settled_charge: None,
+            settled_at: None,
+            exit_deferred_since: None,
+            exited_unsigned_at: None,
         };
 
+        assert!(
+            store.finalize(&nullifier, &transcript).is_err(),
+            "an unsettled request is never signed"
+        );
+        store
+            .record_settlement(&nullifier, 99, 200, "{\"ok\":true}")
+            .unwrap();
+        assert!(
+            store.finalize(&nullifier, &transcript).is_err(),
+            "the successor is signed only at the settled charge"
+        );
+        store.record_settlement(&nullifier, 100, 200, "{}").unwrap();
+        assert_eq!(
+            store
+                .lookup_by_nullifier(&nullifier)
+                .unwrap()
+                .settled_charge,
+            Some(99),
+            "a settled charge is final"
+        );
+        let transcript = TranscriptRecord {
+            charge_applied: Some(99),
+            ..transcript
+        };
         store.finalize(&nullifier, &transcript).unwrap();
 
         let record = store.lookup_by_nullifier(&nullifier).unwrap();
         assert_eq!(record.status, NullifierStatus::Finalized);
-        assert_eq!(record.charge_applied, Some(100));
+        assert_eq!(record.charge_applied, Some(99));
         assert_eq!(record.response_payload.as_deref(), Some("{\"ok\":true}"));
+    }
+
+    /// Threat: an operator (or bug) rewriting or deleting the proof that
+    /// defeats a stale escape. Evidence is written with the reservation and
+    /// SQLite refuses every UPDATE and DELETE on it.
+    #[test]
+    fn request_evidence_is_written_with_the_reservation_and_is_immutable() {
+        let store = NullifierStore::in_memory().unwrap();
+        let request = lease_request("evidence", 5);
+        let nullifier = request.public_inputs.request_nullifier;
+        assert!(store.request_evidence(&nullifier).is_none());
+        store.reserve_openrouter_lease(&request).unwrap();
+        let evidence = store.request_evidence(&nullifier).unwrap();
+        assert_eq!(evidence.request_inputs, request.public_inputs);
+        assert_eq!(evidence.proof, request.proof);
+        assert_eq!(evidence.client_request_id, "evidence");
+        let conn = store.conn.lock().unwrap();
+        for statement in [
+            "UPDATE request_evidence SET proof = 'forged'",
+            "UPDATE request_evidence SET request_inputs_json = '{}'",
+            "DELETE FROM request_evidence",
+        ] {
+            let error = conn.execute(statement, []).unwrap_err().to_string();
+            assert!(error.contains("append-only"), "{statement}: {error}");
+        }
+        drop(conn);
+        assert_eq!(store.request_evidence(&nullifier).unwrap(), evidence);
+        // A replayed reservation appends nothing and changes nothing.
+        assert!(matches!(
+            store.reserve_openrouter_lease(&request),
+            Err(ServerError::Replay)
+        ));
+        assert_eq!(store.request_evidence(&nullifier).unwrap(), evidence);
+    }
+
+    #[test]
+    fn evidence_insert_failure_rolls_back_the_reservation() {
+        let store = NullifierStore::in_memory().unwrap();
+        let request = lease_request("orphan", 6);
+        let nullifier = request.public_inputs.request_nullifier;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO request_evidence VALUES (?1, 'other', '{}', 'groth16_bn254', 'x', 0)",
+                params![nullifier.to_hex()],
+            )
+            .unwrap();
+        assert!(store.reserve_openrouter_lease(&request).is_err());
+        assert!(
+            store.lookup_by_nullifier(&nullifier).is_none(),
+            "no reservation may exist without its own evidence"
+        );
+    }
+
+    #[test]
+    fn signature_deferral_ends_in_exited_unsigned_after_the_window() {
+        let store = NullifierStore::in_memory().unwrap();
+        let request = lease_request("deferred", 9);
+        let nullifier = request.public_inputs.request_nullifier;
+        store.reserve_openrouter_lease(&request).unwrap();
+        assert!(
+            store.defer_signature(&nullifier, 100, 50).is_err(),
+            "only a settled request defers"
+        );
+        store.record_settlement(&nullifier, 7, 200, "{}").unwrap();
+        assert_eq!(store.settled_unsigned_entries().len(), 1);
+        assert_eq!(
+            store.defer_signature(&nullifier, 100, 50).unwrap(),
+            SignatureDeferral::Deferred { since: 100 }
+        );
+        assert_eq!(
+            store.defer_signature(&nullifier, 149, 50).unwrap(),
+            SignatureDeferral::Deferred { since: 100 }
+        );
+        assert_eq!(
+            store.defer_signature(&nullifier, 150, 50).unwrap(),
+            SignatureDeferral::ExitedUnsigned
+        );
+        assert!(store.settled_unsigned_entries().is_empty());
+        let record = store.lookup_by_nullifier(&nullifier).unwrap();
+        assert_eq!(record.exit_deferred_since, Some(100));
+        assert_eq!(record.exited_unsigned_at, Some(150));
+        let transcript = TranscriptRecord {
+            status: NullifierStatus::Finalized,
+            charge_applied: Some(7),
+            ..record
+        };
+        assert!(
+            store.finalize(&nullifier, &transcript).is_err(),
+            "an exited-unsigned request is never signed"
+        );
     }
 
     #[test]

@@ -48,6 +48,12 @@ impl IndexerService {
         Ok(())
     }
 
+    /// Atomically publish a fully validated backend snapshot.
+    pub fn replace(&self, mirror: TreeMirror) {
+        *self.mirror.write().unwrap() = mirror;
+        self.mark_ready();
+    }
+
     /// GET /v1/tree/root
     pub fn get_root(&self) -> Felt252 {
         self.mirror.read().unwrap().root()

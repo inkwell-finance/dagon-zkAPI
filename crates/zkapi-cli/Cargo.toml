@@ -1,13 +1,18 @@
 [package]
 name = "zkapi-cli"
-description = "Command-line interface for the zkAPI app-layer workspace"
+description = "Dagon zkAPI Solana operator CLI with explicit EVM compatibility"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "zkapi"
+name = "dagon-zkapi"
 path = "src/main.rs"
+
+[features]
+# Drill builds only: exposes `serverd --adversary`. Release builds never enable
+# it, and the server refuses every mode without debug assertions.
+adversary = ["zkapi-serverd/adversary"]
 
 [dependencies]
 zkapi-serverd = { path = "../zkapi-serverd" }

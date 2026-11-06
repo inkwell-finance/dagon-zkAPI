@@ -31,7 +31,7 @@ pub struct IssuedOpenRouterLease {
     pub key_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verification: Option<OaKeyVerificationEvidence>,
-    pub billing_quote: crate::native_billing::NativeBillingQuote,
+    pub billing_quote: crate::native_billing::billing::BillingQuote,
 }
 
 #[derive(Debug, Clone)]

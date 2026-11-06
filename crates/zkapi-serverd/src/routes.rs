@@ -6,6 +6,7 @@
 //! - POST /v2/openrouter/leases     -- open a prompt-private runtime-key lease
 //! - POST /v2/openrouter/leases/:id -- retire a rejected runtime-key lease
 //! - POST /v2/withdraw/clearance    -- request mutual-close clearance
+//! - POST /v2/ledger/*/prepare      -- prepare pinned Solana wallet operations
 //! - GET  /v2/requests/:id          -- recover by client_request_id
 //! - GET  /v2/nullifiers/:nullifier -- recover by nullifier
 
@@ -21,15 +22,19 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use dagon_zkapi_ledger::{
+    DepositRequest, FinalizeEscapeRequest, LedgerAccount, LedgerCommitment,
+    PreparedLedgerOperation, WithdrawalRequest,
+};
 use futures_util::stream::Stream;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
 
 use zkapi_types::wire::{
     ApiRequestV2, ClearanceRequest, ClearanceResponseV2, CurvePointWire, ErrorResponse,
-    OpenRouterLeaseStatusResponse, RecoveryResponseV2,
+    Groth16ProofWire, OpenRouterLeaseStatusResponse, RecoveryResponseV2,
 };
-use zkapi_types::Felt252;
+use zkapi_types::{Felt252, WithdrawalPublicInputsV2, MERKLE_DEPTH};
 
 use crate::dashboard::{DashboardEvent, DashboardHub, DashboardTotals};
 use crate::error::ServerError;
@@ -60,14 +65,20 @@ pub async fn run_server(mut config: crate::config::ServerConfig) -> anyhow::Resu
         config.testnet_password = Some(password);
     }
     config.validate_native_mode()?;
-    let store = Arc::new(crate::nullifier_store::NullifierStore::new(
-        &config.db_path,
-    )?);
     let signer = Arc::new(crate::signer::ServerSigner::new(
         &config.state_seed,
         &config.clear_seed,
     ));
-    let initial_root = if let Some(indexer_url) = config.indexer_url.as_deref() {
+    // No durable state, worker, or HTTP listener exists during preflight.
+    let solana = if config.backend == crate::config::LedgerBackend::Solana {
+        Some(prepare_solana_backends(&config, &signer).await?)
+    } else {
+        prepare_evm_backend(&config).await?;
+        None
+    };
+    let initial_root = if let Some(backends) = &solana {
+        backends.initial_root
+    } else if let Some(indexer_url) = config.indexer_url.as_deref() {
         match fetch_indexer_root(indexer_url).await {
             Ok(root) => root,
             Err(err) => {
@@ -78,15 +89,38 @@ pub async fn run_server(mut config: crate::config::ServerConfig) -> anyhow::Resu
     } else {
         config.initial_root
     };
+    let store = Arc::new(crate::nullifier_store::NullifierStore::new(
+        &config.db_path,
+    )?);
     let dashboard = Arc::new(DashboardHub::new(500));
-    let processor = Arc::new(
-        RequestProcessor::try_new(config.clone(), store, signer, initial_root)?
-            .with_dashboard(dashboard),
-    );
-    if let Some(indexer_url) = config.indexer_url.clone() {
+    let processor = match solana {
+        Some(backends) => RequestProcessor::try_new_with_backends(
+            config.clone(),
+            store,
+            signer,
+            initial_root,
+            backends.ledger,
+            backends.billing,
+        )?,
+        None => RequestProcessor::try_new(config.clone(), store, signer, initial_root)?,
+    };
+    let processor = Arc::new(processor.with_dashboard(dashboard));
+    if config.indexer_url.is_some() || config.backend == crate::config::LedgerBackend::Solana {
+        if let Err(err) = processor
+            .refresh_ledger_state(if config.backend == crate::config::LedgerBackend::Solana {
+                LedgerCommitment::Finalized
+            } else {
+                LedgerCommitment::Tip
+            })
+            .await
+        {
+            tracing::warn!(
+                "failed to confirm initial root through credit ledger: {}",
+                err
+            );
+        }
         spawn_root_poller(
             processor.clone(),
-            indexer_url,
             Duration::from_millis(config.root_poll_interval_ms),
         );
     }
@@ -101,6 +135,98 @@ pub async fn run_server(mut config: crate::config::ServerConfig) -> anyhow::Resu
     tracing::info!("Server listening on {}", config.listen_addr);
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+/// Fail-closed EVM startup read: the configured challenge period must be the
+/// vault's immutable `challengePeriod()`.
+pub async fn prepare_evm_backend(config: &crate::config::ServerConfig) -> anyhow::Result<()> {
+    config.validate_native_mode()?;
+    anyhow::ensure!(
+        config.backend == crate::config::LedgerBackend::Evm,
+        "expected EVM mode"
+    );
+    let vault_period = crate::native_billing::NativeBillingOracle::for_server(config)?
+        .vault_challenge_period()
+        .await
+        .map_err(|error| anyhow::anyhow!("vault challenge period read failed: {error}"))?;
+    crate::config::check_vault_challenge_period(config.challenge_period_seconds, vault_period)
+}
+
+pub struct ValidatedSolanaBackends {
+    pub ledger: Arc<dyn dagon_zkapi_ledger::CreditLedger>,
+    pub billing: Arc<dyn crate::native_billing::billing::BillingPriceSource>,
+    pub initial_root: Felt252,
+}
+
+/// Fail-closed authoritative startup reads; deliberately independent of SQLite.
+pub async fn prepare_solana_backends(
+    config: &crate::config::ServerConfig,
+    signer: &crate::signer::ServerSigner,
+) -> anyhow::Result<ValidatedSolanaBackends> {
+    use crate::native_billing::billing::{BillingPriceSource, SolanaBillingPins};
+    use dagon_zkapi_ledger::CreditLedger;
+    config.validate_native_mode()?;
+    anyhow::ensure!(
+        config.backend == crate::config::LedgerBackend::Solana,
+        "expected Solana mode"
+    );
+    let solana = config.solana.as_ref().expect("validated Solana config");
+    let ledger = Arc::new(dagon_zkapi_solana_ledger::SolanaCreditLedger::new(
+        solana.ledger.clone(),
+    )?);
+    ledger.assert_immutable_program().await?;
+    let view = ledger.finalized_vault().await?;
+    anyhow::ensure!(!view.paused, "Solana vault is paused");
+    anyhow::ensure!(
+        u128::from(view.request_charge_cap) == config.request_charge_cap,
+        "Solana vault request charge cap mismatch"
+    );
+    crate::config::check_vault_challenge_period(
+        config.challenge_period_seconds,
+        view.challenge_period,
+    )?;
+    let state_key = signer.state_public_key();
+    let clearance_key = signer.clearance_public_key();
+    anyhow::ensure!(
+        view.state_signing_key_x == state_key.x && view.state_signing_key_y == state_key.y,
+        "Solana vault state signing key mismatch"
+    );
+    anyhow::ensure!(
+        view.clearance_signing_key_x == clearance_key.x
+            && view.clearance_signing_key_y == clearance_key.y,
+        "Solana vault clearance signing key mismatch"
+    );
+    let deployment = ledger.deployment();
+    let pins = SolanaBillingPins {
+        chain_id: deployment.chain_id,
+        deployment_binding: deployment.protocol_binding,
+        backend: deployment.backend.clone(),
+        network: deployment.network.clone(),
+        vault: bs58::encode(solana.ledger.vault_state).into_string(),
+        feed_account: solana.billing.price_account.clone(),
+        receiver_program: solana.billing.receiver_program.clone(),
+        max_age_seconds: solana.billing.max_age_seconds,
+        max_confidence_bps: solana.billing.max_confidence_bps,
+    };
+    let billing = Arc::new(crate::sol_billing::PythBillingOracle::new(
+        solana.ledger.rpc_url.clone(),
+        solana.ledger.genesis_hash,
+        solana.billing.clone(),
+        pins,
+    )?);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let quote = billing.quote(now).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    billing.assert_fresh(&quote, now)?;
+    Ok(ValidatedSolanaBackends {
+        ledger,
+        billing,
+        initial_root: view.state.root,
+    })
 }
 
 /// Create the Axum router with all zkAPI server routes.
@@ -135,6 +261,22 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
             post(handle_native_lease_expiry),
         )
         .route("/v2/withdraw/clearance", post(handle_clearance))
+        .route(
+            "/v2/ledger/deposits/prepare",
+            post(handle_prepare_ledger_deposit),
+        )
+        .route(
+            "/v2/ledger/withdrawals/prepare",
+            post(handle_prepare_ledger_close),
+        )
+        .route(
+            "/v2/ledger/escapes/prepare",
+            post(handle_prepare_ledger_escape),
+        )
+        .route(
+            "/v2/ledger/escapes/finalize/prepare",
+            post(handle_prepare_ledger_finalize_escape),
+        )
         .route(
             "/v2/requests/{client_request_id}",
             get(handle_recovery_by_id),
@@ -278,6 +420,7 @@ async fn handle_recovery_by_id(
 ) -> Result<Json<RecoveryResponseV2>, ErrorHttpResponse> {
     processor
         .recover_by_client_id(&client_request_id)
+        .await
         .map(Json)
         .map_err(|e| error_to_response(&e, &client_request_id, &processor))
 }
@@ -294,6 +437,7 @@ async fn handle_recovery_by_nullifier(
 
     processor
         .recover_by_nullifier(&nullifier)
+        .await
         .map(Json)
         .map_err(|e| error_to_response(&e, &nullifier_hex, &processor))
 }
@@ -317,7 +461,13 @@ async fn handle_native_lease_expiry(
 
 async fn handle_native_billing_quote(
     State(processor): State<AppState>,
-) -> Result<(HeaderMap, Json<crate::native_billing::NativeBillingQuote>), ErrorHttpResponse> {
+) -> Result<
+    (
+        HeaderMap,
+        Json<crate::native_billing::billing::BillingQuote>,
+    ),
+    ErrorHttpResponse,
+> {
     let quote = processor
         .native_billing_quote()
         .await
@@ -328,6 +478,154 @@ async fn handle_native_billing_quote(
         HeaderValue::from_static("no-store"),
     );
     Ok((headers, Json(quote)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareDepositBody {
+    payer: String,
+    expected_note_id: u32,
+    commitment: Felt252,
+    amount: u128,
+    zero_path: Vec<Felt252>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareWithdrawalBody {
+    payer: String,
+    destination: String,
+    public_inputs: WithdrawalPublicInputsV2,
+    proof: Groth16ProofWire,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareFinalizeEscapeBody {
+    payer: String,
+    note_id: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct PreparedLedgerOperationResponse {
+    backend: String,
+    network: String,
+    /// Decimal string keeps the complete Solana-derived u64 identity in JS.
+    chain_id: String,
+    protocol_binding: Felt252,
+    vault: String,
+    operation: PreparedLedgerOperation,
+}
+
+fn ledger_account(value: &str, label: &str) -> Result<LedgerAccount, ServerError> {
+    let decoded = bs58::decode(value)
+        .into_vec()
+        .map_err(|_| ServerError::InvalidRequest(format!("{label} is not base58")))?;
+    let bytes: [u8; 32] = decoded.try_into().map_err(|_| {
+        ServerError::InvalidRequest(format!("{label} must decode to exactly 32 bytes"))
+    })?;
+    if bytes == [0; 32] {
+        return Err(ServerError::InvalidRequest(format!(
+            "{label} cannot be the zero account"
+        )));
+    }
+    Ok(LedgerAccount::new(bytes))
+}
+
+fn merkle_path(values: Vec<Felt252>, label: &str) -> Result<[Felt252; MERKLE_DEPTH], ServerError> {
+    values.try_into().map_err(|values: Vec<Felt252>| {
+        ServerError::InvalidRequest(format!(
+            "{label} must contain {MERKLE_DEPTH} field elements, got {}",
+            values.len()
+        ))
+    })
+}
+
+fn prepared_response(
+    processor: &RequestProcessor,
+    operation: PreparedLedgerOperation,
+) -> PreparedLedgerOperationResponse {
+    let deployment = processor.ledger_deployment();
+    PreparedLedgerOperationResponse {
+        backend: deployment.backend,
+        network: deployment.network,
+        chain_id: deployment.chain_id.to_string(),
+        protocol_binding: deployment.protocol_binding,
+        vault: bs58::encode(deployment.vault.0).into_string(),
+        operation,
+    }
+}
+
+async fn handle_prepare_ledger_deposit(
+    State(processor): State<AppState>,
+    Json(body): Json<PrepareDepositBody>,
+) -> Result<Json<PreparedLedgerOperationResponse>, ErrorHttpResponse> {
+    let request = (|| {
+        Ok(DepositRequest {
+            payer: ledger_account(&body.payer, "payer")?,
+            expected_note_id: body.expected_note_id,
+            commitment: body.commitment,
+            amount: body.amount,
+            zero_path: merkle_path(body.zero_path, "zero_path")?,
+        })
+    })()
+    .map_err(|error| error_to_response(&error, "ledger-prepare", &processor))?;
+    let operation = processor
+        .prepare_ledger_deposit(request)
+        .await
+        .map_err(|error| error_to_response(&error, "ledger-prepare", &processor))?;
+    Ok(Json(prepared_response(&processor, operation)))
+}
+
+fn withdrawal_request(body: PrepareWithdrawalBody) -> Result<WithdrawalRequest, ServerError> {
+    Ok(WithdrawalRequest {
+        payer: ledger_account(&body.payer, "payer")?,
+        destination: ledger_account(&body.destination, "destination")?,
+        public_inputs: body.public_inputs,
+        proof: body.proof,
+    })
+}
+
+async fn handle_prepare_ledger_close(
+    State(processor): State<AppState>,
+    Json(body): Json<PrepareWithdrawalBody>,
+) -> Result<Json<PreparedLedgerOperationResponse>, ErrorHttpResponse> {
+    let request = withdrawal_request(body)
+        .map_err(|error| error_to_response(&error, "ledger-prepare", &processor))?;
+    let operation = processor
+        .prepare_ledger_close(request)
+        .await
+        .map_err(|error| error_to_response(&error, "ledger-prepare", &processor))?;
+    Ok(Json(prepared_response(&processor, operation)))
+}
+
+async fn handle_prepare_ledger_escape(
+    State(processor): State<AppState>,
+    Json(body): Json<PrepareWithdrawalBody>,
+) -> Result<Json<PreparedLedgerOperationResponse>, ErrorHttpResponse> {
+    let request = withdrawal_request(body)
+        .map_err(|error| error_to_response(&error, "ledger-prepare", &processor))?;
+    let operation = processor
+        .prepare_ledger_escape(request)
+        .await
+        .map_err(|error| error_to_response(&error, "ledger-prepare", &processor))?;
+    Ok(Json(prepared_response(&processor, operation)))
+}
+
+async fn handle_prepare_ledger_finalize_escape(
+    State(processor): State<AppState>,
+    Json(body): Json<PrepareFinalizeEscapeBody>,
+) -> Result<Json<PreparedLedgerOperationResponse>, ErrorHttpResponse> {
+    let request = FinalizeEscapeRequest {
+        payer: ledger_account(&body.payer, "payer")
+            .map_err(|error| error_to_response(&error, "ledger-prepare", &processor))?,
+        note_id: body.note_id,
+    };
+    let operation = processor
+        .prepare_ledger_finalize_escape(request)
+        .await
+        .map_err(|error| error_to_response(&error, "ledger-prepare", &processor))?;
+    Ok(Json(prepared_response(&processor, operation)))
 }
 
 /// Server identity + signing capacity for the dashboard header panel.
@@ -523,16 +821,24 @@ fn spawn_openrouter_lease_settler(processor: Arc<RequestProcessor>, interval: Du
     });
 }
 
-fn spawn_root_poller(processor: Arc<RequestProcessor>, indexer_url: String, interval: Duration) {
+fn spawn_root_poller(processor: Arc<RequestProcessor>, interval: Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             ticker.tick().await;
-            match fetch_indexer_root(&indexer_url).await {
-                Ok(root) => processor.update_root(root),
-                Err(err) => tracing::warn!("failed to refresh root from indexer: {}", err),
+            if let Err(err) = processor
+                .refresh_ledger_state(
+                    if processor.config().backend == crate::config::LedgerBackend::Solana {
+                        LedgerCommitment::Finalized
+                    } else {
+                        LedgerCommitment::Tip
+                    },
+                )
+                .await
+            {
+                tracing::warn!("failed to refresh root through credit ledger: {}", err);
             }
         }
     });
@@ -566,7 +872,7 @@ mod rate_limit_tests {
         let error = run_server(config).await.unwrap_err();
         assert!(error
             .to_string()
-            .contains("native ETH billing configuration is required"));
+            .contains("Solana ledger and Pyth configuration is required"));
         assert!(!db_path.exists());
     }
 

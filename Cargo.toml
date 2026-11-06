@@ -1,12 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/dagon-zkapi-ledger",
+    "crates/dagon-zkapi-solana",
+    "crates/dagon-zkapi-solana-ledger",
     "crates/zkapi-cli",
     "crates/zkapi-serverd",
     "crates/zkapi-indexerd",
 ]
 default-members = ["crates/zkapi-cli"]
-exclude = ["protocol", "protocol/rust", "sdk"]
+exclude = ["protocol", "protocol/rust", "sdk", "solana"]
 
 [workspace.package]
 edition = "2021"

@@ -51,6 +51,7 @@ async fn sequential_signed_state_cannot_branch_across_equal_or_unequal_notes() {
         let root = core::merkle_root(0, &a_leaf, &a_path);
         assert_eq!(root, core::merkle_root(1, &b_leaf, &b_path));
         let config = ServerConfig {
+            backend: crate::config::LedgerBackend::Evm,
             request_charge_cap: 1,
             native_billing: Some(crate::test_support::native_config()),
             openrouter_leases: Some(crate::test_support::lease_config()),
@@ -76,7 +77,8 @@ async fn sequential_signed_state_cannot_branch_across_equal_or_unequal_notes() {
                 &witness.rerandomization,
             )
             .unwrap();
-            let nullifier = core::nullifier(&witness.secret, &witness.current_anchor);
+            let nullifier =
+                core::nullifier(&witness.secret, witness.note_id, &witness.current_anchor);
             (
                 RequestPublicInputsV2 {
                     protocol_version: config.protocol_version,
@@ -107,8 +109,8 @@ async fn sequential_signed_state_cannot_branch_across_equal_or_unequal_notes() {
             current_balance: 100,
             current_blinding: Felt252::from_u64(17),
             rerandomization: Felt252::from_u64(19),
-            current_anchor: Felt252::ONE,
-            is_genesis: true,
+            current_anchor: core::GENESIS_ANCHOR,
+            prev_anchor: Felt252::ZERO,
             state_signature: None,
         };
         let mut last_response = None;
@@ -125,14 +127,19 @@ async fn sequential_signed_state_cannot_branch_across_equal_or_unequal_notes() {
                 proof,
             };
             let response = processor.finalize_test_lease(&request, 1).unwrap();
+            assert_eq!(
+                response.next_anchor,
+                core::next_anchor(&request.public_inputs.request_nullifier),
+                "the successor is signed at the derived anchor"
+            );
             a.current_balance -= response.charge_applied;
             a.current_blinding = add_blindings(
                 &add_blindings(&a.current_blinding, &a.rerandomization),
                 &response.blind_delta_srv,
             );
+            a.prev_anchor = a.current_anchor;
             a.current_anchor = response.next_anchor;
             a.state_signature = Some(response.next_state_signature);
-            a.is_genesis = false;
             assert_eq!(a.current_balance, 99 - step);
             if step == 0 {
                 last_response = Some(a.clone());
@@ -146,45 +153,44 @@ async fn sequential_signed_state_cannot_branch_across_equal_or_unequal_notes() {
         b.merkle_siblings = b_path;
         let (public, context, _, _) = prepare("B-transplant", &b);
         b.request_context = context;
-        assert!(prover
-            .prove(&public, b.clone())
-            .unwrap_err()
-            .to_string()
-            .contains("note-bound circuit"));
-        // Both honest escape and mutual withdrawals remain provable after two requests.
+        assert!(
+            prover.prove(&public, b.clone()).is_err(),
+            "A's signed state cannot authorize note B"
+        );
+        // Both honest escape and mutual withdrawals remain provable after two
+        // requests; the escape names the derived successor nullifier.
         for has_clearance in [false, true] {
-            let nullifier = core::nullifier(&a.secret, &a.current_anchor);
-            let destination = [0x11; 20];
-            let mut public = WithdrawalPublicInputsV2 {
+            let nullifier = core::nullifier(&a.secret, 0, &a.current_anchor);
+            let public = WithdrawalPublicInputsV2 {
                 protocol_version: config.protocol_version,
                 chain_id: config.chain_id,
                 contract_address: config.contract_address,
-                active_root: root,
+                registration: core::registration_commitment(&a.secret),
                 state_signing_key_x: key.x,
                 state_signing_key_y: key.y,
                 clearance_signing_key_x: clear_key.x,
                 clearance_signing_key_y: clear_key.y,
                 note_id: 0,
+                deposit_amount: 100,
+                expiry_ts: expiry,
                 final_balance: a.current_balance,
-                destination,
+                destination: [0x11; 20],
                 withdrawal_nullifier: nullifier,
                 has_clearance,
-                withdrawal_tag: Felt252::ZERO,
+                next_nullifier: if has_clearance {
+                    Felt252::ZERO
+                } else {
+                    core::successor_nullifier(&a.secret, 0, &nullifier)
+                },
+                conceded: 0,
+                valid_until: now + 600,
             };
-            public.withdrawal_tag = core::withdrawal_tag(
-                &nullifier,
-                &public.destination_field(),
-                a.current_balance,
-                has_clearance,
-            );
             let witness = WithdrawalWitnessData {
                 secret: a.secret,
-                deposit_amount: 100,
-                expiry,
-                merkle_siblings: a_path,
+                current_balance: a.current_balance,
                 final_blinding: a.current_blinding,
                 current_anchor: a.current_anchor,
-                is_genesis: false,
+                prev_anchor: a.prev_anchor,
                 state_signature: a.state_signature,
                 clearance_signature: has_clearance.then(|| {
                     signer.sign_clearance(&core::clearance_message(

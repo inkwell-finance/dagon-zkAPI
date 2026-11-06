@@ -1,7 +1,15 @@
 //! Native ETH uses integer gwei in the existing proof ledger. The oracle quote
 //! is part of the proof-bound lease payload and is never refreshed at settlement.
+
+pub mod billing;
+
+use billing::{BillingFuture, BillingPriceSource, BillingQuote};
 use std::time::Duration;
 
+use dagon_zkapi_ledger::{
+    CreditLedger, LedgerAccount, LedgerAsset, LedgerCommitment, LedgerDeployment, LedgerError,
+    LedgerFuture, LedgerNullifierStatus, LedgerPath, LedgerSnapshot, LedgerState,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
@@ -139,6 +147,8 @@ pub struct NativeBillingOracle {
     chain_id: u64,
     contract_address: String,
     http: reqwest::Client,
+    indexer_url: Option<String>,
+    deployment: LedgerDeployment,
 }
 
 impl NativeBillingOracle {
@@ -166,6 +176,10 @@ impl NativeBillingOracle {
             config.decimals <= 18 && config.max_age_seconds > 0 && config.max_age_seconds <= 86_400,
             "invalid native oracle decimals or freshness limit"
         );
+        let address_bytes = hex::decode(contract_address.trim_start_matches("0x"))?;
+        let address_bytes: [u8; 20] = address_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("native vault address must contain 20 bytes"))?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())
@@ -173,9 +187,46 @@ impl NativeBillingOracle {
         Ok(Self {
             config,
             chain_id,
-            contract_address,
+            contract_address: contract_address.to_lowercase(),
             http,
+            indexer_url: None,
+            deployment: LedgerDeployment {
+                backend: "compatibility.evm.groth16.v1".to_string(),
+                network: format!("eip155:{chain_id}"),
+                chain_id,
+                protocol_binding: Felt252::try_from_bytes_be({
+                    let mut bytes = [0; 32];
+                    bytes[12..].copy_from_slice(&address_bytes);
+                    bytes
+                })
+                .expect("a 20-byte address is always a BN254 field element"),
+                vault: LedgerAccount::from_evm_address(address_bytes),
+                asset: LedgerAsset {
+                    symbol: "ETH".to_string(),
+                    decimals: 9,
+                    mint: None,
+                },
+            },
         })
+    }
+
+    /// The EVM ledger and price oracle of a server configuration.
+    pub fn for_server(config: &crate::config::ServerConfig) -> anyhow::Result<Self> {
+        let native = config
+            .native_billing
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("native ETH billing configuration is required"))?;
+        let address = config.contract_address.to_hex();
+        let body = address.strip_prefix("0x").unwrap_or(&address);
+        Ok(
+            Self::new(native, config.chain_id, format!("0x{body:0>40}"))?
+                .with_indexer_url(config.indexer_url.clone()),
+        )
+    }
+
+    pub fn with_indexer_url(mut self, indexer_url: Option<String>) -> Self {
+        self.indexer_url = indexer_url;
+        self
     }
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, ServerError> {
@@ -274,6 +325,20 @@ impl NativeBillingOracle {
             ServerError::NullifierUsed => error,
             _ => ServerError::Internal(format!("vault authorization check failed: {error}")),
         })
+    }
+
+    /// The vault's immutable `challengePeriod()`, for the startup check that
+    /// `--challenge-period-seconds` is the vault's own.
+    pub async fn vault_challenge_period(&self) -> Result<u64, ServerError> {
+        self.assert_chain().await?;
+        let raw = self
+            .call(&self.contract_address, &evm_selector("challengePeriod()"))
+            .await?;
+        if raw.len() != 66 {
+            return Err(invalid("invalid vault challenge period response length"));
+        }
+        u64::try_from(decode_word(&raw, 0)?)
+            .map_err(|_| invalid("vault challenge period exceeds uint64"))
     }
 
     async fn assert_deployment(&self) -> Result<(), ServerError> {
@@ -382,6 +447,259 @@ impl NativeBillingOracle {
     }
 }
 
+/// Explicit ETH compatibility price source. Keeping this implementation
+/// separate from CreditLedger prevents Solana accounting from selecting an ETH
+/// price oracle merely because both need an RPC transport.
+impl BillingPriceSource for NativeBillingOracle {
+    fn quote(&self, now: u64) -> BillingFuture<'_, BillingQuote> {
+        Box::pin(async move { NativeBillingOracle::quote(self, now).await.map(Into::into) })
+    }
+
+    fn validate<'a>(&'a self, quote: &'a BillingQuote, now: u64) -> BillingFuture<'a, ()> {
+        Box::pin(async move {
+            match quote {
+                BillingQuote::NativeEth(quote) => {
+                    NativeBillingOracle::validate(self, quote, now).await
+                }
+                BillingQuote::NativeSol(_) => {
+                    Err(invalid("SOL quote cannot use the ETH compatibility oracle"))
+                }
+            }
+        })
+    }
+
+    fn validate_identity(&self, quote: &BillingQuote) -> Result<(), ServerError> {
+        match quote {
+            BillingQuote::NativeEth(quote) => quote.validate_identity(&self.config, self.chain_id),
+            BillingQuote::NativeSol(_) => {
+                Err(invalid("SOL quote cannot use the ETH compatibility oracle"))
+            }
+        }
+    }
+}
+
+impl CreditLedger for NativeBillingOracle {
+    fn deployment(&self) -> &LedgerDeployment {
+        &self.deployment
+    }
+
+    fn state(&self, commitment: LedgerCommitment) -> LedgerFuture<'_, LedgerState> {
+        Box::pin(async move {
+            self.assert_chain()
+                .await
+                .map_err(|error| LedgerError::Unavailable(error.to_string()))?;
+            let block = evm_block_tag(commitment);
+            let root_raw = self
+                .call_at(
+                    &self.contract_address,
+                    &evm_selector("currentRoot()"),
+                    block,
+                )
+                .await
+                .map_err(|error| LedgerError::Unavailable(error.to_string()))?;
+            let next_raw = self
+                .call_at(&self.contract_address, &evm_selector("nextNoteId()"), block)
+                .await
+                .map_err(|error| LedgerError::Unavailable(error.to_string()))?;
+            let next_note_id = u32::try_from(evm_u128(&next_raw)?)
+                .map_err(|_| LedgerError::InvalidData("next note ID exceeds uint32".into()))?;
+            Ok(LedgerState {
+                root: evm_felt(&root_raw)?,
+                next_note_id,
+                observed_height: None,
+                commitment,
+            })
+        })
+    }
+
+    fn snapshot(&self, commitment: LedgerCommitment) -> LedgerFuture<'_, LedgerSnapshot> {
+        Box::pin(async move {
+            if commitment != LedgerCommitment::Tip {
+                return Err(LedgerError::Unsupported {
+                    operation: "historical_indexer_snapshot",
+                });
+            }
+            let indexer = self
+                .indexer_url
+                .as_deref()
+                .ok_or(LedgerError::Unsupported {
+                    operation: "tree_snapshot_without_indexer",
+                })?;
+            #[derive(Deserialize)]
+            struct Response {
+                root: Felt252,
+                next_note_id: u32,
+                leaves: Vec<Felt252>,
+            }
+            let response = self
+                .http
+                .get(format!(
+                    "{}/v1/tree/snapshot",
+                    indexer.trim_end_matches('/')
+                ))
+                .send()
+                .await
+                .map_err(|error| LedgerError::Unavailable(error.to_string()))?
+                .error_for_status()
+                .map_err(|error| LedgerError::Unavailable(error.to_string()))?
+                .json::<Response>()
+                .await
+                .map_err(|error| LedgerError::InvalidData(error.to_string()))?;
+            let state = self.state(commitment).await?;
+            if response.root != state.root || response.next_note_id != state.next_note_id {
+                return Err(LedgerError::InvalidData(
+                    "indexer snapshot is behind the vault state".into(),
+                ));
+            }
+            if response.leaves.len() != response.next_note_id as usize {
+                return Err(LedgerError::InvalidData(
+                    "indexer snapshot leaf count does not match next note ID".into(),
+                ));
+            }
+            Ok(LedgerSnapshot {
+                state,
+                leaves: response.leaves,
+            })
+        })
+    }
+
+    fn path(
+        &self,
+        note_id: u32,
+        zero_leaf: bool,
+        commitment: LedgerCommitment,
+    ) -> LedgerFuture<'_, LedgerPath> {
+        Box::pin(async move {
+            if commitment != LedgerCommitment::Tip {
+                return Err(LedgerError::Unsupported {
+                    operation: "historical_indexer_path",
+                });
+            }
+            let indexer = self
+                .indexer_url
+                .as_deref()
+                .ok_or(LedgerError::Unsupported {
+                    operation: "tree_path_without_indexer",
+                })?;
+            #[derive(Deserialize)]
+            struct Response {
+                note_id: u32,
+                leaf: Felt252,
+                siblings: Vec<Felt252>,
+            }
+            let suffix = if zero_leaf { "zero-path" } else { "path" };
+            let response = self
+                .http
+                .get(format!(
+                    "{}/v1/tree/notes/{note_id}/{suffix}",
+                    indexer.trim_end_matches('/')
+                ))
+                .send()
+                .await
+                .map_err(|error| LedgerError::Unavailable(error.to_string()))?
+                .error_for_status()
+                .map_err(|error| LedgerError::Unavailable(error.to_string()))?
+                .json::<Response>()
+                .await
+                .map_err(|error| LedgerError::InvalidData(error.to_string()))?;
+            if response.note_id != note_id || (zero_leaf && response.leaf != Felt252::ZERO) {
+                return Err(LedgerError::InvalidData(
+                    "indexer returned a path for the wrong note".into(),
+                ));
+            }
+            let siblings = response.siblings.try_into().map_err(|_| {
+                LedgerError::InvalidData("Merkle path must have 32 siblings".into())
+            })?;
+            let state = self.state(commitment).await?;
+            if zkapi_core::v2::merkle_root(note_id, &response.leaf, &siblings) != state.root {
+                return Err(LedgerError::InvalidData(
+                    "indexer path does not reconstruct the vault root".into(),
+                ));
+            }
+            Ok(LedgerPath {
+                state,
+                note_id,
+                leaf: response.leaf,
+                siblings,
+            })
+        })
+    }
+
+    fn nullifier_status(
+        &self,
+        nullifier: Felt252,
+        commitment: LedgerCommitment,
+    ) -> LedgerFuture<'_, LedgerNullifierStatus> {
+        Box::pin(async move {
+            self.assert_chain()
+                .await
+                .map_err(|error| LedgerError::Unavailable(error.to_string()))?;
+            let mut data = Keccak256::digest(b"usedNullifiers(uint256)")[..4].to_vec();
+            data.extend_from_slice(nullifier.as_bytes());
+            let raw = self
+                .call_at(
+                    &self.contract_address,
+                    &format!("0x{}", hex::encode(data)),
+                    evm_block_tag(commitment),
+                )
+                .await
+                .map_err(|error| LedgerError::Unavailable(error.to_string()))?;
+            match evm_u128(&raw)? {
+                0 => Ok(LedgerNullifierStatus::Unused),
+                1 => Ok(LedgerNullifierStatus::Used),
+                _ => Err(LedgerError::InvalidData(
+                    "vault nullifier response is not a boolean".into(),
+                )),
+            }
+        })
+    }
+}
+
+fn evm_block_tag(commitment: LedgerCommitment) -> &'static str {
+    match commitment {
+        LedgerCommitment::Tip => "latest",
+        LedgerCommitment::Confirmed => "safe",
+        LedgerCommitment::Finalized => "finalized",
+    }
+}
+
+fn evm_selector(signature: &str) -> String {
+    format!(
+        "0x{}",
+        hex::encode(&Keccak256::digest(signature.as_bytes())[..4])
+    )
+}
+
+fn evm_word(raw: &str) -> Result<[u8; 32], LedgerError> {
+    let body = raw
+        .strip_prefix("0x")
+        .ok_or_else(|| LedgerError::InvalidData("EVM word lacks 0x prefix".into()))?;
+    if body.len() != 64 {
+        return Err(LedgerError::InvalidData(
+            "EVM response is not one word".into(),
+        ));
+    }
+    hex::decode(body)
+        .map_err(|error| LedgerError::InvalidData(error.to_string()))?
+        .try_into()
+        .map_err(|_| LedgerError::InvalidData("EVM response is not one word".into()))
+}
+
+fn evm_felt(raw: &str) -> Result<Felt252, LedgerError> {
+    Felt252::try_from_bytes_be(evm_word(raw)?)
+        .map_err(|error| LedgerError::InvalidData(error.to_string()))
+}
+
+fn evm_u128(raw: &str) -> Result<u128, LedgerError> {
+    let word = evm_word(raw)?;
+    if word[..16].iter().any(|byte| *byte != 0) {
+        return Err(LedgerError::InvalidData(
+            "EVM integer exceeds uint128".into(),
+        ));
+    }
+    Ok(u128::from_be_bytes(word[16..].try_into().unwrap()))
+}
+
 fn valid_address(value: &str) -> bool {
     value.len() == 42
         && value.starts_with("0x")
@@ -447,6 +765,79 @@ mod tests {
         assert!(q.validate_identity(&c, 11155111).is_ok());
         q.expires_at += 1;
         assert!(q.validate_identity(&c, 11155111).is_err());
+    }
+
+    /// Regression: EVM startup reads the vault's immutable `challengePeriod()`
+    /// and refuses a `--challenge-period-seconds` that differs, so the timing
+    /// gate and the O7 deferral window are measured against the real period.
+    #[tokio::test]
+    async fn evm_startup_refuses_a_challenge_period_other_than_the_vaults() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        let period = Arc::new(Mutex::new(3_600u64));
+        let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let app = Router::new().route("/", post({
+            let period = period.clone();
+            let calls = calls.clone();
+            move |Json(request): Json<Value>| {
+                let period = period.clone();
+                let calls = calls.clone();
+                async move {
+                    calls.lock().unwrap().push(request.clone());
+                    let result = if request["method"] == "eth_chainId" {
+                        json!("0xaa36a7")
+                    } else {
+                        json!(format!("0x{:064x}", *period.lock().unwrap()))
+                    };
+                    Json(json!({"jsonrpc":"2.0", "id":1, "result":result}))
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = crate::config::ServerConfig {
+            backend: crate::config::LedgerBackend::Evm,
+            chain_id: 11155111,
+            contract_address: Felt252::from_u64(1),
+            native_billing: Some(NativeBillingConfig {
+                rpc_url,
+                feed_address: quote().feed_address,
+                decimals: 8,
+                max_age_seconds: 3600,
+            }),
+            openrouter_leases: Some(crate::config::OpenRouterLeaseConfig {
+                source: crate::config::OpenRouterLeaseSourceConfig::OpenRouter {
+                    management_key: "test-only".into(),
+                    api_base: "http://127.0.0.1:9".into(),
+                },
+                ttl_seconds: 300,
+                settlement_grace_seconds: 5,
+                settlement_poll_seconds: 2,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(config.challenge_period_seconds, 86_400);
+        let error = crate::routes::prepare_evm_backend(&config)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not match the vault"), "{error}");
+        {
+            let requests = calls.lock().unwrap();
+            // Independent selector: keccak("challengePeriod()")[..4].
+            assert_eq!(
+                requests.last().unwrap()["params"],
+                json!([
+                    {"to":"0x0000000000000000000000000000000000000001", "data":"0xf3f480d9"},
+                    "latest"
+                ])
+            );
+        }
+        *period.lock().unwrap() = 86_400;
+        crate::routes::prepare_evm_backend(&config).await.unwrap();
+        task.abort();
     }
 
     #[tokio::test]

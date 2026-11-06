@@ -1,12 +1,24 @@
 //! zkAPI v2 request processor.
+//!
+//! Settle, then sign (O7): a lease's charge is persisted when it settles, and
+//! its successor is signed only after the vault reports the request's
+//! nullifier unspent. A nullifier an exit consumed defers the signature
+//! (`exit_deferred`); a defeat releasing it lets the next signing sweep sign,
+//! and after the challenge period plus slack the request becomes terminally
+//! `exited_unsigned`. The successor's anchor is always the derived
+//! `next_anchor(N)`.
 
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use dagon_zkapi_ledger::{
+    CreditLedger, DepositRequest, FinalizeEscapeRequest, LedgerCommitment, LedgerDeployment,
+    LedgerError, LedgerNullifierStatus, LedgerState, PreparedLedgerOperation, WithdrawalRequest,
+};
 use sha3::{Digest, Keccak256};
 use zkapi_core::v2 as core;
-use zkapi_proof::compact::{random_field, random_scalar, server_update, RequestVerifier};
+use zkapi_proof::compact::RequestVerifier;
 use zkapi_types::wire::{
     ApiRequestV2, ClearanceRequest, ClearanceResponseV2, CurvePointWire,
     OpenRouterLeaseAuthorization, OpenRouterLeaseResponse, OpenRouterLeaseStatusResponse,
@@ -20,16 +32,20 @@ use zkapi_types::{
 use crate::config::{OpenRouterLeaseSourceConfig, ServerConfig};
 use crate::dashboard::{redact_secrets, DashboardEvent, DashboardHub};
 use crate::error::ServerError;
-use crate::native_billing::{NativeBillingOracle, NativeBillingQuote};
+use crate::native_billing::billing::{BillingPriceSource, BillingQuote};
+use crate::native_billing::NativeBillingOracle;
+#[cfg(test)]
+use crate::native_billing::NativeBillingQuote;
 use crate::nullifier_store::{
     api_request_binding, NullifierStore, OaProvisioningOutcome, OpenRouterLeaseRecord,
-    TranscriptRecord,
+    SignatureDeferral, TranscriptRecord,
 };
 use crate::oa_org::{IssuedOpenRouterLease, OaOrgProvisioner, OaOrgUsage, OaOrgUsageExpectation};
 use crate::openrouter::OpenRouterProvisioner;
 use crate::pricing;
 use crate::settlement::{SettlementResult, UsageInfo};
 use crate::signer::ServerSigner;
+use crate::successor::{build_signed_successor, Deployment};
 
 const MAX_REQUEST_AGE_SECONDS: u64 = 300;
 const MAX_FUTURE_SKEW_SECONDS: u64 = 30;
@@ -37,6 +53,18 @@ const MAX_FUTURE_SKEW_SECONDS: u64 = 30;
 // child key remains usable until the final second. Stop advertising it as the
 // usable lease end and leave room for clock skew and in-flight requests.
 const OA_LEASE_EXPIRY_SAFETY_SECONDS: u64 = 30;
+
+fn ledger_wallet_error(error: LedgerError) -> ServerError {
+    match error {
+        LedgerError::Unavailable(message) => ServerError::Internal(message),
+        LedgerError::Unsupported { operation } => ServerError::InvalidRequest(format!(
+            "ledger backend does not support wallet operation `{operation}`"
+        )),
+        LedgerError::InvalidData(message)
+        | LedgerError::DeploymentMismatch(message)
+        | LedgerError::Rejected(message) => ServerError::InvalidRequest(message),
+    }
+}
 
 pub struct RequestProcessor {
     config: ServerConfig,
@@ -47,12 +75,25 @@ pub struct RequestProcessor {
     dashboard: Option<Arc<DashboardHub>>,
     openrouter: Option<Arc<OpenRouterProvisioner>>,
     oa_org: Option<Arc<OaOrgProvisioner>>,
-    native_oracle: NativeBillingOracle,
+    billing: Arc<dyn BillingPriceSource>,
+    ledger: Arc<dyn CreditLedger>,
     lease_issue_lock: tokio::sync::Mutex<()>,
     lease_settlement_lock: tokio::sync::Mutex<()>,
     // Keep the database exclusive for this processor's full lifetime, including
     // background tasks that may outlive an HTTP listener.
     _writer_lock: Option<crate::writer_lock::ServerWriterLock>,
+}
+
+/// Outcome of trying to sign a settled request's successor.
+#[derive(Debug)]
+pub enum SignOutcome {
+    Signed(Box<RequestResponseV2>),
+    /// The nullifier is consumed on chain; signing waits for a defeat.
+    Deferred {
+        since: u64,
+    },
+    /// Terminal: the consuming exit was never defeated.
+    ExitedUnsigned,
 }
 
 impl RequestProcessor {
@@ -62,7 +103,28 @@ impl RequestProcessor {
         signer: Arc<ServerSigner>,
         current_root: Felt252,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            config.backend == crate::config::LedgerBackend::Evm,
+            "Solana requires validated backend startup; use try_new_with_backends"
+        );
+        let oracle = Arc::new(NativeBillingOracle::for_server(&config)?);
+        Self::try_new_with_backends(config, store, signer, current_root, oracle.clone(), oracle)
+    }
+
+    pub fn try_new_with_backends(
+        config: ServerConfig,
+        store: Arc<NullifierStore>,
+        signer: Arc<ServerSigner>,
+        current_root: Felt252,
+        ledger: Arc<dyn CreditLedger>,
+        billing: Arc<dyn BillingPriceSource>,
+    ) -> anyhow::Result<Self> {
         config.validate_native_mode()?;
+        anyhow::ensure!(
+            ledger.deployment().chain_id == config.chain_id
+                && ledger.deployment().protocol_binding == config.contract_address,
+            "credit ledger does not match server deployment"
+        );
         let writer_lock = store.acquire_writer_lock()?;
         if let Some(lease) = config.openrouter_leases.as_ref() {
             anyhow::ensure!(
@@ -92,14 +154,6 @@ impl RequestProcessor {
                 }
             }
         }
-        let native = config
-            .native_billing
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("native ETH billing configuration is required"))?;
-        let address = config.contract_address.to_hex();
-        let body = address.strip_prefix("0x").unwrap_or(&address);
-        let native_oracle =
-            NativeBillingOracle::new(native, config.chain_id, format!("0x{:0>40}", body))?;
         let verifier = RequestVerifier::load(&config.proof_setup_dir)?;
         let openrouter = config
             .openrouter_leases
@@ -130,7 +184,8 @@ impl RequestProcessor {
             })
             .transpose()?;
         Ok(Self {
-            native_oracle,
+            billing,
+            ledger,
             config,
             store,
             signer,
@@ -145,6 +200,7 @@ impl RequestProcessor {
         })
     }
 
+    /// Settle and sign as if the vault reported the nullifier unspent.
     #[cfg(test)]
     pub(crate) fn finalize_test_lease(
         &self,
@@ -154,24 +210,117 @@ impl RequestProcessor {
         if let Some(response) = self.validate_and_reserve(request)? {
             return Ok(response);
         }
-        self.finalize_request(
-            request,
-            SettlementResult {
-                status_code: 200,
-                payload: self
-                    .settlement_payload(request, serde_json::json!({"status":"finalized"}))?,
-                charge_applied: charge_gwei,
-                usage: None,
-                billing_label: "native-test".into(),
-            },
-            0,
-            0,
-        )
+        let settlement = SettlementResult {
+            status_code: 200,
+            payload: self.settlement_payload(request, serde_json::json!({"status":"finalized"}))?,
+            charge_applied: charge_gwei,
+            usage: None,
+            billing_label: "native-test".into(),
+        };
+        self.settle(request, &settlement)?;
+        self.sign_settled(request, Some((&settlement, 0, 0)))
     }
 
     pub fn with_dashboard(mut self, dashboard: Arc<DashboardHub>) -> Self {
         self.dashboard = Some(dashboard);
         self
+    }
+
+    /// Replace the compatibility EVM ledger with a chain backend while keeping
+    /// the HTTP request protocol and proof verifier unchanged.
+    pub fn with_credit_ledger(mut self, ledger: Arc<dyn CreditLedger>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            ledger.deployment().chain_id == self.config.chain_id,
+            "credit ledger chain ID does not match server configuration"
+        );
+        anyhow::ensure!(
+            ledger.deployment().protocol_binding == self.config.contract_address,
+            "credit ledger deployment binding does not match server configuration"
+        );
+        self.ledger = ledger;
+        Ok(self)
+    }
+
+    /// Refresh the request root through the chain-neutral ledger boundary.
+    pub async fn refresh_ledger_state(
+        &self,
+        commitment: LedgerCommitment,
+    ) -> anyhow::Result<LedgerState> {
+        let state = self
+            .ledger
+            .state(commitment)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        self.update_root(state.root);
+        Ok(state)
+    }
+
+    /// Stable public identity of the active settlement backend. HTTP wallet
+    /// preparation responses include this so a client can bind every prepared
+    /// message to the deployment it already pinned.
+    pub fn ledger_deployment(&self) -> LedgerDeployment {
+        self.ledger.deployment().clone()
+    }
+
+    pub async fn prepare_ledger_deposit(
+        &self,
+        request: DepositRequest,
+    ) -> Result<PreparedLedgerOperation, ServerError> {
+        self.ledger
+            .prepare_deposit(request)
+            .await
+            .map_err(ledger_wallet_error)
+    }
+
+    pub async fn prepare_ledger_close(
+        &self,
+        request: WithdrawalRequest,
+    ) -> Result<PreparedLedgerOperation, ServerError> {
+        self.ledger
+            .prepare_close(request)
+            .await
+            .map_err(ledger_wallet_error)
+    }
+
+    pub async fn prepare_ledger_escape(
+        &self,
+        request: WithdrawalRequest,
+    ) -> Result<PreparedLedgerOperation, ServerError> {
+        self.ledger
+            .prepare_escape(request)
+            .await
+            .map_err(ledger_wallet_error)
+    }
+
+    pub async fn prepare_ledger_finalize_escape(
+        &self,
+        request: FinalizeEscapeRequest,
+    ) -> Result<PreparedLedgerOperation, ServerError> {
+        self.ledger
+            .prepare_finalize_escape(request)
+            .await
+            .map_err(ledger_wallet_error)
+    }
+
+    async fn assert_request_unspent(&self, nullifier: &Felt252) -> Result<(), ServerError> {
+        match self
+            .ledger
+            .nullifier_status(*nullifier, LedgerCommitment::Tip)
+            .await
+        {
+            Ok(LedgerNullifierStatus::Unused) => Ok(()),
+            Ok(LedgerNullifierStatus::Used) => Err(ServerError::NullifierUsed),
+            Err(error) => Err(ServerError::Internal(format!(
+                "vault authorization check failed: {error}"
+            ))),
+        }
+    }
+
+    #[cfg(test)]
+    fn replace_native_oracle(&mut self, oracle: NativeBillingOracle) {
+        let oracle = Arc::new(oracle.with_indexer_url(self.config.indexer_url.clone()));
+        self.ledger = oracle.clone();
+        self.billing = oracle;
     }
 
     pub fn dashboard(&self) -> Option<&Arc<DashboardHub>> {
@@ -199,14 +348,14 @@ impl RequestProcessor {
         self.signer.clearance_public_key()
     }
 
-    pub async fn native_billing_quote(&self) -> Result<NativeBillingQuote, ServerError> {
-        self.native_oracle.quote(current_timestamp()).await
+    pub async fn native_billing_quote(&self) -> Result<BillingQuote, ServerError> {
+        self.billing.quote(current_timestamp()).await
     }
 
     fn lease_authorization(
         &self,
         request: &ApiRequestV2,
-    ) -> Result<(OpenRouterLeaseAuthorization, NativeBillingQuote), ServerError> {
+    ) -> Result<(OpenRouterLeaseAuthorization, BillingQuote), ServerError> {
         let mut payload: serde_json::Value = serde_json::from_str(&request.payload)
             .map_err(|_| ServerError::InvalidRequest("invalid lease authorization".into()))?;
         let object = payload.as_object_mut().ok_or_else(|| {
@@ -215,12 +364,17 @@ impl RequestProcessor {
         let quote = object.remove("billing_quote").ok_or_else(|| {
             ServerError::InvalidRequest("native ETH lease requires a bound billing quote".into())
         })?;
-        let quote: NativeBillingQuote = serde_json::from_value(quote)
+        let quote: BillingQuote = serde_json::from_value(quote)
             .map_err(|_| ServerError::InvalidRequest("invalid native billing quote".into()))?;
-        let config = self.config.native_billing.as_ref().ok_or_else(|| {
-            ServerError::InvalidRequest("native ETH billing configuration is required".into())
-        })?;
-        quote.validate_identity(config, self.config.chain_id)?;
+        // Authenticate the source identity even for frozen settlement. EVM's
+        // compatibility config remains checked explicitly for old call sites.
+        if let BillingQuote::NativeEth(native) = &quote {
+            let config = self.config.native_billing.as_ref().ok_or_else(|| {
+                ServerError::InvalidRequest("native ETH billing configuration is required".into())
+            })?;
+            native.validate_identity(config, self.config.chain_id)?;
+        }
+        self.billing.validate_identity(&quote)?;
         let authorization = serde_json::from_value(payload).map_err(|_| {
             ServerError::InvalidRequest("invalid prompt-free lease authorization".into())
         })?;
@@ -324,12 +478,12 @@ impl RequestProcessor {
             }
         }
         if existing_reservation.is_none() {
-            self.native_oracle
+            self.billing
                 .validate(&billing_quote, current_timestamp())
                 .await?;
             // Oracle reads may span expiry; no await may separate this check
             // from the synchronous proof validation and reservation below.
-            self.native_oracle
+            self.billing
                 .assert_fresh(&billing_quote, current_timestamp())?;
         }
         if self.validate_and_reserve(request)?.is_some() {
@@ -382,8 +536,7 @@ impl RequestProcessor {
         // new access after its collateral has entered an escape or been paid
         // out. Check immediately before provider I/O, including OA retries
         // that might be the first successful upstream issuance.
-        self.native_oracle
-            .assert_request_unspent(&request.public_inputs.request_nullifier)
+        self.assert_request_unspent(&request.public_inputs.request_nullifier)
             .await?;
         if let Some(existing) = existing {
             match &lease_config.source {
@@ -528,8 +681,7 @@ impl RequestProcessor {
         // Persist activation first so challenge evidence and settlement survive
         // either a consumed nullifier or an unavailable RPC, but never expose
         // the runtime key unless its authorization is still unspent.
-        self.native_oracle
-            .assert_request_unspent(&request.public_inputs.request_nullifier)
+        self.assert_request_unspent(&request.public_inputs.request_nullifier)
             .await?;
         Ok(IssuedOpenRouterLease {
             lease: OpenRouterLeaseResponse {
@@ -586,17 +738,19 @@ impl RequestProcessor {
         {
             return Err(ServerError::LeasePending);
         }
-        let status = if quote.expires_at <= current_timestamp() {
+        let status = if quote.expires_at() <= current_timestamp() {
             "expired_unaccepted"
         } else {
-            let oracle = &self.native_oracle;
+            let oracle = &self.billing;
             match oracle.validate(&quote, current_timestamp()).await {
                 Err(ServerError::NativeQuoteSuperseded) => "superseded_unaccepted",
-                Err(ServerError::NativeQuoteExpired) if quote.expires_at <= current_timestamp() => {
+                Err(ServerError::NativeQuoteExpired)
+                    if quote.expires_at() <= current_timestamp() =>
+                {
                     "expired_unaccepted"
                 }
                 Err(error) => return Err(error),
-                Ok(()) if quote.expires_at <= current_timestamp() => "expired_unaccepted",
+                Ok(()) if quote.expires_at() <= current_timestamp() => "expired_unaccepted",
                 Ok(()) => return Err(ServerError::LeasePending),
             }
         };
@@ -608,7 +762,8 @@ impl RequestProcessor {
     }
 
     /// Settle every expired lease from OpenRouter's authoritative aggregate
-    /// usage. Failures are retained and retried by the next background scan.
+    /// usage, then run the signing sweep. Failures are retained and retried
+    /// by the next background scan.
     pub async fn settle_due_openrouter_leases(&self) {
         let _settlement_guard = self.lease_settlement_lock.lock().await;
         for lease in self.store.due_openrouter_leases(current_timestamp()) {
@@ -636,6 +791,32 @@ impl RequestProcessor {
                 let _ = self
                     .store
                     .record_openrouter_lease_error(&lease.client_request_id, &error.to_string());
+            }
+        }
+        self.sign_pending_successors().await;
+    }
+
+    /// Signing sweep: sign the successor of every settled request whose
+    /// nullifier is unspent on chain, and re-check deferred ones (a defeat
+    /// may have released the nullifier). Callers hold the settlement lock.
+    async fn sign_pending_successors(&self) {
+        for record in self.store.settled_unsigned_entries() {
+            let Some(request) = record
+                .client_request_id
+                .as_deref()
+                .and_then(|id| self.store.lookup_openrouter_lease(id))
+                .map(|lease| lease.api_request)
+                .filter(|request| request.public_inputs.request_nullifier == record.nullifier)
+            else {
+                tracing::error!(nullifier = %record.nullifier, "settled request has no lease");
+                continue;
+            };
+            if let Err(error) = self.sign_successor(&request).await {
+                tracing::warn!(
+                    client_request_id = %request.client_request_id,
+                    error = %error,
+                    "successor signing will be retried"
+                );
             }
         }
     }
@@ -719,7 +900,7 @@ impl RequestProcessor {
             };
         }
         let record = self.validate_oa_lease_binding(lease)?;
-        if record.status == NullifierStatus::Finalized {
+        if settled(&record) {
             return self.settle_oa_org_lease(lease).await;
         }
         let config = self.config.openrouter_leases.as_ref().ok_or_else(|| {
@@ -848,15 +1029,14 @@ impl RequestProcessor {
         }
         let request = &lease.api_request;
         let record = self.validate_oa_lease_binding(lease)?;
-        if record.status == NullifierStatus::Finalized {
-            // The transcript was committed before the lease row. Reuse that
-            // exact signed successor; a retry must never sign another balance.
+        if settled(&record) {
+            // The settlement was committed before the lease row. Reuse that
+            // exact charge; a retry must never settle another balance.
             let payload = record
                 .response_payload
                 .as_deref()
                 .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
-            if record.charge_applied != Some(0)
-                || record.next_state_sig.is_none()
+            if settled_charge(&record) != Some(0)
                 || payload.as_ref().and_then(|p| p["type"].as_str())
                     != Some("oa_org_unissued_lease_cancellation")
             {
@@ -865,9 +1045,6 @@ impl RequestProcessor {
                 ));
             }
         } else if record.status == NullifierStatus::Reserved {
-            self.native_oracle
-                .assert_request_unspent(&lease.request_nullifier)
-                .await?;
             let payload = self.settlement_payload(
                 request,
                 serde_json::json!({
@@ -881,7 +1058,7 @@ impl RequestProcessor {
                     },
                 }),
             )?;
-            self.finalize_request(
+            self.settle_and_sign(
                 request,
                 SettlementResult {
                     status_code: 200,
@@ -890,9 +1067,8 @@ impl RequestProcessor {
                     usage: None,
                     billing_label: "direct:oa-org-unissued".into(),
                 },
-                0,
-                0,
-            )?;
+            )
+            .await?;
         } else {
             return Err(ServerError::LeasePending);
         }
@@ -909,7 +1085,7 @@ impl RequestProcessor {
         if let Some(record) = self
             .store
             .lookup_by_nullifier(&lease.request_nullifier)
-            .filter(|record| record.status == NullifierStatus::Finalized)
+            .filter(settled)
         {
             let usage_credits = record
                 .response_payload
@@ -921,7 +1097,7 @@ impl RequestProcessor {
             self.store.finalize_openrouter_lease(
                 &lease.client_request_id,
                 pricing::micro_usd_to_usd(usage_credits),
-                record.charge_applied.unwrap_or_default(),
+                settled_charge(&record).unwrap_or_default(),
             )?;
             return Ok(());
         }
@@ -1000,9 +1176,14 @@ impl RequestProcessor {
             }),
             billing_label: "direct:oa-org-ephemeral".to_string(),
         };
-        self.finalize_request(&lease.api_request, provider_response, 0, 0)?;
-        self.store
-            .finalize_openrouter_lease(&lease.client_request_id, usage_usd, charge)
+        let record = self
+            .settle_and_sign(&lease.api_request, provider_response)
+            .await?;
+        self.store.finalize_openrouter_lease(
+            &lease.client_request_id,
+            usage_usd,
+            settled_charge(&record).unwrap_or(charge),
+        )
     }
 
     async fn settle_openrouter_lease(
@@ -1016,7 +1197,7 @@ impl RequestProcessor {
         if let Some(record) = self
             .store
             .lookup_by_nullifier(&lease.request_nullifier)
-            .filter(|record| record.status == NullifierStatus::Finalized)
+            .filter(settled)
         {
             let usage_usd = record
                 .response_payload
@@ -1030,7 +1211,7 @@ impl RequestProcessor {
             self.store.finalize_openrouter_lease(
                 &lease.client_request_id,
                 usage_usd,
-                record.charge_applied.unwrap_or_default(),
+                settled_charge(&record).unwrap_or_default(),
             )?;
             return Ok(());
         }
@@ -1141,10 +1322,14 @@ impl RequestProcessor {
             }),
             billing_label: "direct:openrouter-ephemeral".to_string(),
         };
-        self.finalize_request(&lease.api_request, provider_response, 0, 0)?;
-        self.store
-            .finalize_openrouter_lease(&lease.client_request_id, usage_usd, charge)?;
-        Ok(())
+        let record = self
+            .settle_and_sign(&lease.api_request, provider_response)
+            .await?;
+        self.store.finalize_openrouter_lease(
+            &lease.client_request_id,
+            usage_usd,
+            settled_charge(&record).unwrap_or(charge),
+        )
     }
 
     /// Validate proof/deployment bindings and reserve the request nullifier.
@@ -1185,6 +1370,9 @@ impl RequestProcessor {
             return match existing.status {
                 NullifierStatus::Finalized => {
                     response_from_record(&existing, &request.client_request_id).map(Some)
+                }
+                NullifierStatus::Reserved if existing.exited_unsigned_at.is_some() => {
+                    Err(ServerError::NullifierUsed)
                 }
                 NullifierStatus::Reserved => Ok(None),
                 NullifierStatus::ClearanceReserved => Err(ServerError::Replay),
@@ -1238,94 +1426,244 @@ impl RequestProcessor {
         // actual reservation boundary, while issue_openrouter_lease retains
         // its serialization lock. A matching existing reservation returned
         // above and keeps its original quote even after expiration.
-        self.native_oracle
+        self.billing
             .assert_fresh(&self.lease_authorization(request)?.1, current_timestamp())?;
         self.store.reserve_openrouter_lease(request)?;
         Ok(None)
     }
 
-    fn finalize_request(
+    fn deployment(&self) -> Deployment {
+        Deployment {
+            protocol_version: self.config.protocol_version,
+            chain_id: self.config.chain_id,
+            contract_address: self.config.contract_address,
+        }
+    }
+
+    /// How long a settled request's signature waits, after its nullifier was
+    /// first found consumed, for the consuming exit to be defeated (O7).
+    fn exit_deferral_window(&self) -> u64 {
+        self.config
+            .challenge_period_seconds
+            .saturating_add(crate::config::EXIT_DEFERRAL_SLACK_SECONDS)
+    }
+
+    /// Persist a request's settled charge (step 1 of O7). A settled charge is
+    /// final; a retry returns the stored settlement unchanged.
+    fn settle(
         &self,
         request: &ApiRequestV2,
-        provider_response: SettlementResult,
-        upstream_ms: u64,
-        total_ms: u64,
-    ) -> Result<RequestResponseV2, ServerError> {
+        provider_response: &SettlementResult,
+    ) -> Result<TranscriptRecord, ServerError> {
         let public = &request.public_inputs;
-        let reservation_kind = self
+        let record = self
             .store
             .lookup_by_nullifier(&public.request_nullifier)
             .ok_or_else(|| {
                 ServerError::Internal("request nullifier is no longer reserved".to_string())
-            })?
-            .reservation_kind;
-        if reservation_kind != "openrouter_lease" {
+            })?;
+        if record.reservation_kind != "openrouter_lease" {
             return Err(ServerError::InvalidRequest(
                 "only native lease reservations can settle".into(),
             ));
         }
-        let charge_cap = public.solvency_bound;
-        if provider_response.charge_applied > charge_cap {
+        if record.client_request_id.as_deref() != Some(request.client_request_id.as_str())
+            || record.api_request_binding.as_deref() != Some(api_request_binding(request)?.as_str())
+        {
+            return Err(ServerError::Internal(
+                "the request does not match its reservation; refusing to settle".into(),
+            ));
+        }
+        if settled(&record) {
+            return Ok(record);
+        }
+        if provider_response.charge_applied > public.solvency_bound {
             return Err(ServerError::Internal(format!(
                 "provider charge {} exceeds cap {}",
-                provider_response.charge_applied, charge_cap
+                provider_response.charge_applied, public.solvency_bound
             )));
         }
-
-        let anonymous = CurvePointWire {
-            x: public.anonymous_commitment_x,
-            y: public.anonymous_commitment_y,
-        };
-        let blind_delta = random_scalar();
-        let next_commitment =
-            server_update(&anonymous, provider_response.charge_applied, &blind_delta)
-                .map_err(|error| ServerError::InvalidProof(error.to_string()))?;
-        let next_anchor = core::next_anchor(
-            &random_field(),
+        #[cfg(any(test, feature = "adversary"))]
+        let charge = crate::adversary::settled_charge(
+            self.config.adversary,
+            request,
+            provider_response.charge_applied,
+        );
+        #[cfg(not(any(test, feature = "adversary")))]
+        let charge = provider_response.charge_applied;
+        self.store.record_settlement(
             &public.request_nullifier,
-            &next_commitment.x,
-            &next_commitment.y,
+            charge,
+            provider_response.status_code,
+            &provider_response.payload,
+        )
+    }
+
+    /// Settle, then try to sign. A signing failure is logged and left to the
+    /// signing sweep; the settlement itself is durable. Returns the settled
+    /// record.
+    async fn settle_and_sign(
+        &self,
+        request: &ApiRequestV2,
+        provider_response: SettlementResult,
+    ) -> Result<TranscriptRecord, ServerError> {
+        let record = self.settle(request, &provider_response)?;
+        match self
+            .sign_successor_with(request, Some((&provider_response, 0, 0)))
+            .await
+        {
+            Ok(SignOutcome::Signed(_)) => {}
+            Ok(SignOutcome::Deferred { since }) => tracing::warn!(
+                client_request_id = %request.client_request_id,
+                since,
+                "settled request's nullifier is consumed on chain; successor deferred (exit_deferred)"
+            ),
+            Ok(SignOutcome::ExitedUnsigned) => tracing::warn!(
+                client_request_id = %request.client_request_id,
+                "settled request ended exited_unsigned; no successor is ever signed"
+            ),
+            Err(error) => tracing::warn!(
+                client_request_id = %request.client_request_id,
+                error = %error,
+                "successor signing will be retried by the signing sweep"
+            ),
+        }
+        Ok(record)
+    }
+
+    /// Sign the successor of a settled request (O7): only if its nullifier
+    /// is unspent on chain. A consumed nullifier defers the signature from
+    /// its first observation; after `challengePeriod + slack` the request is
+    /// terminally ExitedUnsigned. A defeated exit releases the nullifier and
+    /// the successor is then signed at the persisted charge. A signed or
+    /// ended request returns its outcome without a chain read.
+    pub async fn sign_successor(&self, request: &ApiRequestV2) -> Result<SignOutcome, ServerError> {
+        self.sign_successor_with(request, None).await
+    }
+
+    async fn sign_successor_with(
+        &self,
+        request: &ApiRequestV2,
+        settlement: Option<(&SettlementResult, u64, u64)>,
+    ) -> Result<SignOutcome, ServerError> {
+        let nullifier = request.public_inputs.request_nullifier;
+        let record = self
+            .store
+            .lookup_by_nullifier(&nullifier)
+            .ok_or_else(|| ServerError::Internal("the request has no reservation".into()))?;
+        match record.status {
+            NullifierStatus::Finalized => {
+                return response_from_record(&record, &request.client_request_id)
+                    .map(|response| SignOutcome::Signed(Box::new(response)))
+            }
+            NullifierStatus::Reserved if record.exited_unsigned_at.is_some() => {
+                return Ok(SignOutcome::ExitedUnsigned)
+            }
+            NullifierStatus::Reserved if record.settled_charge.is_some() => {}
+            status => {
+                return Err(ServerError::Internal(format!(
+                    "the request is not settled ({status:?}); nothing to sign"
+                )))
+            }
+        }
+        match self.assert_request_unspent(&nullifier).await {
+            Ok(()) => self
+                .sign_settled(request, settlement)
+                .map(|response| SignOutcome::Signed(Box::new(response))),
+            Err(ServerError::NullifierUsed) => {
+                match self.store.defer_signature(
+                    &nullifier,
+                    current_timestamp(),
+                    self.exit_deferral_window(),
+                )? {
+                    SignatureDeferral::Deferred { since } => Ok(SignOutcome::Deferred { since }),
+                    SignatureDeferral::ExitedUnsigned => Ok(SignOutcome::ExitedUnsigned),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Sign and record the successor of a settled request at its persisted
+    /// charge, after the caller established that its nullifier is unspent.
+    /// The transcript is written once.
+    fn sign_settled(
+        &self,
+        request: &ApiRequestV2,
+        settlement: Option<(&SettlementResult, u64, u64)>,
+    ) -> Result<RequestResponseV2, ServerError> {
+        let public = &request.public_inputs;
+        let record = self
+            .store
+            .lookup_by_nullifier(&public.request_nullifier)
+            .ok_or_else(|| ServerError::Internal("the request has no reservation".into()))?;
+        if record.client_request_id.as_deref() != Some(request.client_request_id.as_str())
+            || record.api_request_binding.as_deref() != Some(api_request_binding(request)?.as_str())
+        {
+            return Err(ServerError::Internal(
+                "the request does not match its reservation; refusing to sign".into(),
+            ));
+        }
+        let (NullifierStatus::Reserved, Some(charge), None) = (
+            record.status,
+            record.settled_charge,
+            record.exited_unsigned_at,
+        ) else {
+            return Err(ServerError::Internal(format!(
+                "the request is {:?} and not settled-unsigned: no successor is signed",
+                record.status
+            )));
+        };
+        let deployment = self.deployment();
+        #[cfg(any(test, feature = "adversary"))]
+        let adversarial = crate::adversary::successor(
+            self.config.adversary,
+            &*self.signer,
+            &deployment,
+            request,
+            charge,
         );
-        let state_message = core::state_message(
-            self.config.protocol_version,
-            self.config.chain_id,
-            &self.config.contract_address,
-            &next_commitment.x,
-            &next_commitment.y,
-            &next_anchor,
-        );
-        let state_signature = self.signer.sign_state(&state_message);
-        let response_hash = canonical_response_hash(provider_response.payload.as_bytes());
+        #[cfg(not(any(test, feature = "adversary")))]
+        let adversarial: Option<Result<crate::successor::SignedSuccessor, ServerError>> = None;
+        let signed = match adversarial {
+            Some(signed) => signed?,
+            None => build_signed_successor(&*self.signer, &deployment, request, charge)?,
+        };
+        let response_payload = record.response_payload.clone().unwrap_or_default();
+        let response_code = record.response_code.unwrap_or(200);
+        let response_hash = canonical_response_hash(response_payload.as_bytes());
         let proof_bytes = base64::engine::general_purpose::STANDARD
             .decode(&request.proof.proof)
             .map_err(|error| ServerError::InvalidProof(error.to_string()))?;
+        let now = current_timestamp();
         let transcript = TranscriptRecord {
-            nullifier: public.request_nullifier,
             status: NullifierStatus::Finalized,
-            reservation_kind,
-            client_request_id: Some(request.client_request_id.clone()),
-            payload_hash: Some(request.payload_hash),
-            charge_applied: Some(provider_response.charge_applied),
-            response_code: Some(provider_response.status_code),
-            response_payload: Some(provider_response.payload.clone()),
+            charge_applied: Some(signed.charge),
+            response_code: Some(response_code),
+            response_payload: Some(response_payload.clone()),
             response_hash: Some(response_hash),
-            next_commitment_x: Some(next_commitment.x),
-            next_commitment_y: Some(next_commitment.y),
-            next_anchor: Some(next_anchor),
-            blind_delta_srv: Some(blind_delta),
-            next_state_sig: Some(state_signature),
+            next_commitment_x: Some(signed.next_commitment.x),
+            next_commitment_y: Some(signed.next_commitment.y),
+            next_anchor: Some(signed.next_anchor),
+            blind_delta_srv: Some(signed.blind_delta),
+            next_state_sig: Some(signed.signature),
             policy_reason_code: None,
             policy_evidence_hash: None,
             proof_blob: Some(proof_bytes.clone()),
             request_inputs_json: serde_json::to_string(public).ok(),
-            api_request_binding: Some(api_request_binding(request)?),
-            created_at: current_timestamp(),
-            finalized_at: Some(current_timestamp()),
+            finalized_at: Some(now),
+            ..record
         };
         self.store
             .finalize(&public.request_nullifier, &transcript)?;
 
-        if let Some(hub) = &self.dashboard {
+        if let (Some(hub), Some((provider_response, upstream_ms, total_ms))) =
+            (&self.dashboard, settlement)
+        {
+            let anonymous = CurvePointWire {
+                x: public.anonymous_commitment_x,
+                y: public.anonymous_commitment_y,
+            };
             hub.record(DashboardEvent {
                 seq: hub.next_seq(),
                 ts_ms: current_timestamp_ms(),
@@ -1340,19 +1678,19 @@ impl RequestProcessor {
                 proof_public_output_hash: public.authorization_tag,
                 proof_size_bytes: proof_bytes.len(),
                 request_raw: redact_secrets(&request.payload),
-                response_code: provider_response.status_code,
-                response_text: redact_secrets(&provider_response.payload),
+                response_code,
+                response_text: redact_secrets(&response_payload),
                 response_hash,
                 usage: provider_response.usage.clone(),
-                charge_applied: provider_response.charge_applied,
+                charge_applied: signed.charge,
                 charge_usd: provider_response
                     .usage
                     .as_ref()
                     .map(|usage| usage.cost_usd)
                     .unwrap_or(0.0),
-                next_commitment: next_commitment.clone(),
-                next_anchor,
-                blind_delta_srv: blind_delta,
+                next_commitment: signed.next_commitment.clone(),
+                next_anchor: signed.next_anchor,
+                blind_delta_srv: signed.blind_delta,
                 upstream_ms,
                 total_ms,
             });
@@ -1362,14 +1700,14 @@ impl RequestProcessor {
             status: "ok".to_string(),
             client_request_id: request.client_request_id.clone(),
             request_nullifier: public.request_nullifier,
-            response_code: provider_response.status_code,
-            response_payload: provider_response.payload,
+            response_code,
+            response_payload,
             response_hash,
-            charge_applied: provider_response.charge_applied,
-            next_commitment,
-            next_anchor,
-            blind_delta_srv: blind_delta,
-            next_state_signature: state_signature,
+            charge_applied: signed.charge,
+            next_commitment: signed.next_commitment,
+            next_anchor: signed.next_anchor,
+            blind_delta_srv: signed.blind_delta,
+            next_state_signature: signed.signature,
             policy_reason_code: None,
             policy_evidence_hash: None,
         })
@@ -1379,22 +1717,33 @@ impl RequestProcessor {
         self.config.openrouter_leases.is_some()
     }
 
+    /// Lease metadata. A finalized lease whose successor is deferred or
+    /// terminally unsigned reports `exit_deferred` / `exited_unsigned`.
     pub fn openrouter_lease_status(
         &self,
         client_request_id: &str,
     ) -> Option<OpenRouterLeaseStatusResponse> {
         self.store
             .lookup_openrouter_lease(client_request_id)
-            .map(|lease| OpenRouterLeaseStatusResponse {
-                status: lease.status,
-                client_request_id: lease.client_request_id,
-                issued_at: lease.issued_at,
-                expires_at: lease.expires_at,
-                settle_after: lease.settle_after,
-                spending_limit_usd: lease.spending_limit_usd,
-                usage_usd: lease.usage_usd,
-                charge_applied: lease.charge_applied,
-                last_error: lease.last_error,
+            .map(|lease| {
+                let signature_status = self
+                    .store
+                    .lookup_by_nullifier(&lease.request_nullifier)
+                    .and_then(|record| match nullifier_status_label(&record) {
+                        label @ ("exit_deferred" | "exited_unsigned") => Some(label),
+                        _ => None,
+                    });
+                OpenRouterLeaseStatusResponse {
+                    status: signature_status.map(str::to_owned).unwrap_or(lease.status),
+                    client_request_id: lease.client_request_id,
+                    issued_at: lease.issued_at,
+                    expires_at: lease.expires_at,
+                    settle_after: lease.settle_after,
+                    spending_limit_usd: lease.spending_limit_usd,
+                    usage_usd: lease.usage_usd,
+                    charge_applied: lease.charge_applied,
+                    last_error: lease.last_error,
+                }
             })
     }
 
@@ -1428,26 +1777,45 @@ impl RequestProcessor {
         })
     }
 
-    pub fn recover_by_client_id(
+    /// Recovery by client request ID. Once the request's nullifier is
+    /// consumed on chain only its status is returned.
+    pub async fn recover_by_client_id(
         &self,
         client_request_id: &str,
     ) -> Result<RecoveryResponseV2, ServerError> {
-        Ok(self
-            .store
-            .lookup_by_client_id(client_request_id)
-            .map(|record| recovery_from_record(&record))
-            .unwrap_or_else(not_found_recovery))
+        match self.store.lookup_by_client_id(client_request_id) {
+            Some(record) => self.recovery_from_record(&record).await,
+            None => Ok(not_found_recovery()),
+        }
     }
 
-    pub fn recover_by_nullifier(
+    /// Recovery by nullifier, with the same contract as by client request ID.
+    pub async fn recover_by_nullifier(
         &self,
         nullifier: &Felt252,
     ) -> Result<RecoveryResponseV2, ServerError> {
-        Ok(self
-            .store
-            .lookup_by_nullifier(nullifier)
-            .map(|record| recovery_from_record(&record))
-            .unwrap_or_else(not_found_recovery))
+        match self.store.lookup_by_nullifier(nullifier) {
+            Some(record) => self.recovery_from_record(&record).await,
+            None => Ok(not_found_recovery()),
+        }
+    }
+
+    /// A published nullifier's request data is no longer served: the
+    /// response is withheld once the vault reports `N` used. A failed chain
+    /// read fails closed.
+    async fn recovery_from_record(
+        &self,
+        record: &TranscriptRecord,
+    ) -> Result<RecoveryResponseV2, ServerError> {
+        let mut recovery = recovery_from_record(record);
+        if recovery.request_response.is_some() {
+            match self.assert_request_unspent(&record.nullifier).await {
+                Ok(()) => {}
+                Err(ServerError::NullifierUsed) => recovery.request_response = None,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(recovery)
     }
 
     pub fn config(&self) -> &ServerConfig {
@@ -1485,12 +1853,30 @@ fn response_from_record(
     })
 }
 
-fn recovery_from_record(record: &TranscriptRecord) -> RecoveryResponseV2 {
-    let status = match record.status {
+/// The `nullifier_status` a recovery response reports. A settled request
+/// whose successor is not signed yet still reads `reserved`.
+pub(crate) fn nullifier_status_label(record: &TranscriptRecord) -> &'static str {
+    match record.status {
+        NullifierStatus::Reserved if record.exited_unsigned_at.is_some() => "exited_unsigned",
+        NullifierStatus::Reserved if record.exit_deferred_since.is_some() => "exit_deferred",
         NullifierStatus::Reserved => "reserved",
         NullifierStatus::Finalized => "finalized",
         NullifierStatus::ClearanceReserved => "clearance_reserved",
-    };
+    }
+}
+
+/// Whether a request is settled: its charge is persisted (or, for a legacy
+/// transcript, it was finalized before settled charges were recorded).
+fn settled(record: &TranscriptRecord) -> bool {
+    record.settled_charge.is_some() || record.status == NullifierStatus::Finalized
+}
+
+fn settled_charge(record: &TranscriptRecord) -> Option<u128> {
+    record.settled_charge.or(record.charge_applied)
+}
+
+fn recovery_from_record(record: &TranscriptRecord) -> RecoveryResponseV2 {
+    let status = nullifier_status_label(record);
     RecoveryResponseV2 {
         status: "ok".to_string(),
         nullifier_status: status.to_string(),
@@ -1554,6 +1940,7 @@ mod tests {
             ServerConfig {
                 request_charge_cap: 1,
                 contract_address: Felt252::from_u64(1),
+                backend: crate::config::LedgerBackend::Evm,
                 native_billing: Some(crate::test_support::native_config()),
                 proof_setup_dir: setup_directory(),
                 openrouter_leases: Some(OpenRouterLeaseConfig {
@@ -1676,12 +2063,15 @@ mod tests {
     fn configure_issuance_rpc(processor: &mut RequestProcessor, url: String) {
         let config = processor.config.native_billing.as_mut().unwrap();
         config.rpc_url = url;
-        processor.native_oracle = NativeBillingOracle::new(
-            config.clone(),
-            processor.config.chain_id,
-            "0x0000000000000000000000000000000000000001".into(),
-        )
-        .unwrap();
+        let config = config.clone();
+        processor.replace_native_oracle(
+            NativeBillingOracle::new(
+                config,
+                processor.config.chain_id,
+                "0x0000000000000000000000000000000000000001".into(),
+            )
+            .unwrap(),
+        );
     }
 
     async fn unspent_rpc(processor: &mut RequestProcessor) -> tokio::task::JoinHandle<()> {
@@ -2054,8 +2444,11 @@ mod tests {
         server.abort();
     }
 
+    /// Settlement of a confirmed-unissued lease needs no chain read; only
+    /// signing does. An RPC failure leaves the zero-charge settlement durable
+    /// and unsigned, and the background sweep signs once the vault answers.
     #[tokio::test]
-    async fn confirmed_rejection_survives_failed_finalization_then_background_recovers() {
+    async fn confirmed_rejection_settles_without_rpc_then_background_signs() {
         let state = Arc::new(std::sync::Mutex::new(IssuanceMock {
             policy_reject: true,
             fail_rpc_after_create: true,
@@ -2071,16 +2464,25 @@ mod tests {
             lease.oa_provisioning_outcome,
             OaProvisioningOutcome::ConfirmedUnissued
         );
-        assert_eq!(lease.status, "provisioning");
+        assert_eq!(lease.status, "finalized");
+        let record = processor
+            .store
+            .lookup_by_nullifier(&request.public_inputs.request_nullifier)
+            .unwrap();
+        assert_eq!(record.settled_charge, Some(0));
+        assert_eq!(record.status, NullifierStatus::Reserved);
+        assert!(
+            record.next_state_sig.is_none(),
+            "unsigned while the vault is unreadable"
+        );
         state.lock().unwrap().fail_rpc_after_create = false;
         processor.settle_due_openrouter_leases().await;
-        assert_eq!(
-            processor
-                .openrouter_lease_status(&request.client_request_id)
-                .unwrap()
-                .status,
-            "finalized"
-        );
+        let record = processor
+            .store
+            .lookup_by_nullifier(&request.public_inputs.request_nullifier)
+            .unwrap();
+        assert_eq!(record.status, NullifierStatus::Finalized);
+        assert_eq!(record.charge_applied, Some(0));
         assert_eq!(state.lock().unwrap().creates, 1);
         server.abort();
     }
@@ -2132,13 +2534,15 @@ mod tests {
             .store
             .confirm_oa_unissued(&request.client_request_id)
             .unwrap();
-        let signed = processor.finalize_request(&request, SettlementResult {
+        let settlement = SettlementResult {
             status_code: 200,
             payload: processor.settlement_payload(&request, serde_json::json!({
                 "type":"oa_org_unissued_lease_cancellation", "issued":false, "usage_credits":0
             })).unwrap(),
             charge_applied: 0, usage: None, billing_label: "test".into(),
-        }, 0, 0).unwrap();
+        };
+        processor.settle(&request, &settlement).unwrap();
+        let signed = processor.sign_settled(&request, None).unwrap();
         processor.settle_due_openrouter_leases().await;
         let record = processor
             .store
@@ -2153,6 +2557,171 @@ mod tests {
             "finalized"
         );
         assert_eq!(state.lock().unwrap().creates, 0);
+        server.abort();
+    }
+
+    fn test_settlement(processor: &RequestProcessor, request: &ApiRequestV2) -> SettlementResult {
+        SettlementResult {
+            status_code: 200,
+            payload: processor
+                .settlement_payload(request, serde_json::json!({"usage_usd": 0.0}))
+                .unwrap(),
+            charge_applied: 5,
+            usage: None,
+            billing_label: "test".into(),
+        }
+    }
+
+    /// Threat (G2 withhold-safety): a cheater escapes, consuming `N` (or
+    /// `N⁺`), while its request at `N` settles. The server persists the charge
+    /// but never signs the successor while `N` is consumed on chain; recovery
+    /// reports `exit_deferred` without a response. Only a defeat releasing
+    /// `N` lets the signing sweep sign it, at the derived anchor and the
+    /// persisted charge; once `N` is consumed again recovery returns status
+    /// only.
+    #[tokio::test]
+    async fn o7_never_signs_a_successor_for_an_on_chain_consumed_nullifier() {
+        let state = Arc::new(std::sync::Mutex::new(IssuanceMock {
+            spent: true,
+            ..Default::default()
+        }));
+        let (processor, request, server) = issuance_processor(false, state.clone()).await;
+        let nullifier = request.public_inputs.request_nullifier;
+        let settled = processor
+            .settle_and_sign(&request, test_settlement(&processor, &request))
+            .await
+            .unwrap();
+        assert_eq!(settled.settled_charge, Some(5));
+        let record = processor.store.lookup_by_nullifier(&nullifier).unwrap();
+        assert_eq!(record.status, NullifierStatus::Reserved);
+        assert!(
+            record.next_state_sig.is_none(),
+            "never signed while consumed"
+        );
+        let since = record.exit_deferred_since.expect("deferred");
+        let recovery = processor
+            .recover_by_client_id(&request.client_request_id)
+            .await
+            .unwrap();
+        assert_eq!(recovery.nullifier_status, "exit_deferred");
+        assert!(recovery.request_response.is_none());
+        // The sweep re-checks and keeps deferring while N stays consumed.
+        processor.sign_pending_successors().await;
+        let record = processor.store.lookup_by_nullifier(&nullifier).unwrap();
+        assert!(record.next_state_sig.is_none());
+        assert_eq!(record.exit_deferred_since, Some(since));
+        // A different settlement cannot change the persisted charge.
+        let mut higher = test_settlement(&processor, &request);
+        higher.charge_applied = 9;
+        assert_eq!(
+            processor.settle(&request, &higher).unwrap().settled_charge,
+            Some(5)
+        );
+
+        // A defeat released N: the sweep signs at the derived anchor.
+        state.lock().unwrap().spent = false;
+        processor.sign_pending_successors().await;
+        let record = processor.store.lookup_by_nullifier(&nullifier).unwrap();
+        assert_eq!(record.status, NullifierStatus::Finalized);
+        assert_eq!(record.charge_applied, Some(5));
+        assert_eq!(record.next_anchor, Some(core::next_anchor(&nullifier)));
+        let recovery = processor
+            .recover_by_client_id(&request.client_request_id)
+            .await
+            .unwrap();
+        assert_eq!(recovery.nullifier_status, "finalized");
+        assert_eq!(
+            recovery.request_response.unwrap().next_anchor,
+            core::next_anchor(&nullifier)
+        );
+
+        // Once N is published on chain, recovery returns the status only.
+        state.lock().unwrap().spent = true;
+        let recovery = processor.recover_by_nullifier(&nullifier).await.unwrap();
+        assert_eq!(recovery.nullifier_status, "finalized");
+        assert!(recovery.request_response.is_none());
+        server.abort();
+    }
+
+    /// After the challenge period plus slack without a defeat, a deferred
+    /// request is terminally `exited_unsigned`: never signed, even if `N`
+    /// later reads unspent, and its replay is refused.
+    #[tokio::test]
+    async fn o7_deferred_request_ends_exited_unsigned_after_the_window() {
+        let state = Arc::new(std::sync::Mutex::new(IssuanceMock {
+            spent: true,
+            ..Default::default()
+        }));
+        let (processor, request, server) = issuance_processor(false, state.clone()).await;
+        let nullifier = request.public_inputs.request_nullifier;
+        processor
+            .settle_and_sign(&request, test_settlement(&processor, &request))
+            .await
+            .unwrap();
+        let since = processor
+            .store
+            .lookup_by_nullifier(&nullifier)
+            .unwrap()
+            .exit_deferred_since
+            .unwrap();
+        let window = processor.exit_deferral_window();
+        assert_eq!(
+            window,
+            processor.config.challenge_period_seconds + crate::config::EXIT_DEFERRAL_SLACK_SECONDS
+        );
+        assert_eq!(
+            processor
+                .store
+                .defer_signature(&nullifier, since + window, window)
+                .unwrap(),
+            SignatureDeferral::ExitedUnsigned
+        );
+        state.lock().unwrap().spent = false;
+        let reads = state.lock().unwrap().nullifier_reads;
+        assert!(matches!(
+            processor.sign_successor(&request).await.unwrap(),
+            SignOutcome::ExitedUnsigned
+        ));
+        processor.sign_pending_successors().await;
+        assert_eq!(
+            state.lock().unwrap().nullifier_reads,
+            reads,
+            "a terminal request needs no chain read"
+        );
+        let record = processor.store.lookup_by_nullifier(&nullifier).unwrap();
+        assert!(record.next_state_sig.is_none());
+        let recovery = processor
+            .recover_by_client_id(&request.client_request_id)
+            .await
+            .unwrap();
+        assert_eq!(recovery.nullifier_status, "exited_unsigned");
+        assert!(recovery.request_response.is_none());
+        assert!(matches!(
+            processor.validate_and_reserve(&request),
+            Err(ServerError::NullifierUsed)
+        ));
+        assert!(processor.sign_settled(&request, None).is_err());
+        server.abort();
+    }
+
+    /// An honest settlement with `N` unspent signs immediately at the
+    /// derived anchor, never 0 or 1.
+    #[tokio::test]
+    async fn honest_settlement_signs_at_the_derived_anchor() {
+        let state = Arc::new(std::sync::Mutex::new(IssuanceMock::default()));
+        let (processor, request, server) = issuance_processor(false, state).await;
+        let nullifier = request.public_inputs.request_nullifier;
+        processor
+            .settle_and_sign(&request, test_settlement(&processor, &request))
+            .await
+            .unwrap();
+        let record = processor.store.lookup_by_nullifier(&nullifier).unwrap();
+        assert_eq!(record.status, NullifierStatus::Finalized);
+        let anchor = record.next_anchor.unwrap();
+        assert_eq!(anchor, core::next_anchor(&nullifier));
+        assert_ne!(anchor, Felt252::ZERO);
+        assert_ne!(anchor, core::GENESIS_ANCHOR);
+        assert!(record.exit_deferred_since.is_none());
         server.abort();
     }
 
@@ -2242,10 +2811,15 @@ mod tests {
                 reserved.api_request_binding.as_deref(),
                 Some(api_request_binding(&request).unwrap().as_str())
             );
-            assert!(
-                crate::watcher::ChallengeWatcher::new(processor.store.clone())
-                    .challenge_transcript(&request.public_inputs.request_nullifier)
-                    .is_none()
+            // The reservation recorded immutable evidence; the challenger's
+            // policy, not its existence, decides any raise.
+            assert_eq!(
+                processor
+                    .store
+                    .request_evidence(&request.public_inputs.request_nullifier)
+                    .unwrap()
+                    .request_inputs,
+                request.public_inputs
             );
             server.abort();
         }
@@ -2278,11 +2852,10 @@ mod tests {
                     api_request_binding(&lease.api_request).unwrap(),
                     api_request_binding(&request).unwrap()
                 );
-                assert!(
-                    crate::watcher::ChallengeWatcher::new(processor.store.clone())
-                        .challenge_transcript(&request.public_inputs.request_nullifier)
-                        .is_some()
-                );
+                assert!(processor
+                    .store
+                    .request_evidence(&request.public_inputs.request_nullifier)
+                    .is_some());
                 // Recovery of already activated access needs no fresh chain
                 // read and cannot repeat provider issuance after either error.
                 assert!(matches!(
@@ -2302,7 +2875,7 @@ mod tests {
             let (processor, request, server) = issuance_processor(oa, state.clone()).await;
             processor.update_root(Felt252::from_u64(999));
             let quote = processor.lease_authorization(&request).unwrap().1;
-            assert!(quote.expires_at < current_timestamp());
+            assert!(quote.expires_at() < current_timestamp());
             let issued = processor.issue_openrouter_lease(&request).await.unwrap();
             assert_eq!(issued.lease.api_key, "runtime-key");
             assert_eq!(issued.billing_quote, quote);
@@ -2473,7 +3046,7 @@ mod tests {
                 store
                     .lookup_by_nullifier(&request.public_inputs.request_nullifier)
                     .unwrap()
-                    .charge_applied,
+                    .settled_charge,
                 Some(2)
             );
             assert_eq!(
@@ -2583,7 +3156,7 @@ mod tests {
                 .store
                 .lookup_by_nullifier(&request.public_inputs.request_nullifier)
                 .unwrap()
-                .charge_applied,
+                .settled_charge,
             Some(5)
         );
         assert_eq!(state.lock().unwrap().events, ["disable", "usage", "delete"]);
@@ -2938,12 +3511,14 @@ mod tests {
             max_age_seconds: 3600,
         };
         processor.config.native_billing = Some(config.clone());
-        processor.native_oracle = NativeBillingOracle::new(
-            config,
-            1,
-            "0x0000000000000000000000000000000000000001".into(),
-        )
-        .unwrap();
+        processor.replace_native_oracle(
+            NativeBillingOracle::new(
+                config,
+                1,
+                "0x0000000000000000000000000000000000000001".into(),
+            )
+            .unwrap(),
+        );
         let chain_server = unspent_rpc(&mut processor).await;
         let mut request = unverified_lease_request(&processor);
         request.payload = serde_json::to_string(&OpenRouterLeaseAuthorization::default()).unwrap();
@@ -3026,7 +3601,7 @@ mod tests {
                 .lease_authorization(&restored.api_request)
                 .unwrap()
                 .1,
-            quote.clone()
+            BillingQuote::NativeEth(quote.clone())
         );
         // Retry must reach the unavailable issuer, not fetch/reprice an expired
         // round. This confirms that a restarted lease uses its persisted quote.
@@ -3119,12 +3694,14 @@ mod tests {
             max_age_seconds: 3600,
         };
         processor.config.native_billing = Some(config.clone());
-        processor.native_oracle = NativeBillingOracle::new(
-            config,
-            1,
-            "0x0000000000000000000000000000000000000001".into(),
-        )
-        .unwrap();
+        processor.replace_native_oracle(
+            NativeBillingOracle::new(
+                config,
+                1,
+                "0x0000000000000000000000000000000000000001".into(),
+            )
+            .unwrap(),
+        );
         let processor = Arc::new(processor);
         let mut request = unverified_lease_request(&processor);
         let quote = NativeBillingQuote {
@@ -3243,19 +3820,27 @@ mod tests {
             max_age_seconds: 4500,
         };
         processor.config.native_billing = Some(config.clone());
-        processor.native_oracle = NativeBillingOracle::new(
-            config,
-            1,
-            "0x0000000000000000000000000000000000000001".into(),
-        )
-        .unwrap();
-        let oracle = &processor.native_oracle;
-        let quote = oracle.quote(current_timestamp()).await.unwrap();
+        processor.replace_native_oracle(
+            NativeBillingOracle::new(
+                config,
+                1,
+                "0x0000000000000000000000000000000000000001".into(),
+            )
+            .unwrap(),
+        );
+        let oracle = &processor.billing;
+        let generic_quote = oracle.quote(current_timestamp()).await.unwrap();
+        let BillingQuote::NativeEth(quote) = &generic_quote else {
+            panic!("expected ETH quote");
+        };
         assert_eq!(
             quote.round_id, "123",
             "head-only round must not influence pricing"
         );
-        oracle.validate(&quote, current_timestamp()).await.unwrap();
+        oracle
+            .validate(&generic_quote, current_timestamp())
+            .await
+            .unwrap();
         let mut request = unverified_lease_request(&processor);
         request.payload =
             json!({"mode":"openrouter_ephemeral_lease","version":1,"billing_quote":quote})
@@ -3332,24 +3917,46 @@ mod tests {
         ));
         server.abort();
     }
-    #[test]
-    fn native_quote_is_bound_by_real_browser_proof_and_settles_in_gwei() {
-        use zkapi_browser::{
-            BrowserWalletConfig, CompleteResponseArgs, ConfirmDepositArgs, PrepareRequestArgs,
-        };
-        use zkapi_core::merkle::MerkleTree;
+
+    fn browser_processor(adversary: Option<crate::adversary::AdversaryMode>) -> RequestProcessor {
         let store = Arc::new(NullifierStore::in_memory().unwrap());
         let mut processor = oa_lease_processor(store);
         processor.config.contract_address = Felt252::from_u64(1);
         processor.config.request_charge_cap = 400_000;
+        processor.config.adversary = adversary;
         processor.config.native_billing = Some(crate::native_billing::NativeBillingConfig {
             rpc_url: "http://127.0.0.1:9".into(),
             feed_address: "0x694aa1769357215de4fac081bf1f309adc325306".into(),
             decimals: 8,
             max_age_seconds: 3600,
         });
+        processor.replace_native_oracle(
+            NativeBillingOracle::new(
+                processor.config.native_billing.clone().unwrap(),
+                processor.config.chain_id,
+                "0x0000000000000000000000000000000000000001".into(),
+            )
+            .unwrap(),
+        );
+        processor
+    }
+
+    /// A real browser proof binds the native quote; the honest successor is
+    /// installed by the wallet (S1–S5), while every adversary mode is, from
+    /// the wallet's side, a withheld successor: `withhold` signs nothing and
+    /// recovery stays `reserved` without a response; `random-anchor` and
+    /// `born-spent` fail S4; `overcharge` fails S3.
+    #[tokio::test]
+    async fn native_quote_is_bound_by_real_browser_proof_and_adversaries_are_withheld() {
+        use crate::adversary::AdversaryMode;
+        use zkapi_browser::{
+            BrowserWalletConfig, CompleteResponseArgs, ConfirmDepositArgs, PrepareRequestArgs,
+        };
+        use zkapi_core::merkle::MerkleTree;
+        let processor = browser_processor(None);
         let config = BrowserWalletConfig {
             protocol_version: 2,
+            ledger_backend: "evm.groth16.v1".into(),
             chain_id: 1,
             contract_address: processor.config.contract_address,
             request_charge_cap: 400_000,
@@ -3425,38 +4032,86 @@ mod tests {
             processor.validate_and_reserve(&changed),
             Err(ServerError::InvalidProof(_))
         ));
-        assert!(processor
-            .validate_and_reserve(&prepared.request)
-            .unwrap()
-            .is_none());
         let charge = processor
             .lease_charge_units(&prepared.request, 123_456)
             .unwrap();
         assert_eq!(charge, 49_383);
-        let response = processor
-            .finalize_request(
-                &prepared.request,
-                SettlementResult {
-                    status_code: 200,
-                    payload: serde_json::json!({"billing_quote":quote,"usage_credits":123456})
-                        .to_string(),
-                    charge_applied: charge,
-                    usage: None,
-                    billing_label: "native-test".into(),
+        let settlement = SettlementResult {
+            status_code: 200,
+            payload: serde_json::json!({"billing_quote":quote,"usage_credits":123456}).to_string(),
+            charge_applied: charge,
+            usage: None,
+            billing_label: "native-test".into(),
+        };
+        let serve = |processor: &RequestProcessor| {
+            processor.update_root(tree.root());
+            assert!(processor
+                .validate_and_reserve(&prepared.request)
+                .unwrap()
+                .is_none());
+            processor.settle(&prepared.request, &settlement).unwrap();
+            processor.sign_settled(&prepared.request, None)
+        };
+        let complete = |response: RequestResponseV2| {
+            zkapi_browser::complete_response(
+                &config,
+                CompleteResponseArgs {
+                    state: prepared.state.clone(),
+                    journal: journal.clone(),
+                    response,
                 },
-                0,
-                0,
             )
-            .unwrap();
-        let next = zkapi_browser::complete_response(
-            &config,
-            CompleteResponseArgs {
-                state,
-                journal,
-                response,
-            },
-        )
-        .unwrap();
+        };
+
+        let response = serve(&processor).unwrap();
+        assert_eq!(
+            response.next_anchor,
+            core::next_anchor(&prepared.request.public_inputs.request_nullifier)
+        );
+        let next = complete(response).unwrap();
         assert_eq!(next.current_balance, 2_000_000 - charge);
+
+        // withhold: settled, never signed; recovery serves no successor.
+        let withholding = browser_processor(Some(AdversaryMode::Withhold));
+        assert!(serve(&withholding).is_err());
+        let recovery = withholding
+            .recover_by_client_id("native-real-proof")
+            .await
+            .unwrap();
+        assert_eq!(recovery.nullifier_status, "reserved");
+        assert!(recovery.request_response.is_none());
+        assert_eq!(
+            withholding
+                .store
+                .lookup_by_nullifier(&prepared.request.public_inputs.request_nullifier)
+                .unwrap()
+                .settled_charge,
+            Some(charge)
+        );
+
+        for (mode, rule) in [
+            (AdversaryMode::RandomAnchor, "S4"),
+            (AdversaryMode::BornSpent, "S4"),
+            (AdversaryMode::Overcharge, "S3"),
+        ] {
+            let adversary = browser_processor(Some(mode));
+            let response = serve(&adversary).unwrap();
+            match mode {
+                AdversaryMode::BornSpent => assert_eq!(response.next_anchor, Felt252::ONE),
+                AdversaryMode::Overcharge => assert_eq!(
+                    response.charge_applied,
+                    prepared.request.public_inputs.solvency_bound + 1
+                ),
+                _ => assert_ne!(
+                    response.next_anchor,
+                    core::next_anchor(&prepared.request.public_inputs.request_nullifier)
+                ),
+            }
+            let error = complete(response).unwrap_err().to_string();
+            assert!(
+                error.contains("invalid_successor") && error.contains(rule),
+                "{mode:?}: {error}"
+            );
+        }
     }
 }

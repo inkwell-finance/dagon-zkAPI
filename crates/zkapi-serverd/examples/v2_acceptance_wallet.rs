@@ -5,7 +5,10 @@
 //! does no networking and never reads an existing wallet or signing credential.
 //! It calls the same pure wallet operations used by the browser SDK. Named
 //! snapshots deliberately retain a genuine server-signed state for the stale
-//! escape scenario; the helper never constructs a synthetic signed state.
+//! escape scenarios; the helper never constructs a synthetic signed state.
+//! Exits are leaf-bound: `prepare_withdrawal` takes `conceded` and
+//! `valid_until`, needs no Merkle path, and returns `inputs_abi`, the
+//! 18-word ABI tuple `Types.WithdrawalPublicInputs`.
 
 use anyhow::{bail, ensure, Context, Result};
 use base64::Engine;
@@ -21,7 +24,39 @@ use zkapi_browser::{
     PendingRequestJournal, PrepareRequestArgs, PrepareWithdrawalArgs, TreeSnapshot,
 };
 use zkapi_proof::compact::{CompactSigner, RequestProver, CIRCUIT_ID};
-use zkapi_types::Felt252;
+use zkapi_types::{Felt252, WithdrawalPublicInputsV2};
+
+/// ABI-encode `Types.WithdrawalPublicInputs` (18 static words; the packed
+/// note fields of the proof are unpacked into noteId, depositAmount, expiryTs).
+fn withdrawal_tuple_abi(inputs: &WithdrawalPublicInputsV2) -> String {
+    let words = [
+        Felt252::from_u64(inputs.protocol_version as u64),
+        Felt252::from_u64(inputs.chain_id),
+        inputs.contract_address,
+        inputs.registration,
+        inputs.state_signing_key_x,
+        inputs.state_signing_key_y,
+        inputs.clearance_signing_key_x,
+        inputs.clearance_signing_key_y,
+        Felt252::from_u64(inputs.note_id as u64),
+        Felt252::from_u128(inputs.deposit_amount),
+        Felt252::from_u64(inputs.expiry_ts),
+        Felt252::from_u128(inputs.final_balance),
+        inputs.destination_field(),
+        inputs.withdrawal_nullifier,
+        Felt252::from_u64(inputs.has_clearance as u64),
+        inputs.next_nullifier,
+        Felt252::from_u128(inputs.conceded),
+        Felt252::from_u64(inputs.valid_until),
+    ];
+    format!(
+        "0x{}",
+        words
+            .iter()
+            .map(|value| hex::encode(value.as_bytes()))
+            .collect::<String>()
+    )
+}
 
 struct WalletDriver {
     setup: PathBuf,
@@ -66,6 +101,7 @@ impl WalletDriver {
         json!({
             "state": zkapi_browser::wallet_status(self.state.as_ref(), self.journal.as_ref()),
             "withdrawal_nullifier": self.state.as_ref().map(zkapi_browser::withdrawal_nullifier),
+            "successor_nullifier": self.state.as_ref().map(zkapi_browser::successor_nullifier),
             "pending_request": self.journal.is_some(),
         })
     }
@@ -89,8 +125,8 @@ impl WalletDriver {
                     "only protocol v2 is supported"
                 );
                 ensure!(
-                    config.chain_id == 31_337,
-                    "acceptance wallet requires local chain 31337"
+                    config.chain_id == 11_155_111,
+                    "acceptance wallet requires the signer-compatible local chain ID 11155111"
                 );
                 ensure!(
                     !config.contract_address.is_zero(),
@@ -141,6 +177,9 @@ impl WalletDriver {
                         .as_ref()
                         .context("missing request prover")?,
                 )?;
+                // The request's bound is recorded at its state (C2) together
+                // with the journal.
+                self.state = Some(prepared.state);
                 self.journal = Some(prepared.journal);
                 Ok(json!({"request": prepared.request}))
             }
@@ -173,9 +212,10 @@ impl WalletDriver {
                     "snapshot already exists"
                 );
                 let state = self.state.as_ref().context("confirm a deposit first")?;
+                // Genesis or a verified server-signed state: both are genuine.
                 ensure!(
-                    !state.is_genesis && state.state_signature.is_some(),
-                    "a stale-state snapshot requires a verified server settlement"
+                    state.is_genesis || state.state_signature.is_some(),
+                    "a stale-state snapshot requires a genuine state"
                 );
                 self.snapshots.insert(name.to_string(), state.clone());
                 Ok(
@@ -200,9 +240,11 @@ impl WalletDriver {
                         snapshot
                     }
                     None => {
+                        // An escape may leave with the request it made at this
+                        // state still unanswered (a withheld successor).
                         ensure!(
-                            self.journal.is_none(),
-                            "settle the pending request before honest withdrawal"
+                            self.journal.is_none() || args.mode == "escape",
+                            "settle the pending request before a mutual close"
                         );
                         self.state.as_ref().context("confirm a deposit first")?
                     }
@@ -220,14 +262,7 @@ impl WalletDriver {
                         .as_deref()
                         .context("missing withdrawal key")?,
                 )?;
-                let inputs_abi = format!(
-                    "0x{}",
-                    plan.public_inputs
-                        .to_field_elements()
-                        .iter()
-                        .map(|value| hex::encode(value.as_bytes()))
-                        .collect::<String>()
-                );
+                let inputs_abi = withdrawal_tuple_abi(&plan.public_inputs);
                 let proof_hex = format!(
                     "0x{}",
                     hex::encode(

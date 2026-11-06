@@ -1,19 +1,22 @@
 [package]
 name = "zkapi-indexerd"
-description = "zkAPI indexer daemon: mirrors on-chain events into a local Merkle tree view and serves root/siblings"
+description = "Dagon zkAPI indexer: mirrors the Solana vault into a privacy-safe Merkle snapshot"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "zkapi-indexerd"
+name = "dagon-zkapi-indexerd"
 path = "src/main.rs"
 
 [dependencies]
+dagon-zkapi-vault = { path = "../../solana/programs/dagon-zkapi-vault", features = ["no-entrypoint"] }
 zkapi-types = { path = "../../protocol/rust/crates/zkapi-types" }
 zkapi-core = { path = "../../protocol/rust/crates/zkapi-core" }
+anchor-lang = "=0.32.1"
 anyhow = { workspace = true }
 axum = { workspace = true }
+base64 = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }

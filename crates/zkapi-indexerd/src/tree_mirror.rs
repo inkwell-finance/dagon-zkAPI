@@ -14,15 +14,16 @@ use crate::events::VaultEvent;
 pub struct TreeMirrorSnapshot {
     pub next_note_id: u32,
     pub current_leaves: Vec<Felt252>,
-    pub original_leaves: Vec<(u32, Felt252)>,
 }
 
 /// A mirror of the on-chain Merkle tree, maintained by consuming events.
+///
+/// Exits are leaf-bound and root-free: escape, defeat, raise, finalize,
+/// mutual close and expiry claims leave the leaf in place. Only a deposit
+/// inserts a leaf and only `ClosedLeafRetired` removes one.
 pub struct TreeMirror {
     tree: MerkleTree,
     next_note_id: u32,
-    /// Original leaf values for each note (needed for challenge restores).
-    original_leaves: std::collections::HashMap<u32, Felt252>,
 }
 
 impl TreeMirror {
@@ -30,7 +31,6 @@ impl TreeMirror {
         Self {
             tree: MerkleTree::new(),
             next_note_id: 0,
-            original_leaves: std::collections::HashMap::new(),
         }
     }
 
@@ -56,19 +56,11 @@ impl TreeMirror {
             .collect()
     }
 
-    /// Capture all state needed to restore paths and challengeable leaves.
+    /// Capture all state needed to restore paths.
     pub fn snapshot(&self) -> TreeMirrorSnapshot {
-        let mut original_leaves: Vec<_> = self
-            .original_leaves
-            .iter()
-            .map(|(note_id, leaf)| (*note_id, *leaf))
-            .collect();
-        original_leaves.sort_unstable_by_key(|(note_id, _)| *note_id);
-
         TreeMirrorSnapshot {
             next_note_id: self.next_note_id,
             current_leaves: self.current_leaves(),
-            original_leaves,
         }
     }
 
@@ -81,13 +73,6 @@ impl TreeMirror {
                 snapshot.next_note_id
             ));
         }
-        if snapshot
-            .original_leaves
-            .iter()
-            .any(|(note_id, _)| *note_id >= snapshot.next_note_id)
-        {
-            return Err("snapshot contains an original leaf beyond next_note_id".to_string());
-        }
 
         let mut tree = MerkleTree::new();
         for (note_id, leaf) in snapshot.current_leaves.iter().copied().enumerate() {
@@ -99,7 +84,6 @@ impl TreeMirror {
         Ok(Self {
             tree,
             next_note_id: snapshot.next_note_id,
-            original_leaves: snapshot.original_leaves.into_iter().collect(),
         })
     }
 
@@ -131,28 +115,19 @@ impl TreeMirror {
             } => {
                 let leaf = compute_note_leaf(*note_id, commitment, *amount, *expiry_ts);
                 self.tree.set_leaf(*note_id, leaf);
-                self.original_leaves.insert(*note_id, leaf);
                 self.next_note_id = self.next_note_id.max(note_id.saturating_add(1));
             }
-            VaultEvent::MutualClose { note_id, .. } => {
+            VaultEvent::ClosedLeafRetired { note_id, .. } => {
                 self.tree.set_leaf(*note_id, Felt252::ZERO);
             }
-            VaultEvent::EscapeWithdrawalInitiated { note_id, .. } => {
-                // Leaf is zeroed immediately on initiation
-                self.tree.set_leaf(*note_id, Felt252::ZERO);
-            }
-            VaultEvent::EscapeWithdrawalChallenged { note_id, .. } => {
-                // Restore the original leaf
-                if let Some(original) = self.original_leaves.get(note_id) {
-                    self.tree.set_leaf(*note_id, *original);
-                }
-            }
-            VaultEvent::EscapeWithdrawalFinalized { .. } => {
-                // Leaf was already zeroed during initiation, nothing more to do
-            }
-            VaultEvent::ExpiredClaimed { note_id, .. } => {
-                self.tree.set_leaf(*note_id, Felt252::ZERO);
-            }
+            VaultEvent::MutualClose { .. }
+            | VaultEvent::EscapeWithdrawalInitiated { .. }
+            | VaultEvent::EscapeWithdrawalDefeated { .. }
+            | VaultEvent::EscapeConcessionRaised { .. }
+            | VaultEvent::EscapeWithdrawalFinalized { .. }
+            | VaultEvent::ExpiredClaimed { .. }
+            | VaultEvent::VaultPaused { .. }
+            | VaultEvent::VaultUnpaused { .. } => {}
         }
     }
 }
@@ -167,122 +142,116 @@ impl Default for TreeMirror {
 mod tests {
     use super::*;
 
+    fn deposit(note_id: u32) -> VaultEvent {
+        VaultEvent::NoteDeposited {
+            note_id,
+            commitment: Felt252::from_u64(100 + note_id as u64),
+            amount: 1_000,
+            expiry_ts: 1_700_000_000,
+            new_root: Felt252::ZERO,
+        }
+    }
+
+    /// Exits never remove a leaf: a defeated escape returns the note to
+    /// Active with its leaf intact, and a front-running deposit cannot change
+    /// anything an exit depends on.
     #[test]
-    fn test_deposit_and_close() {
+    fn exits_and_disputes_keep_the_leaf_and_only_retirement_removes_it() {
         let mut mirror = TreeMirror::new();
-        let commitment = Felt252::from_u64(12345);
-
-        // Deposit
-        mirror.process_event(&VaultEvent::NoteDeposited {
-            note_id: 0,
-            commitment,
-            amount: 1000,
-            expiry_ts: 1700000000,
-            new_root: Felt252::ZERO, // We don't use this
-        });
-
+        mirror.process_event(&deposit(0));
         let root_after_deposit = mirror.root();
         assert_ne!(root_after_deposit, MerkleTree::new().root());
-
-        // Close
-        mirror.process_event(&VaultEvent::MutualClose {
+        let nullifier = Felt252::from_u64(999);
+        for event in [
+            VaultEvent::EscapeWithdrawalInitiated {
+                note_id: 0,
+                nullifier,
+                next_nullifier: Felt252::from_u64(1_000),
+                final_balance: 900,
+                conceded: 0,
+                challenge_deadline: 1_700_086_400,
+            },
+            VaultEvent::EscapeConcessionRaised {
+                note_id: 0,
+                nullifier,
+                conceded: 50,
+                final_balance: 850,
+            },
+            VaultEvent::EscapeWithdrawalDefeated {
+                note_id: 0,
+                nullifier,
+                next_nullifier: Felt252::from_u64(1_000),
+            },
+            VaultEvent::MutualClose {
+                note_id: 0,
+                nullifier: Felt252::from_u64(1_001),
+                final_balance: 900,
+            },
+            VaultEvent::EscapeWithdrawalFinalized {
+                note_id: 0,
+                nullifier,
+                final_balance: 850,
+            },
+            VaultEvent::ExpiredClaimed {
+                note_id: 0,
+                deposit_amount: 1_000,
+            },
+            VaultEvent::VaultPaused { paused_at: 1 },
+            VaultEvent::VaultUnpaused { unpaused_at: 2 },
+        ] {
+            mirror.process_event(&event);
+            assert_eq!(mirror.root(), root_after_deposit, "{event:?}");
+        }
+        mirror.process_event(&VaultEvent::ClosedLeafRetired {
             note_id: 0,
-            nullifier: Felt252::from_u64(999),
-            final_balance: 900,
+            new_root: MerkleTree::new().root(),
         });
-
-        // Should be back to empty
+        assert!(mirror.get_leaf(0).is_zero());
         assert_eq!(mirror.root(), MerkleTree::new().root());
     }
 
     #[test]
-    fn test_escape_and_challenge() {
+    fn retirement_after_unrelated_deposit_keeps_the_other_leaf() {
         let mut mirror = TreeMirror::new();
-        let commitment = Felt252::from_u64(12345);
-
-        // Deposit
-        mirror.process_event(&VaultEvent::NoteDeposited {
+        mirror.process_event(&deposit(0));
+        mirror.process_event(&deposit(1));
+        let leaf1 = mirror.get_leaf(1);
+        mirror.process_event(&VaultEvent::ClosedLeafRetired {
             note_id: 0,
-            commitment,
-            amount: 1000,
-            expiry_ts: 1700000000,
             new_root: Felt252::ZERO,
         });
-        let root_after_deposit = mirror.root();
-
-        // Escape withdrawal initiation (zeroes leaf)
-        mirror.process_event(&VaultEvent::EscapeWithdrawalInitiated {
-            note_id: 0,
-            nullifier: Felt252::from_u64(999),
-            final_balance: 900,
-            challenge_deadline: 1700086400,
-            new_root: Felt252::ZERO,
-        });
-        assert_ne!(mirror.root(), root_after_deposit);
-
-        // Challenge (restores leaf)
-        mirror.process_event(&VaultEvent::EscapeWithdrawalChallenged {
-            note_id: 0,
-            nullifier: Felt252::from_u64(999),
-            restored_root: Felt252::ZERO,
-        });
-        assert_eq!(mirror.root(), root_after_deposit);
+        let mut expected = MerkleTree::new();
+        expected.set_leaf(1, leaf1);
+        assert_eq!(mirror.root(), expected.root());
     }
 
     #[test]
     fn test_multiple_deposits() {
         let mut mirror = TreeMirror::new();
-
         for i in 0..5 {
-            mirror.process_event(&VaultEvent::NoteDeposited {
-                note_id: i,
-                commitment: Felt252::from_u64(i as u64 + 100),
-                amount: 1000,
-                expiry_ts: 1700000000,
-                new_root: Felt252::ZERO,
-            });
+            mirror.process_event(&deposit(i));
         }
-
-        // All leaves should be accessible
         for i in 0..5 {
-            let leaf = mirror.get_leaf(i);
-            assert!(!leaf.is_zero());
+            assert!(!mirror.get_leaf(i).is_zero());
         }
     }
 
     #[test]
-    fn snapshot_round_trip_preserves_current_and_original_leaves() {
+    fn snapshot_round_trip_preserves_current_leaves() {
         let mut mirror = TreeMirror::new();
         for note_id in 0..3 {
-            mirror.process_event(&VaultEvent::NoteDeposited {
-                note_id,
-                commitment: Felt252::from_u64(100 + note_id as u64),
-                amount: 1_000,
-                expiry_ts: 1_700_000_000,
-                new_root: Felt252::ZERO,
-            });
+            mirror.process_event(&deposit(note_id));
         }
-        mirror.process_event(&VaultEvent::EscapeWithdrawalInitiated {
+        mirror.process_event(&VaultEvent::ClosedLeafRetired {
             note_id: 1,
-            nullifier: Felt252::from_u64(999),
-            final_balance: 900,
-            challenge_deadline: 1_700_086_400,
             new_root: Felt252::ZERO,
         });
-
         let expected_root = mirror.root();
         let expected_path = mirror.get_path(2);
         let restored = TreeMirror::from_snapshot(mirror.snapshot()).unwrap();
         assert_eq!(restored.root(), expected_root);
         assert_eq!(restored.next_note_id(), 3);
         assert_eq!(restored.get_path(2), expected_path);
-
-        let mut restored = restored;
-        restored.process_event(&VaultEvent::EscapeWithdrawalChallenged {
-            note_id: 1,
-            nullifier: Felt252::from_u64(999),
-            restored_root: Felt252::ZERO,
-        });
-        assert!(!restored.get_leaf(1).is_zero());
+        assert!(restored.get_leaf(1).is_zero());
     }
 }
