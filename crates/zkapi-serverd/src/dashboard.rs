@@ -1,7 +1,7 @@
 //! Live dashboard feed for the zkAPI server.
 //!
 //! Events expose lease authorizations, proof bindings, aggregate upstream cost,
-//! whole-gwei settlement, and signed state transitions. Inference prompts stay
+//! whole-lamport settlement, and signed state transitions. Inference prompts stay
 //! between the client and its leased upstream key. This bounded feed is
 //! observability only and does not affect protocol state.
 
@@ -42,7 +42,7 @@ pub struct DashboardEvent {
     pub response_text: String,
     pub response_hash: Felt252,
 
-    // --- aggregate upstream cost and gwei billing ---
+    // --- aggregate upstream cost and lamport billing ---
     pub usage: Option<UsageInfo>,
     pub charge_applied: u128,
     pub charge_usd: f64,
@@ -61,7 +61,7 @@ pub struct DashboardEvent {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DashboardTotals {
     pub request_count: u64,
-    pub total_gwei_charged: u128,
+    pub total_lamports_charged: u128,
     pub total_cost_usd: f64,
 }
 
@@ -100,8 +100,8 @@ impl DashboardHub {
         {
             let mut totals = self.totals.lock().unwrap();
             totals.request_count += 1;
-            totals.total_gwei_charged = totals
-                .total_gwei_charged
+            totals.total_lamports_charged = totals
+                .total_lamports_charged
                 .saturating_add(event.charge_applied);
             totals.total_cost_usd += event.charge_usd;
         }
@@ -186,8 +186,8 @@ mod tests {
         }
         let totals = hub.totals();
         assert_eq!(totals.request_count, 3);
-        assert_eq!(totals.total_gwei_charged, 6); // 1 + 2 + 3
-                                                  // Ring buffer capped at 2.
+        assert_eq!(totals.total_lamports_charged, 6); // 1 + 2 + 3
+                                                      // Ring buffer capped at 2.
         assert_eq!(hub.recent().len(), 2);
     }
 

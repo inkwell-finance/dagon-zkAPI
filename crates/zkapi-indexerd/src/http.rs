@@ -1,71 +1,67 @@
 //! Axum HTTP server for the tree indexer.
 
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use dagon_zkapi_profile::{NetworkIdentity, SharedProfile};
 use zkapi_types::Felt252;
 
-use crate::poller::{spawn_json_rpc_log_poller, PollerConfig};
 use crate::service::{
     IndexerService, NextNoteIdResponse, TreePathResponse, TreeRootResponse, TreeSnapshotResponse,
 };
-use crate::solana_poller::{spawn_solana_account_poller, SolanaPollerConfig};
+use crate::solana_poller::{spawn_solana_account_poller, SolanaAccountPoller, SolanaPollerConfig};
 use crate::tree_mirror::TreeMirror;
-
-#[derive(Debug, Clone)]
-pub enum IndexerLedger {
-    Ethereum(PollerConfig),
-    Solana(SolanaPollerConfig),
-    Disabled,
-}
 
 /// Runtime configuration for the indexer HTTP server.
 #[derive(Debug, Clone)]
 pub struct IndexerConfig {
     pub listen_addr: String,
     pub poll_interval_ms: u64,
-    pub ledger: IndexerLedger,
+    pub ledger: SolanaPollerConfig,
 }
 
-impl Default for IndexerConfig {
-    fn default() -> Self {
-        let poller = PollerConfig::default();
-        Self {
-            listen_addr: "0.0.0.0:3001".to_string(),
-            poll_interval_ms: 1_000,
-            ledger: IndexerLedger::Ethereum(poller),
-        }
+impl IndexerConfig {
+    /// The embedded profile's vault under the network identity at `path`.
+    pub fn from_identity_file(
+        path: &Path,
+        rpc_url: String,
+        listen_addr: String,
+        poll_interval_ms: u64,
+    ) -> anyhow::Result<Self> {
+        let profile = SharedProfile::embedded();
+        let identity = NetworkIdentity::load(path)?.resolve(profile)?;
+        Ok(Self {
+            listen_addr,
+            poll_interval_ms,
+            ledger: SolanaPollerConfig::from_identity(rpc_url, profile, &identity),
+        })
     }
 }
 
 type AppState = Arc<IndexerService>;
 
+/// Check the RPC's cluster, then serve the tree while polling the vault.
 pub async fn run_indexer(config: IndexerConfig) -> anyhow::Result<()> {
-    let polling_enabled = !matches!(config.ledger, IndexerLedger::Disabled);
-    let mirror = Arc::new(RwLock::new(TreeMirror::new()));
-    let service = Arc::new(if polling_enabled {
-        IndexerService::new_syncing(mirror)
-    } else {
-        IndexerService::new(mirror)
-    });
-    match config.ledger {
-        IndexerLedger::Ethereum(poller) => spawn_json_rpc_log_poller(
-            service.clone(),
-            poller,
-            Duration::from_millis(config.poll_interval_ms),
-        ),
-        IndexerLedger::Solana(poller) => spawn_solana_account_poller(
-            service.clone(),
-            poller,
-            Duration::from_millis(config.poll_interval_ms),
-        ),
-        IndexerLedger::Disabled => {}
-    }
+    anyhow::ensure!(
+        config.poll_interval_ms > 0,
+        "poll interval must be positive"
+    );
+    let poller = SolanaAccountPoller::new(config.ledger)?;
+    poller.assert_cluster().await?;
+    let service = Arc::new(IndexerService::new_syncing(Arc::new(RwLock::new(
+        TreeMirror::new(),
+    ))));
+    spawn_solana_account_poller(
+        service.clone(),
+        poller,
+        Duration::from_millis(config.poll_interval_ms),
+    );
 
     let router = create_router(service);
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
@@ -126,7 +122,7 @@ async fn handle_next_note_id(
 
 async fn handle_note_path(
     State(service): State<AppState>,
-    Path(note_id): Path<u32>,
+    UrlPath(note_id): UrlPath<u32>,
 ) -> Result<Json<TreePathResponse>, StatusCode> {
     ensure_ready(&service)?;
     Ok(Json(TreePathResponse {
@@ -138,7 +134,7 @@ async fn handle_note_path(
 
 async fn handle_zero_path(
     State(service): State<AppState>,
-    Path(note_id): Path<u32>,
+    UrlPath(note_id): UrlPath<u32>,
 ) -> Result<Json<TreePathResponse>, StatusCode> {
     ensure_ready(&service)?;
     Ok(Json(TreePathResponse {
@@ -159,20 +155,36 @@ fn ensure_ready(service: &IndexerService) -> Result<(), StatusCode> {
 mod tests {
     use super::*;
 
-    use crate::events::VaultEvent;
+    use crate::tree_mirror::TreeMirrorSnapshot;
+
+    /// A ready service holding `count` deposited leaves.
+    fn service_with_leaves(count: u32) -> Arc<IndexerService> {
+        let service = Arc::new(IndexerService::new_syncing(Arc::new(RwLock::new(
+            TreeMirror::new(),
+        ))));
+        let current_leaves = (0..count)
+            .map(|note_id| {
+                zkapi_core::leaf::compute_note_leaf(
+                    note_id,
+                    &Felt252::from_u64(100 + note_id as u64),
+                    100,
+                    1_700_000_000,
+                )
+            })
+            .collect();
+        service.replace(
+            TreeMirror::from_snapshot(TreeMirrorSnapshot {
+                next_note_id: count,
+                current_leaves,
+            })
+            .unwrap(),
+        );
+        service
+    }
 
     #[tokio::test]
     async fn test_zero_path_endpoint_returns_zero_leaf() {
-        let service = Arc::new(IndexerService::new(Arc::new(
-            RwLock::new(TreeMirror::new()),
-        )));
-        service.process_event(&VaultEvent::NoteDeposited {
-            note_id: 0,
-            commitment: Felt252::from_u64(10),
-            amount: 100,
-            expiry_ts: 1_700_000_000,
-            new_root: Felt252::from_u64(1),
-        });
+        let service = service_with_leaves(1);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -198,18 +210,7 @@ mod tests {
     async fn snapshot_lets_a_client_rebuild_paths_locally() {
         use zkapi_core::merkle::MerkleTree;
 
-        let service = Arc::new(IndexerService::new(Arc::new(
-            RwLock::new(TreeMirror::new()),
-        )));
-        for nid in 0..3u32 {
-            service.process_event(&VaultEvent::NoteDeposited {
-                note_id: nid,
-                commitment: Felt252::from_u64(100 + nid as u64),
-                amount: 100,
-                expiry_ts: 1_700_000_000,
-                new_root: Felt252::from_u64(1),
-            });
-        }
+        let service = service_with_leaves(3);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

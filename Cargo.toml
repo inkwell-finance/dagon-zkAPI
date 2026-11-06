@@ -2,6 +2,9 @@
 resolver = "2"
 members = [
     "crates/dagon-zkapi-ledger",
+    "crates/dagon-zkapi-profile",
+    "crates/dagon-zkapi-deploy",
+    "crates/dagon-zkapi-pyth-pusher",
     "crates/dagon-zkapi-solana",
     "crates/dagon-zkapi-solana-ledger",
     "crates/zkapi-cli",

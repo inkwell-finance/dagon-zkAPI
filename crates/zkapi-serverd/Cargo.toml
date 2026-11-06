@@ -1,6 +1,6 @@
 [package]
 name = "zkapi-serverd"
-description = "Dagon zkAPI server: Groth16 request authorization and CreditLedger settlement"
+description = "Dagon zkAPI Solana server: Groth16 request authorization, Pyth-priced leases and vault challenger"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -16,6 +16,7 @@ adversary = []
 
 [dependencies]
 dagon-zkapi-ledger = { path = "../dagon-zkapi-ledger" }
+dagon-zkapi-profile = { path = "../dagon-zkapi-profile" }
 dagon-zkapi-solana-ledger = { path = "../dagon-zkapi-solana-ledger" }
 # Official receiver 1.2.0 uses the vault's Anchor 0.32.1; no version alias.
 pyth-solana-receiver-sdk = "=1.2.0"

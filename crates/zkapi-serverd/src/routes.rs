@@ -64,127 +64,70 @@ pub async fn run_server(mut config: crate::config::ServerConfig) -> anyhow::Resu
     if let Some(password) = TestnetPassword::from_env()? {
         config.testnet_password = Some(password);
     }
-    config.validate_native_mode()?;
+    config.validate()?;
     let signer = Arc::new(crate::signer::ServerSigner::new(
         &config.state_seed,
         &config.clear_seed,
     ));
     // No durable state, worker, or HTTP listener exists during preflight.
-    let solana = if config.backend == crate::config::LedgerBackend::Solana {
-        Some(prepare_solana_backends(&config, &signer).await?)
-    } else {
-        prepare_evm_backend(&config).await?;
-        None
-    };
-    let initial_root = if let Some(backends) = &solana {
-        backends.initial_root
-    } else if let Some(indexer_url) = config.indexer_url.as_deref() {
-        match fetch_indexer_root(indexer_url).await {
-            Ok(root) => root,
-            Err(err) => {
-                tracing::warn!("failed to fetch initial root from indexer: {}", err);
-                config.initial_root
-            }
-        }
-    } else {
-        config.initial_root
-    };
+    let backends = prepare_solana_backends(&config, &signer).await?;
     let store = Arc::new(crate::nullifier_store::NullifierStore::new(
         &config.db_path,
     )?);
     let dashboard = Arc::new(DashboardHub::new(500));
-    let processor = match solana {
-        Some(backends) => RequestProcessor::try_new_with_backends(
-            config.clone(),
-            store,
-            signer,
-            initial_root,
-            backends.ledger,
-            backends.billing,
-        )?,
-        None => RequestProcessor::try_new(config.clone(), store, signer, initial_root)?,
-    };
+    let processor = RequestProcessor::try_new(
+        config.clone(),
+        store,
+        signer,
+        backends.initial_root,
+        backends.ledger,
+        backends.billing,
+    )?;
     let processor = Arc::new(processor.with_dashboard(dashboard));
-    if config.indexer_url.is_some() || config.backend == crate::config::LedgerBackend::Solana {
-        if let Err(err) = processor
-            .refresh_ledger_state(if config.backend == crate::config::LedgerBackend::Solana {
-                LedgerCommitment::Finalized
-            } else {
-                LedgerCommitment::Tip
-            })
-            .await
-        {
-            tracing::warn!(
-                "failed to confirm initial root through credit ledger: {}",
-                err
-            );
-        }
-        spawn_root_poller(
-            processor.clone(),
-            Duration::from_millis(config.root_poll_interval_ms),
-        );
-    }
-    if let Some(lease) = config.openrouter_leases.as_ref() {
-        spawn_openrouter_lease_settler(
-            processor.clone(),
-            Duration::from_secs(lease.settlement_poll_seconds.max(1)),
-        );
-    }
+    spawn_root_poller(
+        processor.clone(),
+        Duration::from_millis(config.root_poll_interval_ms),
+    );
+    spawn_openrouter_lease_settler(
+        processor.clone(),
+        Duration::from_secs(config.profile.server.settlement_poll_seconds.max(1)),
+    );
     let router = create_router(processor);
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
-    tracing::info!("Server listening on {}", config.listen_addr);
+    tracing::info!(
+        network = %config.network,
+        "Server listening on {}",
+        config.listen_addr
+    );
     axum::serve(listener, router).await?;
     Ok(())
 }
 
-/// Fail-closed EVM startup read: the configured challenge period must be the
-/// vault's immutable `challengePeriod()`.
-pub async fn prepare_evm_backend(config: &crate::config::ServerConfig) -> anyhow::Result<()> {
-    config.validate_native_mode()?;
-    anyhow::ensure!(
-        config.backend == crate::config::LedgerBackend::Evm,
-        "expected EVM mode"
-    );
-    let vault_period = crate::native_billing::NativeBillingOracle::for_server(config)?
-        .vault_challenge_period()
-        .await
-        .map_err(|error| anyhow::anyhow!("vault challenge period read failed: {error}"))?;
-    crate::config::check_vault_challenge_period(config.challenge_period_seconds, vault_period)
-}
-
 pub struct ValidatedSolanaBackends {
     pub ledger: Arc<dyn dagon_zkapi_ledger::CreditLedger>,
-    pub billing: Arc<dyn crate::native_billing::billing::BillingPriceSource>,
+    pub billing: Arc<dyn crate::billing::BillingPriceSource>,
     pub initial_root: Felt252,
 }
 
 /// Fail-closed authoritative startup reads; deliberately independent of SQLite.
+///
+/// The finalized deployment must be the profile's (identity genesis hash,
+/// immutable program with the profile's executable hash, vault parameters),
+/// the vault must be unpaused and pin this server's signing keys, and the
+/// identity's Pyth account must yield a fresh, fully verified quote.
 pub async fn prepare_solana_backends(
     config: &crate::config::ServerConfig,
     signer: &crate::signer::ServerSigner,
 ) -> anyhow::Result<ValidatedSolanaBackends> {
-    use crate::native_billing::billing::{BillingPriceSource, SolanaBillingPins};
-    use dagon_zkapi_ledger::CreditLedger;
-    config.validate_native_mode()?;
-    anyhow::ensure!(
-        config.backend == crate::config::LedgerBackend::Solana,
-        "expected Solana mode"
-    );
-    let solana = config.solana.as_ref().expect("validated Solana config");
+    use crate::billing::BillingPriceSource;
+    config.validate()?;
     let ledger = Arc::new(dagon_zkapi_solana_ledger::SolanaCreditLedger::new(
-        solana.ledger.clone(),
+        config.ledger_config(),
     )?);
-    ledger.assert_immutable_program().await?;
-    let view = ledger.finalized_vault().await?;
+    let view = ledger
+        .assert_profile_deployment(&config.profile, &config.identity)
+        .await?;
     anyhow::ensure!(!view.paused, "Solana vault is paused");
-    anyhow::ensure!(
-        u128::from(view.request_charge_cap) == config.request_charge_cap,
-        "Solana vault request charge cap mismatch"
-    );
-    crate::config::check_vault_challenge_period(
-        config.challenge_period_seconds,
-        view.challenge_period,
-    )?;
     let state_key = signer.state_public_key();
     let clearance_key = signer.clearance_public_key();
     anyhow::ensure!(
@@ -196,24 +139,7 @@ pub async fn prepare_solana_backends(
             && view.clearance_signing_key_y == clearance_key.y,
         "Solana vault clearance signing key mismatch"
     );
-    let deployment = ledger.deployment();
-    let pins = SolanaBillingPins {
-        chain_id: deployment.chain_id,
-        deployment_binding: deployment.protocol_binding,
-        backend: deployment.backend.clone(),
-        network: deployment.network.clone(),
-        vault: bs58::encode(solana.ledger.vault_state).into_string(),
-        feed_account: solana.billing.price_account.clone(),
-        receiver_program: solana.billing.receiver_program.clone(),
-        max_age_seconds: solana.billing.max_age_seconds,
-        max_confidence_bps: solana.billing.max_confidence_bps,
-    };
-    let billing = Arc::new(crate::sol_billing::PythBillingOracle::new(
-        solana.ledger.rpc_url.clone(),
-        solana.ledger.genesis_hash,
-        solana.billing.clone(),
-        pins,
-    )?);
+    let billing = Arc::new(crate::sol_billing::PythBillingOracle::new(config)?);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
@@ -232,8 +158,8 @@ pub async fn prepare_solana_backends(
 /// Create the Axum router with all zkAPI server routes.
 pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
     let password = processor.config().testnet_password.clone();
-    // Preserve the local dashboard's existing CORS policy. Password-gated
-    // Sepolia additionally permits explicit credential headers below.
+    // Preserve the local dashboard's existing CORS policy. A password-gated
+    // testnet additionally permits explicit credential headers below.
     let dashboard = Router::new()
         .route("/v1/dashboard/summary", get(handle_dashboard_summary))
         .route("/v1/dashboard/recent", get(handle_dashboard_recent))
@@ -250,7 +176,7 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
                 .allow_methods([Method::GET, Method::HEAD]),
         )
         .route("/v2/auth", get(handle_auth_check))
-        .route("/v2/billing/quote", get(handle_native_billing_quote))
+        .route("/v2/billing/quote", get(handle_billing_quote))
         .route("/v2/openrouter/leases", post(handle_openrouter_lease))
         .route(
             "/v2/openrouter/leases/{client_request_id}",
@@ -340,9 +266,9 @@ async fn handle_health(State(processor): State<AppState>) -> Json<HealthResponse
     let config = processor.config();
     Json(HealthResponse {
         status: "ok",
-        protocol_version: config.protocol_version,
-        chain_id: config.chain_id,
-        contract_address: config.contract_address,
+        protocol_version: config.protocol_version(),
+        chain_id: config.chain_id(),
+        contract_address: config.contract_address(),
         current_root: processor.current_root(),
         provider: "native_leases",
         indexer_url: config.indexer_url.clone(),
@@ -357,9 +283,9 @@ async fn handle_attestation(State(processor): State<AppState>) -> Json<Attestati
     let config = processor.config();
     Json(AttestationResponse {
         status: "ok",
-        protocol_version: config.protocol_version,
-        chain_id: config.chain_id,
-        contract_address: config.contract_address,
+        protocol_version: config.protocol_version(),
+        chain_id: config.chain_id(),
+        contract_address: config.contract_address(),
         current_root: processor.current_root(),
         state_signing_key: processor.state_signing_key(),
         clearance_signing_key: processor.clearance_signing_key(),
@@ -459,17 +385,11 @@ async fn handle_native_lease_expiry(
     Ok((headers, Json(status)))
 }
 
-async fn handle_native_billing_quote(
+async fn handle_billing_quote(
     State(processor): State<AppState>,
-) -> Result<
-    (
-        HeaderMap,
-        Json<crate::native_billing::billing::BillingQuote>,
-    ),
-    ErrorHttpResponse,
-> {
+) -> Result<(HeaderMap, Json<crate::billing::BillingQuote>), ErrorHttpResponse> {
     let quote = processor
-        .native_billing_quote()
+        .billing_quote()
         .await
         .map_err(|error| error_to_response(&error, "billing-quote", &processor))?;
     let mut headers = HeaderMap::new();
@@ -646,7 +566,6 @@ struct ServerIdentity {
     billing_asset: &'static str,
     state_signing_key: CurvePointWire,
     clearance_signing_key: CurvePointWire,
-    openrouter_leases_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -660,35 +579,30 @@ struct DashboardSummary {
 /// GET /v1/dashboard/summary -- server identity + running totals.
 async fn handle_dashboard_summary(State(processor): State<AppState>) -> Json<DashboardSummary> {
     let config = processor.config();
-    let (upstream_kind, upstream_api_base) = config
-        .openrouter_leases
-        .as_ref()
-        .map(|lease| match &lease.source {
-            crate::config::OpenRouterLeaseSourceConfig::OpenRouter { api_base, .. } => {
-                (Some("openrouter".to_string()), Some(api_base.clone()))
-            }
-            crate::config::OpenRouterLeaseSourceConfig::OaOrg { org_base_url, .. } => {
-                (Some("oa_org".to_string()), Some(org_base_url.clone()))
-            }
-        })
-        .unwrap_or_default();
+    let (upstream_kind, upstream_api_base) = match &config.lease_source {
+        crate::config::OpenRouterLeaseSourceConfig::OpenRouter { api_base, .. } => {
+            ("openrouter", api_base.clone())
+        }
+        crate::config::OpenRouterLeaseSourceConfig::OaOrg { org_base_url, .. } => {
+            ("oa_org", org_base_url.clone())
+        }
+    };
     let server = ServerIdentity {
-        protocol_version: config.protocol_version,
-        chain_id: config.chain_id,
-        contract_address: config.contract_address,
+        protocol_version: config.protocol_version(),
+        chain_id: config.chain_id(),
+        contract_address: config.contract_address(),
         current_root: processor.current_root(),
         provider: "native_leases",
-        upstream_kind,
-        upstream_api_base,
+        upstream_kind: Some(upstream_kind.to_string()),
+        upstream_api_base: Some(upstream_api_base),
         auth_scheme: "state-anchor",
         policy_enabled: false,
-        request_charge_cap: config.request_charge_cap,
+        request_charge_cap: config.request_charge_cap(),
         request_charge_cap_usd: None,
         credits_per_usd: None,
-        billing_asset: "native_eth",
+        billing_asset: "native_sol",
         state_signing_key: processor.state_signing_key(),
         clearance_signing_key: processor.clearance_signing_key(),
-        openrouter_leases_enabled: processor.openrouter_leases_enabled(),
     };
     let (totals, started_ms, recent_count) = match processor.dashboard() {
         Some(hub) => (hub.totals(), hub.started_ms, hub.recent().len()),
@@ -829,13 +743,7 @@ fn spawn_root_poller(processor: Arc<RequestProcessor>, interval: Duration) {
         loop {
             ticker.tick().await;
             if let Err(err) = processor
-                .refresh_ledger_state(
-                    if processor.config().backend == crate::config::LedgerBackend::Solana {
-                        LedgerCommitment::Finalized
-                    } else {
-                        LedgerCommitment::Tip
-                    },
-                )
+                .refresh_ledger_state(LedgerCommitment::Finalized)
                 .await
             {
                 tracing::warn!("failed to refresh root through credit ledger: {}", err);
@@ -844,35 +752,19 @@ fn spawn_root_poller(processor: Arc<RequestProcessor>, interval: Duration) {
     });
 }
 
-async fn fetch_indexer_root(indexer_url: &str) -> anyhow::Result<Felt252> {
-    #[derive(serde::Deserialize)]
-    struct RootResponse {
-        root: Felt252,
-    }
-
-    let base = indexer_url.trim_end_matches('/');
-    let url = format!("{base}/v1/tree/root");
-    let response = reqwest::get(&url).await?;
-    let response = response.error_for_status()?;
-    Ok(response.json::<RootResponse>().await?.root)
-}
-
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
 
     #[tokio::test]
-    async fn startup_requires_native_billing_before_opening_database() {
+    async fn startup_rejects_an_invalid_identity_before_opening_database() {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("must-not-exist.db");
-        let config = crate::config::ServerConfig {
-            db_path: db_path.to_string_lossy().into_owned(),
-            ..Default::default()
-        };
+        let mut config = crate::test_support::config(crate::test_support::oa_source());
+        config.db_path = db_path.to_string_lossy().into_owned();
+        config.identity.vault_state = [9; 32];
         let error = run_server(config).await.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Solana ledger and Pyth configuration is required"));
+        assert!(error.to_string().contains("not the vault PDA"), "{error}");
         assert!(!db_path.exists());
     }
 

@@ -1,17 +1,17 @@
-//! Server-side logic for the zkAPI protocol.
+//! Server-side logic for the Dagon zkAPI protocol on Solana.
 //!
-//! This crate implements proof verification, nullifier storage, API execution,
-//! Baby-JubJub Schnorr signing, and HTTP routes for the zkAPI server.
+//! This crate implements proof verification, nullifier storage, prompt-private
+//! lease issuance and settlement against Pyth SOL/USD quotes, Baby-JubJub
+//! Schnorr signing, the concession-exit challenger, and the HTTP routes.
 
 #[cfg(any(test, feature = "adversary"))]
 pub mod adversary;
-pub mod challenge_service;
+pub mod billing;
 mod checkpoint;
 pub mod config;
 pub mod dashboard;
 pub mod error;
 pub mod ledger_challenge_service;
-pub mod native_billing;
 pub mod nullifier_store;
 pub mod oa_org;
 pub mod openrouter;

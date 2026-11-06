@@ -231,8 +231,8 @@ impl LedgerChallengeService {
     }
 
     /// Discover finalized obligations, persist them, then make one durable step
-    /// for every challengeable note. A failure for one note does not starve the
-    /// others because Solana does not serialize them through an EVM nonce.
+    /// for every challengeable note. Each note's transactions are independent,
+    /// so a failure for one note does not starve the others.
     pub async fn poll_once(&mut self) -> anyhow::Result<()> {
         let pending = self
             .ledger
@@ -326,7 +326,7 @@ impl LedgerChallengeService {
                 .as_secs()
         });
         let action = match self.watcher.decide(&job.escape(), now)? {
-            Decision::Act(action) => action,
+            Decision::Act(action) => *action,
             Decision::Wait => return Ok(()),
             Decision::Nothing => {
                 // A landed raise leaves nothing due; retire its finished plan.

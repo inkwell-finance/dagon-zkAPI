@@ -1,4 +1,5 @@
-//! Optional shared access gate for the Sepolia service, separate from note proofs.
+//! Optional shared access gate for a testnet service, separate from note
+//! proofs. Startup refuses it on mainnet-beta.
 
 use axum::extract::{Request, State};
 use axum::http::{header::CACHE_CONTROL, HeaderValue, Method, StatusCode};
@@ -8,7 +9,6 @@ use axum::Json;
 use sha3::{Digest, Sha3_256};
 use subtle::ConstantTimeEq;
 
-pub const SEPOLIA_CHAIN_ID: u64 = 11_155_111;
 pub const TESTNET_PASSWORD_HEADER: &str = "x-zkapi-testnet-password";
 
 /// Store only a fixed-size digest and never expose it through debug output.
@@ -78,7 +78,7 @@ pub(crate) async fn require_testnet_password(
                 [(CACHE_CONTROL, "no-store")],
                 Json(serde_json::json!({
                     "error_code": "testnet_password_required",
-                    "error": "Sepolia password required or invalid",
+                    "error": "testnet password required or invalid",
                     "retriable": false,
                 })),
             )

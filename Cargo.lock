@@ -1137,6 +1137,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "dagon-zkapi-deploy"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "anyhow",
+ "base64 0.22.1",
+ "bs58",
+ "clap",
+ "dagon-zkapi-profile",
+ "dagon-zkapi-vault",
+ "pyth-solana-receiver-sdk",
+ "reqwest",
+ "serde_json",
+ "sha2 0.10.9",
+ "solana-compute-budget-interface",
+ "solana-hash",
+ "solana-instruction",
+ "solana-keypair",
+ "solana-message",
+ "solana-program",
+ "solana-pubkey",
+ "solana-signer",
+ "tokio",
+ "zkapi-proof",
+ "zkapi-types",
+]
+
+[[package]]
 name = "dagon-zkapi-ledger"
 version = "0.1.0"
 dependencies = [
@@ -1144,6 +1172,47 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "zkapi-types",
+]
+
+[[package]]
+name = "dagon-zkapi-profile"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bs58",
+ "dagon-zkapi-vault",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "solana-pubkey",
+]
+
+[[package]]
+name = "dagon-zkapi-pyth-pusher"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "byteorder",
+ "clap",
+ "dagon-zkapi-profile",
+ "pythnet-sdk",
+ "rand 0.8.5",
+ "reqwest",
+ "serde_json",
+ "sha2 0.10.9",
+ "solana-compute-budget-interface",
+ "solana-hash",
+ "solana-instruction",
+ "solana-keypair",
+ "solana-message",
+ "solana-pubkey",
+ "solana-signer",
+ "solana-system-interface",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
@@ -1168,7 +1237,9 @@ dependencies = [
  "anchor-lang",
  "base64 0.22.1",
  "bincode",
+ "dagon-zkapi-deploy",
  "dagon-zkapi-ledger",
+ "dagon-zkapi-profile",
  "dagon-zkapi-vault",
  "rand 0.8.5",
  "reqwest",
@@ -4868,11 +4939,13 @@ name = "zkapi-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bs58",
  "clap",
+ "dagon-zkapi-profile",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
- "tracing",
  "tracing-subscriber 0.3.23",
  "zkapi-indexerd",
  "zkapi-proof",
@@ -4899,13 +4972,11 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "clap",
+ "dagon-zkapi-profile",
  "dagon-zkapi-vault",
- "hex",
  "reqwest",
  "serde",
  "serde_json",
- "sha3",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
@@ -4953,6 +5024,7 @@ dependencies = [
  "bs58",
  "clap",
  "dagon-zkapi-ledger",
+ "dagon-zkapi-profile",
  "dagon-zkapi-solana-ledger",
  "dagon-zkapi-vault",
  "fs2",

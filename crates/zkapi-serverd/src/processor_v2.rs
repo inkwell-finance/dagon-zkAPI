@@ -29,13 +29,10 @@ use zkapi_types::{
     NullifierStatus,
 };
 
+use crate::billing::{BillingPriceSource, BillingQuote};
 use crate::config::{OpenRouterLeaseSourceConfig, ServerConfig};
 use crate::dashboard::{redact_secrets, DashboardEvent, DashboardHub};
 use crate::error::ServerError;
-use crate::native_billing::billing::{BillingPriceSource, BillingQuote};
-use crate::native_billing::NativeBillingOracle;
-#[cfg(test)]
-use crate::native_billing::NativeBillingQuote;
 use crate::nullifier_store::{
     api_request_binding, NullifierStore, OaProvisioningOutcome, OpenRouterLeaseRecord,
     SignatureDeferral, TranscriptRecord,
@@ -97,21 +94,10 @@ pub enum SignOutcome {
 }
 
 impl RequestProcessor {
+    /// Build a processor over validated backends. Production startup obtains
+    /// them from `routes::prepare_solana_backends`, which checks the finalized
+    /// deployment first.
     pub fn try_new(
-        config: ServerConfig,
-        store: Arc<NullifierStore>,
-        signer: Arc<ServerSigner>,
-        current_root: Felt252,
-    ) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            config.backend == crate::config::LedgerBackend::Evm,
-            "Solana requires validated backend startup; use try_new_with_backends"
-        );
-        let oracle = Arc::new(NativeBillingOracle::for_server(&config)?);
-        Self::try_new_with_backends(config, store, signer, current_root, oracle.clone(), oracle)
-    }
-
-    pub fn try_new_with_backends(
         config: ServerConfig,
         store: Arc<NullifierStore>,
         signer: Arc<ServerSigner>,
@@ -119,70 +105,36 @@ impl RequestProcessor {
         ledger: Arc<dyn CreditLedger>,
         billing: Arc<dyn BillingPriceSource>,
     ) -> anyhow::Result<Self> {
-        config.validate_native_mode()?;
+        config.validate()?;
         anyhow::ensure!(
-            ledger.deployment().chain_id == config.chain_id
-                && ledger.deployment().protocol_binding == config.contract_address,
+            ledger.deployment().chain_id == config.chain_id()
+                && ledger.deployment().protocol_binding == config.contract_address(),
             "credit ledger does not match server deployment"
         );
         let writer_lock = store.acquire_writer_lock()?;
-        if let Some(lease) = config.openrouter_leases.as_ref() {
-            anyhow::ensure!(
-                lease.ttl_seconds > 0,
-                "OpenRouter lease TTL must be positive"
-            );
-            match &lease.source {
-                OpenRouterLeaseSourceConfig::OpenRouter { management_key, .. } => {
-                    anyhow::ensure!(
-                        !management_key.is_empty(),
-                        "OpenRouter management key cannot be empty"
-                    );
-                }
-                OpenRouterLeaseSourceConfig::OaOrg {
-                    org_base_url,
-                    shared_secret,
-                } => {
-                    anyhow::ensure!(!org_base_url.is_empty(), "OA org URL cannot be empty");
-                    anyhow::ensure!(
-                        !shared_secret.is_empty(),
-                        "OA org shared secret cannot be empty"
-                    );
-                    anyhow::ensure!(
-                        lease.ttl_seconds.is_multiple_of(60),
-                        "OA org lease TTL must be a whole number of minutes"
-                    );
-                }
-            }
-        }
         let verifier = RequestVerifier::load(&config.proof_setup_dir)?;
-        let openrouter = config
-            .openrouter_leases
-            .as_ref()
-            .and_then(|lease| match &lease.source {
-                OpenRouterLeaseSourceConfig::OpenRouter {
-                    management_key,
-                    api_base,
-                } => Some(
-                    OpenRouterProvisioner::new(management_key.clone(), api_base.clone())
-                        .map(Arc::new),
-                ),
-                OpenRouterLeaseSourceConfig::OaOrg { .. } => None,
-            })
-            .transpose()?;
-        let oa_org = config
-            .openrouter_leases
-            .as_ref()
-            .and_then(|lease| match &lease.source {
-                OpenRouterLeaseSourceConfig::OaOrg {
-                    org_base_url,
-                    shared_secret,
-                } => Some(
-                    OaOrgProvisioner::new(org_base_url.clone(), shared_secret.clone())
-                        .map(Arc::new),
-                ),
-                OpenRouterLeaseSourceConfig::OpenRouter { .. } => None,
-            })
-            .transpose()?;
+        let (openrouter, oa_org) = match &config.lease_source {
+            OpenRouterLeaseSourceConfig::OpenRouter {
+                management_key,
+                api_base,
+            } => (
+                Some(Arc::new(OpenRouterProvisioner::new(
+                    management_key.clone(),
+                    api_base.clone(),
+                )?)),
+                None,
+            ),
+            OpenRouterLeaseSourceConfig::OaOrg {
+                org_base_url,
+                shared_secret,
+            } => (
+                None,
+                Some(Arc::new(OaOrgProvisioner::new(
+                    org_base_url.clone(),
+                    shared_secret.clone(),
+                )?)),
+            ),
+        };
         Ok(Self {
             billing,
             ledger,
@@ -205,7 +157,7 @@ impl RequestProcessor {
     pub(crate) fn finalize_test_lease(
         &self,
         request: &ApiRequestV2,
-        charge_gwei: u128,
+        charge_lamports: u128,
     ) -> Result<RequestResponseV2, ServerError> {
         if let Some(response) = self.validate_and_reserve(request)? {
             return Ok(response);
@@ -213,7 +165,7 @@ impl RequestProcessor {
         let settlement = SettlementResult {
             status_code: 200,
             payload: self.settlement_payload(request, serde_json::json!({"status":"finalized"}))?,
-            charge_applied: charge_gwei,
+            charge_applied: charge_lamports,
             usage: None,
             billing_label: "native-test".into(),
         };
@@ -224,21 +176,6 @@ impl RequestProcessor {
     pub fn with_dashboard(mut self, dashboard: Arc<DashboardHub>) -> Self {
         self.dashboard = Some(dashboard);
         self
-    }
-
-    /// Replace the compatibility EVM ledger with a chain backend while keeping
-    /// the HTTP request protocol and proof verifier unchanged.
-    pub fn with_credit_ledger(mut self, ledger: Arc<dyn CreditLedger>) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            ledger.deployment().chain_id == self.config.chain_id,
-            "credit ledger chain ID does not match server configuration"
-        );
-        anyhow::ensure!(
-            ledger.deployment().protocol_binding == self.config.contract_address,
-            "credit ledger deployment binding does not match server configuration"
-        );
-        self.ledger = ledger;
-        Ok(self)
     }
 
     /// Refresh the request root through the chain-neutral ledger boundary.
@@ -317,10 +254,13 @@ impl RequestProcessor {
     }
 
     #[cfg(test)]
-    fn replace_native_oracle(&mut self, oracle: NativeBillingOracle) {
-        let oracle = Arc::new(oracle.with_indexer_url(self.config.indexer_url.clone()));
-        self.ledger = oracle.clone();
-        self.billing = oracle;
+    pub(crate) fn replace_backends(
+        &mut self,
+        ledger: Arc<dyn CreditLedger>,
+        billing: Arc<dyn BillingPriceSource>,
+    ) {
+        self.ledger = ledger;
+        self.billing = billing;
     }
 
     pub fn dashboard(&self) -> Option<&Arc<DashboardHub>> {
@@ -348,7 +288,7 @@ impl RequestProcessor {
         self.signer.clearance_public_key()
     }
 
-    pub async fn native_billing_quote(&self) -> Result<BillingQuote, ServerError> {
+    pub async fn billing_quote(&self) -> Result<BillingQuote, ServerError> {
         self.billing.quote(current_timestamp()).await
     }
 
@@ -362,18 +302,11 @@ impl RequestProcessor {
             ServerError::InvalidRequest("invalid lease authorization object".into())
         })?;
         let quote = object.remove("billing_quote").ok_or_else(|| {
-            ServerError::InvalidRequest("native ETH lease requires a bound billing quote".into())
+            ServerError::InvalidRequest("native SOL lease requires a bound billing quote".into())
         })?;
         let quote: BillingQuote = serde_json::from_value(quote)
             .map_err(|_| ServerError::InvalidRequest("invalid native billing quote".into()))?;
-        // Authenticate the source identity even for frozen settlement. EVM's
-        // compatibility config remains checked explicitly for old call sites.
-        if let BillingQuote::NativeEth(native) = &quote {
-            let config = self.config.native_billing.as_ref().ok_or_else(|| {
-                ServerError::InvalidRequest("native ETH billing configuration is required".into())
-            })?;
-            native.validate_identity(config, self.config.chain_id)?;
-        }
+        // Authenticate the source identity even for frozen settlement.
         self.billing.validate_identity(&quote)?;
         let authorization = serde_json::from_value(payload).map_err(|_| {
             ServerError::InvalidRequest("invalid prompt-free lease authorization".into())
@@ -435,7 +368,7 @@ impl RequestProcessor {
     }
 
     /// Reserve one prompt-free zkAPI request and mint its bounded OpenRouter
-    /// runtime key using its frozen native ETH price quote.
+    /// runtime key using its frozen Pyth SOL/USD quote.
     pub async fn issue_openrouter_lease(
         &self,
         request: &ApiRequestV2,
@@ -446,26 +379,20 @@ impl RequestProcessor {
                 "unsupported OpenRouter lease authorization".to_string(),
             ));
         }
-        let lease_config = self.config.openrouter_leases.as_ref().ok_or_else(|| {
-            ServerError::InvalidRequest(
-                "prompt-private OpenRouter leases are not enabled on this server".to_string(),
-            )
-        })?;
+        let lease_source = &self.config.lease_source;
+        let lease_timing = &self.config.profile.server;
         // Validate native integer bounds before reserving a nullifier. An
         // unrepresentable budget must never strand otherwise unused state.
         let limit_micro_usd = self.lease_limit_micro_usd(request)?;
         let _issue_guard = self.lease_issue_lock.lock().await;
-        let oa_request_id = if matches!(
-            lease_config.source,
-            OpenRouterLeaseSourceConfig::OaOrg { .. }
-        ) {
+        let oa_request_id = if matches!(lease_source, OpenRouterLeaseSourceConfig::OaOrg { .. }) {
             Some(Self::native_oa_request_id(request)?)
         } else {
             None
         };
 
         // A persisted request already froze its quote before external issuance.
-        // Matching retries remain valid after the oracle round ages out.
+        // Matching retries remain valid after the quote ages out.
         let existing_lease = self
             .store
             .lookup_openrouter_lease(&request.client_request_id);
@@ -513,11 +440,11 @@ impl RequestProcessor {
                     "pending lease request does not match its nullifier reservation".to_string(),
                 ));
             }
-            if existing.key_source != lease_config.source.label() {
+            if existing.key_source != lease_source.label() {
                 return Err(ServerError::Internal(format!(
                     "pending lease source {} does not match configured source {}",
                     existing.key_source,
-                    lease_config.source.label()
+                    lease_source.label()
                 )));
             }
             if existing.status != "provisioning" || existing.key_hash.is_some() {
@@ -539,7 +466,7 @@ impl RequestProcessor {
         self.assert_request_unspent(&request.public_inputs.request_nullifier)
             .await?;
         if let Some(existing) = existing {
-            match &lease_config.source {
+            match lease_source {
                 OpenRouterLeaseSourceConfig::OpenRouter { .. } => {
                     let provisioner = self.openrouter.as_ref().ok_or_else(|| {
                         ServerError::Internal(
@@ -573,20 +500,20 @@ impl RequestProcessor {
                 }
             }
         }
-        let requested_expires_at = current_timestamp().saturating_add(lease_config.ttl_seconds);
+        let requested_expires_at =
+            current_timestamp().saturating_add(lease_timing.lease_ttl_seconds);
         if !resume_provisioning {
             self.store.create_openrouter_lease_with_oa_id(
                 request,
-                lease_config.source.label(),
+                lease_source.label(),
                 issued_at,
                 requested_expires_at,
-                requested_expires_at.saturating_add(lease_config.settlement_grace_seconds),
+                requested_expires_at.saturating_add(lease_timing.settlement_grace_seconds),
                 spending_limit_usd,
                 oa_request_id.as_deref(),
             )?;
         }
-        let (api_key, key_hash, openrouter_api_base, expires_at, verification) = match &lease_config
-            .source
+        let (api_key, key_hash, openrouter_api_base, expires_at, verification) = match lease_source
         {
             OpenRouterLeaseSourceConfig::OpenRouter { .. } => {
                 let provisioner = self.openrouter.as_ref().ok_or_else(|| {
@@ -625,7 +552,7 @@ impl RequestProcessor {
                             .unwrap_or(&request.client_request_id),
                         spending_limit_usd,
                         limit_micro_usd,
-                        lease_config.ttl_seconds,
+                        lease_timing.lease_ttl_seconds,
                     )
                     .await;
                 let created = match created {
@@ -660,7 +587,7 @@ impl RequestProcessor {
                 )
             }
         };
-        let settle_after = expires_at.saturating_add(lease_config.settlement_grace_seconds);
+        let settle_after = expires_at.saturating_add(lease_timing.settlement_grace_seconds);
         self.store.update_openrouter_lease_timing(
             &request.client_request_id,
             expires_at,
@@ -671,7 +598,7 @@ impl RequestProcessor {
             .activate_openrouter_lease(&request.client_request_id, &key_hash)
         {
             if let (Some(provisioner), OpenRouterLeaseSourceConfig::OpenRouter { .. }) =
-                (&self.openrouter, &lease_config.source)
+                (&self.openrouter, lease_source)
             {
                 let _ = provisioner.delete_key(&key_hash).await;
             }
@@ -695,7 +622,7 @@ impl RequestProcessor {
                 settle_after,
                 spending_limit_usd,
             },
-            key_source: lease_config.source.label().to_string(),
+            key_source: lease_source.label().to_string(),
             verification,
             billing_quote,
         })
@@ -717,9 +644,9 @@ impl RequestProcessor {
                 "native expiry check does not match the exact request".into(),
             ));
         }
-        if request.public_inputs.protocol_version != self.config.protocol_version
-            || request.public_inputs.chain_id != self.config.chain_id
-            || request.public_inputs.contract_address != self.config.contract_address
+        if request.public_inputs.protocol_version != self.config.protocol_version()
+            || request.public_inputs.chain_id != self.config.chain_id()
+            || request.public_inputs.contract_address != self.config.contract_address()
         {
             return Err(ServerError::ProtocolMismatch(
                 "native expiry check deployment mismatch".into(),
@@ -738,19 +665,17 @@ impl RequestProcessor {
         {
             return Err(ServerError::LeasePending);
         }
-        let status = if quote.expires_at() <= current_timestamp() {
+        let status = if quote.expires_at <= current_timestamp() {
             "expired_unaccepted"
         } else {
             let oracle = &self.billing;
             match oracle.validate(&quote, current_timestamp()).await {
                 Err(ServerError::NativeQuoteSuperseded) => "superseded_unaccepted",
-                Err(ServerError::NativeQuoteExpired)
-                    if quote.expires_at() <= current_timestamp() =>
-                {
+                Err(ServerError::NativeQuoteExpired) if quote.expires_at <= current_timestamp() => {
                     "expired_unaccepted"
                 }
                 Err(error) => return Err(error),
-                Ok(()) if quote.expires_at() <= current_timestamp() => "expired_unaccepted",
+                Ok(()) if quote.expires_at <= current_timestamp() => "expired_unaccepted",
                 Ok(()) => return Err(ServerError::LeasePending),
             }
         };
@@ -903,10 +828,8 @@ impl RequestProcessor {
         if settled(&record) {
             return self.settle_oa_org_lease(lease).await;
         }
-        let config = self.config.openrouter_leases.as_ref().ok_or_else(|| {
-            ServerError::Internal("OA org lease configuration is unavailable".into())
-        })?;
-        if config.ttl_seconds == 0 || !config.ttl_seconds.is_multiple_of(60) {
+        let config = &self.config.profile.server;
+        if config.lease_ttl_seconds == 0 || !config.lease_ttl_seconds.is_multiple_of(60) {
             return Err(ServerError::Internal("invalid OA lease duration".into()));
         }
         let provider = self
@@ -918,14 +841,14 @@ impl RequestProcessor {
                 &self.persisted_oa_request_id(lease)?,
                 OaOrgUsageExpectation {
                     credit_limit_usd: lease.spending_limit_usd,
-                    duration_minutes: config.ttl_seconds / 60,
+                    duration_minutes: config.lease_ttl_seconds / 60,
                     limit_credits: self.lease_limit_micro_usd(&lease.api_request)?,
                     minimum_expires_at: lease
                         .issued_at
-                        .saturating_add(config.ttl_seconds)
+                        .saturating_add(config.lease_ttl_seconds)
                         .saturating_sub(OA_LEASE_EXPIRY_SAFETY_SECONDS),
                     maximum_expires_at: current_timestamp()
-                        .saturating_add(config.ttl_seconds)
+                        .saturating_add(config.lease_ttl_seconds)
                         .saturating_add(OA_LEASE_EXPIRY_SAFETY_SECONDS),
                 },
             )
@@ -988,9 +911,9 @@ impl RequestProcessor {
             || record.payload_hash != Some(request.payload_hash)
             || record.api_request_binding.as_deref() != Some(binding.as_str())
             || canonical_payload_hash(request.payload.as_bytes()) != request.payload_hash
-            || public.protocol_version != self.config.protocol_version
-            || public.chain_id != self.config.chain_id
-            || public.contract_address != self.config.contract_address
+            || public.protocol_version != self.config.protocol_version()
+            || public.chain_id != self.config.chain_id()
+            || public.contract_address != self.config.contract_address()
             || public.state_signing_key_x != signing_key.x
             || public.state_signing_key_y != signing_key.y
             || self.lease_authorization(request)?.0 != OpenRouterLeaseAuthorization::default()
@@ -1107,15 +1030,14 @@ impl RequestProcessor {
         let provisioner = self.oa_org.as_ref().ok_or_else(|| {
             ServerError::Internal("OA org lease provider is unavailable".to_string())
         })?;
-        let lease_config = self.config.openrouter_leases.as_ref().ok_or_else(|| {
-            ServerError::Internal("OA org lease configuration is unavailable".to_string())
-        })?;
-        if lease_config.ttl_seconds == 0 || !lease_config.ttl_seconds.is_multiple_of(60) {
+        let lease_timing = &self.config.profile.server;
+        if lease_timing.lease_ttl_seconds == 0 || !lease_timing.lease_ttl_seconds.is_multiple_of(60)
+        {
             return Err(ServerError::Internal(
                 "OA org lease duration is not a positive whole number of minutes".to_string(),
             ));
         }
-        let duration_minutes = lease_config.ttl_seconds / 60;
+        let duration_minutes = lease_timing.lease_ttl_seconds / 60;
         let expected_limit_credits = self.lease_limit_micro_usd(&lease.api_request)?;
         let oa_request_id = self.persisted_oa_request_id(lease)?;
         let receipt = provisioner
@@ -1232,16 +1154,7 @@ impl RequestProcessor {
             // OpenRouter does not issue a finalized receipt. Its aggregate
             // accounting requires the configured drain/reconciliation interval
             // after disabling, including when retiring a key before expiry.
-            let grace = self
-                .config
-                .openrouter_leases
-                .as_ref()
-                .ok_or_else(|| {
-                    ServerError::Internal(
-                        "OpenRouter lease configuration is unavailable".to_string(),
-                    )
-                })?
-                .settlement_grace_seconds;
+            let grace = self.config.profile.server.settlement_grace_seconds;
             settle_after = current_timestamp().saturating_add(grace);
             self.store.advance_openrouter_retirement(
                 &lease.client_request_id,
@@ -1345,9 +1258,9 @@ impl RequestProcessor {
                 "payload_hash does not match payload bytes".to_string(),
             ));
         }
-        if public.protocol_version != self.config.protocol_version
-            || public.chain_id != self.config.chain_id
-            || public.contract_address != self.config.contract_address
+        if public.protocol_version != self.config.protocol_version()
+            || public.chain_id != self.config.chain_id()
+            || public.contract_address != self.config.contract_address()
         {
             return Err(ServerError::ProtocolMismatch(
                 "version, chain, or contract mismatch".to_string(),
@@ -1398,7 +1311,7 @@ impl RequestProcessor {
                 "request_time is outside the accepted freshness window".to_string(),
             ));
         }
-        let required_solvency = self.config.request_charge_cap;
+        let required_solvency = self.config.request_charge_cap();
         if public.solvency_bound < required_solvency {
             return Err(ServerError::InvalidRequest(format!(
                 "solvency_bound {} is below required {}",
@@ -1434,9 +1347,9 @@ impl RequestProcessor {
 
     fn deployment(&self) -> Deployment {
         Deployment {
-            protocol_version: self.config.protocol_version,
-            chain_id: self.config.chain_id,
-            contract_address: self.config.contract_address,
+            protocol_version: self.config.protocol_version(),
+            chain_id: self.config.chain_id(),
+            contract_address: self.config.contract_address(),
         }
     }
 
@@ -1444,6 +1357,8 @@ impl RequestProcessor {
     /// first found consumed, for the consuming exit to be defeated (O7).
     fn exit_deferral_window(&self) -> u64 {
         self.config
+            .profile
+            .vault
             .challenge_period_seconds
             .saturating_add(crate::config::EXIT_DEFERRAL_SLACK_SECONDS)
     }
@@ -1713,10 +1628,6 @@ impl RequestProcessor {
         })
     }
 
-    pub fn openrouter_leases_enabled(&self) -> bool {
-        self.config.openrouter_leases.is_some()
-    }
-
     /// Lease metadata. A finalized lease whose successor is deferred or
     /// terminally unsigned reports `exit_deferred` / `exited_unsigned`.
     pub fn openrouter_lease_status(
@@ -1760,9 +1671,9 @@ impl RequestProcessor {
             None => false,
         };
         let message = core::clearance_message(
-            self.config.protocol_version,
-            self.config.chain_id,
-            &self.config.contract_address,
+            self.config.protocol_version(),
+            self.config.chain_id(),
+            &self.config.contract_address(),
             &request.withdrawal_nullifier,
         );
         let signature = self.signer.sign_clearance(&message);
@@ -1921,7 +1832,7 @@ mod tests {
     use zkapi_types::wire::{Groth16ProofWire, ProofBackendWire};
     use zkapi_types::RequestPublicInputsV2;
 
-    use crate::config::OpenRouterLeaseConfig;
+    use crate::test_support::{lease_payload_with, quote, NullifierRead, StubBilling, StubLedger};
 
     fn setup_directory() -> String {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1936,31 +1847,35 @@ mod tests {
         let state_seed = Felt252::from_u64(11);
         let clear_seed = Felt252::from_u64(12);
         let signer = Arc::new(ServerSigner::new(&state_seed, &clear_seed));
-        RequestProcessor::try_new(
-            ServerConfig {
-                request_charge_cap: 1,
-                contract_address: Felt252::from_u64(1),
-                backend: crate::config::LedgerBackend::Evm,
-                native_billing: Some(crate::test_support::native_config()),
-                proof_setup_dir: setup_directory(),
-                openrouter_leases: Some(OpenRouterLeaseConfig {
-                    source: OpenRouterLeaseSourceConfig::OaOrg {
-                        // No request should reach this address in the mutation
-                        // tests: the bound-retry check must reject first.
-                        org_base_url: "http://127.0.0.1:9".to_string(),
-                        shared_secret: "test-secret".to_string(),
-                    },
-                    ttl_seconds: 300,
-                    settlement_grace_seconds: 0,
-                    settlement_poll_seconds: 1,
-                }),
-                ..Default::default()
-            },
-            store,
-            signer,
-            Felt252::ZERO,
-        )
-        .unwrap()
+        // No request should reach the OA address in the mutation tests: the
+        // bound-retry check must reject first.
+        let mut config = crate::test_support::config(crate::test_support::oa_source());
+        config.proof_setup_dir = setup_directory();
+        config.profile.vault.request_charge_cap = 1;
+        config.profile.server.settlement_grace_seconds = 0;
+        config.profile.server.settlement_poll_seconds = 1;
+        test_processor(config, store, signer)
+    }
+
+    /// A processor whose chain reads fail and whose oracle accepts any
+    /// fresh quote for the deployment.
+    fn test_processor(
+        config: ServerConfig,
+        store: Arc<NullifierStore>,
+        signer: Arc<ServerSigner>,
+    ) -> RequestProcessor {
+        let ledger = StubLedger::unavailable(&config);
+        let billing = StubBilling::accepting(&config);
+        RequestProcessor::try_new(config, store, signer, Felt252::ZERO, ledger, billing).unwrap()
+    }
+
+    fn replace_ledger(processor: &mut RequestProcessor, read: NullifierRead) {
+        let billing = processor.billing.clone();
+        processor.replace_backends(StubLedger::new(&processor.config, read), billing);
+    }
+
+    fn unspent_ledger(processor: &mut RequestProcessor) {
+        replace_ledger(processor, Arc::new(|| Ok(LedgerNullifierStatus::Unused)));
     }
 
     fn unverified_lease_request(processor: &RequestProcessor) -> ApiRequestV2 {
@@ -1971,9 +1886,9 @@ mod tests {
             payload_hash: canonical_payload_hash(payload.as_bytes()),
             payload,
             public_inputs: RequestPublicInputsV2 {
-                protocol_version: processor.config.protocol_version,
-                chain_id: processor.config.chain_id,
-                contract_address: processor.config.contract_address,
+                protocol_version: processor.config.protocol_version(),
+                chain_id: processor.config.chain_id(),
+                contract_address: processor.config.contract_address(),
                 active_root: Felt252::ZERO,
                 state_signing_key_x: state_key.x,
                 state_signing_key_y: state_key.y,
@@ -2030,60 +1945,23 @@ mod tests {
 
     type IssuanceMockState = Arc<std::sync::Mutex<IssuanceMock>>;
 
-    async fn issuance_rpc(
-        axum::extract::State(state): axum::extract::State<IssuanceMockState>,
-        axum::Json(body): axum::Json<serde_json::Value>,
-    ) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
-        let mut state = state.lock().unwrap();
-        if state.fail_rpc_after_create && state.creates > 0 {
-            return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
-        }
-        let result = if body["method"] == "eth_chainId" {
-            "0x1".to_string()
-        } else {
-            assert_eq!(body["method"], "eth_call");
-            assert_eq!(body["params"][1], "latest");
-            assert_eq!(
-                body["params"][0]["to"],
-                "0x0000000000000000000000000000000000000001"
-            );
-            let selector = Keccak256::digest(b"usedNullifiers(uint256)");
-            assert_eq!(
-                body["params"][0]["data"],
-                format!("0x{}{:064x}", hex::encode(&selector[..4]), 77)
-            );
-            state.nullifier_reads += 1;
-            format!("0x{:064x}", u8::from(state.spent))
-        };
-        Ok(axum::Json(
-            serde_json::json!({"jsonrpc":"2.0","id":1,"result":result}),
-        ))
-    }
-
-    fn configure_issuance_rpc(processor: &mut RequestProcessor, url: String) {
-        let config = processor.config.native_billing.as_mut().unwrap();
-        config.rpc_url = url;
-        let config = config.clone();
-        processor.replace_native_oracle(
-            NativeBillingOracle::new(
-                config,
-                processor.config.chain_id,
-                "0x0000000000000000000000000000000000000001".into(),
-            )
-            .unwrap(),
-        );
-    }
-
-    async fn unspent_rpc(processor: &mut RequestProcessor) -> tokio::task::JoinHandle<()> {
-        let app = axum::Router::new()
-            .route("/", axum::routing::post(issuance_rpc))
-            .with_state(Arc::new(std::sync::Mutex::new(IssuanceMock::default())));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        configure_issuance_rpc(
+    /// The vault's nullifier account as the issuance mock models it.
+    fn mock_ledger(processor: &mut RequestProcessor, state: IssuanceMockState) {
+        replace_ledger(
             processor,
-            format!("http://{}", listener.local_addr().unwrap()),
+            Arc::new(move || {
+                let mut state = state.lock().unwrap();
+                if state.fail_rpc_after_create && state.creates > 0 {
+                    return Err(LedgerError::Unavailable("mock RPC unavailable".into()));
+                }
+                state.nullifier_reads += 1;
+                Ok(if state.spent {
+                    LedgerNullifierStatus::Used
+                } else {
+                    LedgerNullifierStatus::Unused
+                })
+            }),
         );
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() })
     }
 
     async fn issuance_processor(
@@ -2136,7 +2014,6 @@ mod tests {
             Json(json!({"data":[]}))
         }
         let app = Router::new()
-            .route("/rpc", post(issuance_rpc))
             .route("/v1/keys", get(list).post(create))
             .route("/api/zkapi/request_key", post(create))
             .route(
@@ -2146,23 +2023,22 @@ mod tests {
                     "client_request_id":body["client_request_id"]}))
                 }),
             )
-            .with_state(state);
+            .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let store = Arc::new(NullifierStore::in_memory().unwrap());
         let mut processor = oa_lease_processor(store.clone());
-        configure_issuance_rpc(&mut processor, format!("{url}/rpc"));
+        mock_ledger(&mut processor, state);
         if oa {
             processor.oa_org = Some(Arc::new(
                 OaOrgProvisioner::new(url, "test-secret".into()).unwrap(),
             ));
         } else {
-            processor.config.openrouter_leases.as_mut().unwrap().source =
-                OpenRouterLeaseSourceConfig::OpenRouter {
-                    management_key: "test-secret".into(),
-                    api_base: url.clone(),
-                };
+            processor.config.lease_source = OpenRouterLeaseSourceConfig::OpenRouter {
+                management_key: "test-secret".into(),
+                api_base: url.clone(),
+            };
             processor.openrouter = Some(Arc::new(
                 OpenRouterProvisioner::new("test-secret".into(), url).unwrap(),
             ));
@@ -2667,7 +2543,8 @@ mod tests {
         let window = processor.exit_deferral_window();
         assert_eq!(
             window,
-            processor.config.challenge_period_seconds + crate::config::EXIT_DEFERRAL_SLACK_SECONDS
+            processor.config.profile.vault.challenge_period_seconds
+                + crate::config::EXIT_DEFERRAL_SLACK_SECONDS
         );
         assert_eq!(
             processor
@@ -2875,7 +2752,7 @@ mod tests {
             let (processor, request, server) = issuance_processor(oa, state.clone()).await;
             processor.update_root(Felt252::from_u64(999));
             let quote = processor.lease_authorization(&request).unwrap().1;
-            assert!(quote.expires_at() < current_timestamp());
+            assert!(quote.expires_at < current_timestamp());
             let issued = processor.issue_openrouter_lease(&request).await.unwrap();
             assert_eq!(issued.lease.api_key, "runtime-key");
             assert_eq!(issued.billing_quote, quote);
@@ -2966,12 +2843,11 @@ mod tests {
             None => NullifierStore::in_memory().unwrap(),
         });
         let mut processor = oa_lease_processor(store.clone());
-        let config = processor.config.openrouter_leases.as_mut().unwrap();
-        config.source = OpenRouterLeaseSourceConfig::OpenRouter {
+        processor.config.lease_source = OpenRouterLeaseSourceConfig::OpenRouter {
             management_key: "test".to_string(),
             api_base: url.clone(),
         };
-        config.settlement_grace_seconds = grace;
+        processor.config.profile.server.settlement_grace_seconds = grace;
         processor.openrouter = Some(Arc::new(
             OpenRouterProvisioner::new("test".to_string(), url).unwrap(),
         ));
@@ -3034,8 +2910,7 @@ mod tests {
             let signer = processor.signer.clone();
             drop(processor);
             let store = Arc::new(NullifierStore::new(&db_path).unwrap());
-            let processor =
-                RequestProcessor::try_new(config, store.clone(), signer, Felt252::ZERO).unwrap();
+            let processor = test_processor(config, store.clone(), signer);
             processor.settle_due_openrouter_leases().await;
             let response = processor
                 .retire_openrouter_lease(&request.client_request_id, &request)
@@ -3363,7 +3238,7 @@ mod tests {
     #[test]
     fn native_oa_namespace_is_deployment_and_full_request_bound_and_persisted() {
         let store = Arc::new(NullifierStore::in_memory().unwrap());
-        let mut processor = oa_lease_processor(store.clone());
+        let processor = oa_lease_processor(store.clone());
         let request = unverified_lease_request(&processor);
         let id = RequestProcessor::native_oa_request_id(&request).unwrap();
         assert_eq!(
@@ -3394,13 +3269,6 @@ mod tests {
             .unwrap();
         assert_eq!(saved.oa_client_request_id.as_deref(), Some(id.as_str()));
         assert_eq!(saved.client_request_id, request.client_request_id);
-        assert_eq!(processor.persisted_oa_request_id(&saved).unwrap(), id);
-        processor.config.native_billing = Some(crate::native_billing::NativeBillingConfig {
-            rpc_url: "http://127.0.0.1:9".into(),
-            feed_address: "0x694aa1769357215de4fac081bf1f309adc325306".into(),
-            decimals: 8,
-            max_age_seconds: 4500,
-        });
         assert_eq!(processor.persisted_oa_request_id(&saved).unwrap(), id);
         let mut corrupted = saved.clone();
         corrupted.oa_client_request_id = None;
@@ -3446,20 +3314,9 @@ mod tests {
         processor.oa_org = Some(Arc::new(
             OaOrgProvisioner::new(url, "test-secret".into()).unwrap(),
         ));
-        processor.config.native_billing = Some(crate::native_billing::NativeBillingConfig {
-            rpc_url: "http://127.0.0.1:9".into(),
-            feed_address: "0x694aa1769357215de4fac081bf1f309adc325306".into(),
-            decimals: 8,
-            max_age_seconds: 4500,
-        });
-        let chain_server = unspent_rpc(&mut processor).await;
+        unspent_ledger(&mut processor);
         let mut request = unverified_lease_request(&processor);
-        request.payload = json!({"mode":"openrouter_ephemeral_lease","version":1,"billing_quote":{
-            "asset":"native_eth","units_per_eth":1_000_000_000,"chain_id":1,
-            "feed_address":"0x694aa1769357215de4fac081bf1f309adc325306","round_id":"123",
-            "answer":"250000000000","decimals":8,"updated_at":now,"expires_at":now+4500
-        }})
-        .to_string();
+        request.payload = lease_payload_with(&quote(&processor.config, now, "250000000000"));
         request.payload_hash = canonical_payload_hash(request.payload.as_bytes());
         request.public_inputs.solvency_bound = 400_000;
         let id = RequestProcessor::native_oa_request_id(&request).unwrap();
@@ -3495,46 +3352,19 @@ mod tests {
             "active"
         );
         server.abort();
-        chain_server.abort();
     }
 
     #[tokio::test]
     async fn native_lease_persists_frozen_quote_and_rejects_missing_or_changed_quotes() {
-        use crate::native_billing::NativeBillingConfig;
         let store = Arc::new(NullifierStore::in_memory().unwrap());
         let mut processor = oa_lease_processor(store.clone());
-        processor.config.contract_address = Felt252::from_u64(1);
-        let config = NativeBillingConfig {
-            rpc_url: "http://127.0.0.1:9".into(),
-            feed_address: "0x694aa1769357215de4fac081bf1f309adc325306".into(),
-            decimals: 8,
-            max_age_seconds: 3600,
-        };
-        processor.config.native_billing = Some(config.clone());
-        processor.replace_native_oracle(
-            NativeBillingOracle::new(
-                config,
-                1,
-                "0x0000000000000000000000000000000000000001".into(),
-            )
-            .unwrap(),
-        );
-        let chain_server = unspent_rpc(&mut processor).await;
+        unspent_ledger(&mut processor);
         let mut request = unverified_lease_request(&processor);
         request.payload = serde_json::to_string(&OpenRouterLeaseAuthorization::default()).unwrap();
         assert!(processor.lease_authorization(&request).is_err());
-        let quote = NativeBillingQuote {
-            asset: "native_eth".into(),
-            units_per_eth: 1_000_000_000,
-            chain_id: 1,
-            feed_address: "0x694aa1769357215de4fac081bf1f309adc325306".into(),
-            round_id: "123".into(),
-            answer: "250000000000".into(),
-            decimals: 8,
-            updated_at: 100,
-            expires_at: 3700,
-        };
-        request.payload = serde_json::json!({"mode":"openrouter_ephemeral_lease","version":1,"billing_quote":quote}).to_string();
+        // $2500/SOL, published long ago: one lamport is 2.5 micro-USD.
+        let quote = quote(&processor.config, 100, "250000000000");
+        request.payload = lease_payload_with(&quote);
         request.payload_hash = canonical_payload_hash(request.payload.as_bytes());
         request.public_inputs.solvency_bound = 400_000;
         assert_eq!(
@@ -3601,10 +3431,10 @@ mod tests {
                 .lease_authorization(&restored.api_request)
                 .unwrap()
                 .1,
-            BillingQuote::NativeEth(quote.clone())
+            quote.clone()
         );
         // Retry must reach the unavailable issuer, not fetch/reprice an expired
-        // round. This confirms that a restarted lease uses its persisted quote.
+        // quote. This confirms that a restarted lease uses its persisted quote.
         let error = processor
             .issue_openrouter_lease(&restored.api_request)
             .await
@@ -3625,99 +3455,52 @@ mod tests {
             .is_none());
         let mut mutation = restored.api_request.clone();
         let mut payload: serde_json::Value = serde_json::from_str(&mutation.payload).unwrap();
-        payload["billing_quote"]["answer"] = "500000000000".into();
+        payload["billing_quote"]["price"] = "500000000000".into();
         mutation.payload = payload.to_string();
         mutation.payload_hash = canonical_payload_hash(mutation.payload.as_bytes());
         assert!(matches!(
             processor.issue_openrouter_lease(&mutation).await,
             Err(ServerError::Replay)
         ));
-        let mut missing_config = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
-        missing_config.config.native_billing = None;
-        assert!(missing_config.lease_authorization(&request).is_err());
-        chain_server.abort();
+        // A quote pinned to another deployment never authenticates.
+        let mut foreign = request.clone();
+        let mut payload: serde_json::Value = serde_json::from_str(&foreign.payload).unwrap();
+        payload["billing_quote"]["vault"] = "another-vault".into();
+        foreign.payload = payload.to_string();
+        assert!(processor.lease_authorization(&foreign).is_err());
     }
+
     #[tokio::test]
     async fn native_issuance_rechecks_expiry_after_delayed_oracle_read() {
-        use crate::native_billing::NativeBillingConfig;
-        use axum::{routing::post, Json, Router};
-        use serde_json::{json, Value};
         use std::time::Duration;
         use tokio::sync::Notify;
 
-        let expires_at = current_timestamp() + 5;
-        let updated_at = expires_at - 3600;
         let oracle_read_started = Arc::new(Notify::new());
         let finish_oracle_read = Arc::new(Notify::new());
-        let started = oracle_read_started.clone();
-        let finish = finish_oracle_read.clone();
-        let app = Router::new().route(
-            "/",
-            post(move |Json(request): Json<Value>| {
-                let started = started.clone();
-                let finish = finish.clone();
-                async move {
-                    let data = request["params"][0]["data"].as_str().unwrap_or("");
-                    let result = if request["method"] == "eth_chainId" {
-                        "0x1".to_string()
-                    } else if data == "0x313ce567" {
-                        format!("0x{:064x}", 8)
-                    } else if data == "0x4d1352fd" {
-                        format!("0x{:064x}", 1_000_000_000)
-                    } else {
-                        assert_eq!(request["params"][1], "finalized");
-                        if data.starts_with("0x9a6fc8f5") {
-                            started.notify_one();
-                            finish.notified().await;
-                        } else {
-                            assert_eq!(data, "0xfeaf968c");
-                        }
-                        format!(
-                            "0x{:064x}{:064x}{:064x}{:064x}{:064x}",
-                            123, 250_000_000_000u64, updated_at, updated_at, 123
-                        )
-                    };
-                    Json(json!({"jsonrpc":"2.0","id":1,"result":result}))
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let store = Arc::new(NullifierStore::in_memory().unwrap());
         let mut processor = oa_lease_processor(store.clone());
-        processor.config.contract_address = Felt252::from_u64(1);
-        let config = NativeBillingConfig {
-            rpc_url,
-            feed_address: "0x694aa1769357215de4fac081bf1f309adc325306".into(),
-            decimals: 8,
-            max_age_seconds: 3600,
-        };
-        processor.config.native_billing = Some(config.clone());
-        processor.replace_native_oracle(
-            NativeBillingOracle::new(
-                config,
-                1,
-                "0x0000000000000000000000000000000000000001".into(),
-            )
-            .unwrap(),
+        let started = oracle_read_started.clone();
+        let finish = finish_oracle_read.clone();
+        let billing = StubBilling::new(
+            &processor.config,
+            Arc::new(move |_| {
+                let started = started.clone();
+                let finish = finish.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    finish.notified().await;
+                    Ok(())
+                })
+            }),
         );
+        let ledger = processor.ledger.clone();
+        processor.replace_backends(ledger, billing);
         let processor = Arc::new(processor);
+        let max_age = processor.config.profile.pyth.max_age_seconds;
+        let expires_at = current_timestamp() + 5;
+        let quote = quote(&processor.config, expires_at - max_age, "250000000000");
         let mut request = unverified_lease_request(&processor);
-        let quote = NativeBillingQuote {
-            asset: "native_eth".into(),
-            units_per_eth: 1_000_000_000,
-            chain_id: 1,
-            feed_address: "0x694aa1769357215de4fac081bf1f309adc325306".into(),
-            round_id: "123".into(),
-            answer: "250000000000".into(),
-            decimals: 8,
-            updated_at,
-            expires_at,
-        };
-        request.payload =
-            json!({"mode":"openrouter_ephemeral_lease","version":1,"billing_quote":quote})
-                .to_string();
+        request.payload = lease_payload_with(&quote);
         request.payload_hash = canonical_payload_hash(request.payload.as_bytes());
         request.public_inputs.solvency_bound = 400_000;
         let issuer = processor.clone();
@@ -3749,102 +3532,44 @@ mod tests {
                 .unwrap()["status"],
             "expired_unaccepted"
         );
-        server.abort();
     }
-    #[tokio::test]
-    async fn native_issuance_uses_latest_finalized_round_and_recovers_superseded_request() {
-        use crate::native_billing::NativeBillingConfig;
-        use axum::{routing::post, Json, Router};
-        use serde_json::{json, Value};
-        use std::sync::atomic::{AtomicU64, Ordering};
 
-        let updated_at = current_timestamp() - 30;
-        let finalized_round = Arc::new(AtomicU64::new(123));
-        let head_round = Arc::new(AtomicU64::new(124));
-        let rpc_finalized = finalized_round.clone();
-        let rpc_head = head_round.clone();
-        let app = Router::new().route(
-            "/",
-            post(move |Json(request): Json<Value>| {
-                let finalized = rpc_finalized.clone();
-                let head = rpc_head.clone();
-                async move {
-                    let data = request["params"][0]["data"].as_str().unwrap_or("");
-                    let result = if request["method"] == "eth_chainId" {
-                        "0x1".to_string()
-                    } else if data == "0x313ce567" {
-                        format!("0x{:064x}", 8)
-                    } else if data == "0x4d1352fd" {
-                        format!("0x{:064x}", 1_000_000_000)
-                    } else if data.starts_with("0xaad24061") {
-                        assert_eq!(request["params"][1], "latest");
-                        format!("0x{:064x}", 0)
-                    } else {
-                        let latest = if request["params"][1] == "finalized" {
-                            finalized.load(Ordering::SeqCst)
-                        } else {
-                            head.load(Ordering::SeqCst)
-                        };
-                        let round = if data == "0xfeaf968c" {
-                            latest
-                        } else {
-                            assert!(data.starts_with("0x9a6fc8f5"));
-                            let round = u64::from_str_radix(&data[10..], 16).unwrap();
-                            assert!(round <= latest);
-                            round
-                        };
-                        let price = if round == 123 {
-                            250_000_000_000u64
-                        } else {
-                            200_000_000_000u64
-                        };
-                        format!(
-                            "0x{:064x}{:064x}{:064x}{:064x}{:064x}",
-                            round, price, updated_at, updated_at, round
-                        )
-                    };
-                    Json(json!({"jsonrpc":"2.0","id":1,"result":result}))
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    /// A fresh quote the oracle no longer authenticates is superseded: issuance
+    /// refuses it before reserving, the client can acknowledge the request as
+    /// `superseded_unaccepted`, and an already accepted request keeps its
+    /// frozen price.
+    #[tokio::test]
+    async fn superseded_quote_is_refused_and_accepted_request_keeps_its_price() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let superseded = Arc::new(AtomicBool::new(false));
         let store = Arc::new(NullifierStore::in_memory().unwrap());
         let mut processor = oa_lease_processor(store.clone());
-        processor.config.contract_address = Felt252::from_u64(1);
-        let config = NativeBillingConfig {
-            rpc_url,
-            feed_address: "0x694aa1769357215de4fac081bf1f309adc325306".into(),
-            decimals: 8,
-            max_age_seconds: 4500,
-        };
-        processor.config.native_billing = Some(config.clone());
-        processor.replace_native_oracle(
-            NativeBillingOracle::new(
-                config,
-                1,
-                "0x0000000000000000000000000000000000000001".into(),
-            )
-            .unwrap(),
+        let flag = superseded.clone();
+        let billing = StubBilling::new(
+            &processor.config,
+            Arc::new(move |_| {
+                let superseded = flag.load(Ordering::SeqCst);
+                Box::pin(async move {
+                    if superseded {
+                        Err(ServerError::NativeQuoteSuperseded)
+                    } else {
+                        Ok(())
+                    }
+                })
+            }),
         );
-        let oracle = &processor.billing;
-        let generic_quote = oracle.quote(current_timestamp()).await.unwrap();
-        let BillingQuote::NativeEth(quote) = &generic_quote else {
-            panic!("expected ETH quote");
-        };
-        assert_eq!(
-            quote.round_id, "123",
-            "head-only round must not influence pricing"
-        );
-        oracle
-            .validate(&generic_quote, current_timestamp())
+        let ledger = processor.ledger.clone();
+        processor.replace_backends(ledger, billing);
+        let published = current_timestamp() - 5;
+        let quote = quote(&processor.config, published, "250000000000");
+        processor
+            .billing
+            .validate(&quote, current_timestamp())
             .await
             .unwrap();
         let mut request = unverified_lease_request(&processor);
-        request.payload =
-            json!({"mode":"openrouter_ephemeral_lease","version":1,"billing_quote":quote})
-                .to_string();
+        request.payload = lease_payload_with(&quote);
         request.payload_hash = canonical_payload_hash(request.payload.as_bytes());
         request.public_inputs.solvency_bound = 400_000;
         assert!(matches!(
@@ -3853,9 +3578,7 @@ mod tests {
                 .await,
             Err(ServerError::LeasePending)
         ));
-        // Proof construction used round123. Once round124 finalizes, a new
-        // issuance cannot choose the more favorable historical price123.
-        finalized_round.store(124, Ordering::SeqCst);
+        superseded.store(true, Ordering::SeqCst);
         assert!(matches!(
             processor.issue_openrouter_lease(&request).await,
             Err(ServerError::NativeQuoteSuperseded)
@@ -3876,22 +3599,16 @@ mod tests {
             ack["request_nullifier"],
             serde_json::to_value(request.public_inputs.request_nullifier).unwrap()
         );
-        // A normal head reorg cannot revive an acknowledged old finalized quote.
-        head_round.store(123, Ordering::SeqCst);
-        assert!(matches!(
-            processor.issue_openrouter_lease(&request).await,
-            Err(ServerError::NativeQuoteSuperseded)
-        ));
-        // Simulate a previously accepted request from before finality advanced:
-        // recovery never discards it and measured usage uses its frozen price.
+        // A request accepted before the quote was superseded: recovery never
+        // discards it and measured usage uses its frozen price.
         store.reserve_openrouter_lease(&request).unwrap();
         store
             .create_openrouter_lease_with_oa_id(
                 &request,
                 "oa_org",
-                updated_at,
-                updated_at + 300,
-                updated_at + 300,
+                published,
+                published + 300,
+                published + 300,
                 1.0,
                 Some(&RequestProcessor::native_oa_request_id(&request).unwrap()),
             )
@@ -3915,29 +3632,13 @@ mod tests {
             error,
             ServerError::NativeQuoteSuperseded | ServerError::NativeQuoteExpired
         ));
-        server.abort();
     }
 
     fn browser_processor(adversary: Option<crate::adversary::AdversaryMode>) -> RequestProcessor {
         let store = Arc::new(NullifierStore::in_memory().unwrap());
         let mut processor = oa_lease_processor(store);
-        processor.config.contract_address = Felt252::from_u64(1);
-        processor.config.request_charge_cap = 400_000;
+        processor.config.profile.vault.request_charge_cap = 400_000;
         processor.config.adversary = adversary;
-        processor.config.native_billing = Some(crate::native_billing::NativeBillingConfig {
-            rpc_url: "http://127.0.0.1:9".into(),
-            feed_address: "0x694aa1769357215de4fac081bf1f309adc325306".into(),
-            decimals: 8,
-            max_age_seconds: 3600,
-        });
-        processor.replace_native_oracle(
-            NativeBillingOracle::new(
-                processor.config.native_billing.clone().unwrap(),
-                processor.config.chain_id,
-                "0x0000000000000000000000000000000000000001".into(),
-            )
-            .unwrap(),
-        );
         processor
     }
 
@@ -3956,9 +3657,8 @@ mod tests {
         let processor = browser_processor(None);
         let config = BrowserWalletConfig {
             protocol_version: 2,
-            ledger_backend: "evm.groth16.v1".into(),
-            chain_id: 1,
-            contract_address: processor.config.contract_address,
+            chain_id: processor.config.chain_id(),
+            contract_address: processor.config.contract_address(),
             request_charge_cap: 400_000,
             policy_charge_cap: 400_000,
             policy_enabled: false,
@@ -3983,18 +3683,8 @@ mod tests {
         );
         processor.update_root(tree.root());
         let now = current_timestamp();
-        let quote = NativeBillingQuote {
-            asset: "native_eth".into(),
-            units_per_eth: 1_000_000_000,
-            chain_id: 1,
-            feed_address: "0x694aa1769357215de4fac081bf1f309adc325306".into(),
-            round_id: "123".into(),
-            answer: "250000000000".into(),
-            decimals: 8,
-            updated_at: now,
-            expires_at: now + 3600,
-        };
-        let payload=serde_json::json!({"mode":"openrouter_ephemeral_lease","version":1,"billing_quote":quote}).to_string();
+        let quote = quote(&processor.config, now, "250000000000");
+        let payload = lease_payload_with(&quote);
         let key =
             std::fs::read(std::path::Path::new(&setup_directory()).join("request.pk")).unwrap();
         let prepared = zkapi_browser::prepare_request(
@@ -4018,7 +3708,7 @@ mod tests {
         assert_eq!(journal.prepared_request.payload, payload);
         let mut changed = prepared.request.clone();
         let mut changed_payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        changed_payload["billing_quote"]["answer"] = "500000000000".into();
+        changed_payload["billing_quote"]["price"] = "500000000000".into();
         changed.payload = changed_payload.to_string();
         changed.payload_hash = canonical_payload_hash(changed.payload.as_bytes());
         assert!(matches!(

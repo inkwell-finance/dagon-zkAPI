@@ -1,0 +1,9 @@
+{
+  "schema": "dagon-zkapi.solana-identity.v1",
+  "network": "mainnet-beta",
+  "genesis_hash": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+  "vault_authority": null,
+  "vault_state": null,
+  "treasury": null,
+  "pyth_price_account": "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE"
+}

@@ -1,0 +1,34 @@
+[package]
+name = "dagon-zkapi-pyth-pusher"
+description = "Operator Pyth SOL/USD pusher: posts Hermes updates through Wormhole and the Pyth push oracle into the profile's price account"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dagon-zkapi-pyth-pusher"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+byteorder = "1.5"
+clap = { workspace = true }
+dagon-zkapi-profile = { path = "../dagon-zkapi-profile" }
+pythnet-sdk = "=2.3.1"
+rand = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+solana-compute-budget-interface = "=2.2.2"
+solana-hash = "=2.3.0"
+solana-instruction = "=2.3.3"
+solana-keypair = "=2.2.3"
+solana-message = { version = "=2.4.0", features = ["bincode"] }
+solana-pubkey = { version = "=2.4.0", features = ["sha2"] }
+solana-signer = "=2.2.1"
+solana-system-interface = { version = "=1.0.0", features = ["bincode"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -10,6 +10,7 @@ anchor-lang = "=0.32.1"
 base64 = { workspace = true }
 bincode = "1.3"
 dagon-zkapi-ledger = { path = "../dagon-zkapi-ledger" }
+dagon-zkapi-profile = { path = "../dagon-zkapi-profile" }
 dagon-zkapi-vault = { path = "../../solana/programs/dagon-zkapi-vault", features = ["no-entrypoint"] }
 rand = { workspace = true }
 reqwest = { workspace = true }
@@ -27,6 +28,7 @@ zkapi-proof = { path = "../../protocol/rust/crates/zkapi-proof" }
 zkapi-types = { path = "../../protocol/rust/crates/zkapi-types" }
 
 [dev-dependencies]
+dagon-zkapi-deploy = { path = "../dagon-zkapi-deploy" }
 solana-keypair = "=2.2.3"
 solana-signer = "=2.2.1"
 tokio = { workspace = true }

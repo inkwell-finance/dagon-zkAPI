@@ -16,10 +16,8 @@ use zkapi_types::{Felt252, RequestPublicInputsV2, WithdrawalPublicInputsV2, MERK
 /// Boxed future keeps [`CreditLedger`] object-safe without fixing a runtime.
 pub type LedgerFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, LedgerError>> + Send + 'a>>;
 
-/// A chain account normalized to the 32-byte account width used by Solana.
-///
-/// Compatibility backends left-pad shorter account identifiers. The bytes are
-/// an identifier only; protocol proofs bind [`LedgerDeployment::protocol_binding`].
+/// A 32-byte Solana account. The bytes are an identifier only; protocol
+/// proofs bind [`LedgerDeployment::protocol_binding`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct LedgerAccount(pub [u8; 32]);
@@ -28,12 +26,6 @@ impl LedgerAccount {
     pub const ZERO: Self = Self([0; 32]);
 
     pub const fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn from_evm_address(address: [u8; 20]) -> Self {
-        let mut bytes = [0; 32];
-        bytes[12..].copy_from_slice(&address);
         Self(bytes)
     }
 
@@ -65,7 +57,7 @@ pub struct LedgerDeployment {
     pub chain_id: u64,
     /// Field element carried in the v2 `contract_address` input.
     pub protocol_binding: Felt252,
-    /// Concrete vault state account (or a left-padded compatibility address).
+    /// Concrete vault state account.
     pub vault: LedgerAccount,
     pub asset: LedgerAsset,
 }
@@ -96,7 +88,7 @@ pub struct LedgerSnapshot {
     pub leaves: Vec<Felt252>,
 }
 
-/// One Merkle path, used by operator workflows and compatibility clients.
+/// One Merkle path, used by operator workflows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerPath {
     pub state: LedgerState,

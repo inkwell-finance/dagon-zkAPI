@@ -15,6 +15,7 @@ use anchor_lang::{
 };
 use base64::Engine;
 use dagon_zkapi_ledger::*;
+use dagon_zkapi_profile::{executable_sha256, to_hex, ResolvedIdentity, SharedProfile};
 use dagon_zkapi_vault as vault_program;
 use rand::RngCore;
 use serde::de::DeserializeOwned;
@@ -59,6 +60,26 @@ pub struct SolanaLedgerConfig {
     pub genesis_hash: [u8; 32],
 }
 
+impl SolanaLedgerConfig {
+    /// The ledger of the profile's program under an operator's network identity.
+    pub fn from_identity(
+        rpc_url: String,
+        indexer_url: Option<String>,
+        network: String,
+        profile: &SharedProfile,
+        identity: &ResolvedIdentity,
+    ) -> Self {
+        Self {
+            rpc_url,
+            indexer_url,
+            network,
+            program_id: profile.program_id(),
+            vault_state: identity.vault_state,
+            genesis_hash: identity.genesis_hash,
+        }
+    }
+}
+
 pub struct SolanaCreditLedger {
     config: SolanaLedgerConfig,
     deployment: LedgerDeployment,
@@ -77,7 +98,11 @@ pub struct SolanaCreditLedger {
 pub struct SolanaVaultRuntimeView {
     pub state: LedgerState,
     pub paused: bool,
+    pub version: u8,
+    pub authority: [u8; 32],
+    pub treasury: [u8; 32],
     pub request_charge_cap: u64,
+    pub note_ttl: u64,
     /// The vault's escape challenge period in seconds.
     pub challenge_period: u64,
     pub state_signing_key_x: Felt252,
@@ -156,12 +181,14 @@ impl SolanaCreditLedger {
     }
 
     /// Verify that the pinned program is an executable loader-v3 deployment
-    /// whose upgrade authority has been permanently revoked.
+    /// whose upgrade authority has been permanently revoked, and return its
+    /// `solana-verify` executable hash (the program-data bytes after the
+    /// loader metadata, trailing zeros trimmed).
     ///
     /// This is deliberately separate from [`Self::finalized_vault`]: vault
     /// identity and deployed-code immutability are independent startup gates.
     /// Both accounts are read at finalized commitment from the pinned cluster.
-    pub async fn assert_immutable_program(&self) -> Result<(), LedgerError> {
+    pub async fn assert_immutable_program(&self) -> Result<[u8; 32], LedgerError> {
         self.assert_cluster().await?;
         let commitment = LedgerCommitment::Finalized;
         let program = self
@@ -183,6 +210,40 @@ impl SolanaCreditLedger {
                 ))
             })?;
         assert_immutable_program_data(program_data_address, &program_data)
+    }
+
+    /// Every deployment gate shared by the operator binaries, read at
+    /// finalized commitment before any local state is opened:
+    ///
+    /// * this ledger is the profile's program under `identity`;
+    /// * the RPC's genesis hash is the identity's;
+    /// * the program is immutable and its executable hash is the profile's;
+    /// * the vault's version, request charge cap, note TTL and challenge
+    ///   period are the profile's, and its treasury is the identity's.
+    pub async fn assert_profile_deployment(
+        &self,
+        profile: &SharedProfile,
+        identity: &ResolvedIdentity,
+    ) -> Result<SolanaVaultRuntimeView, LedgerError> {
+        if self.config.program_id != profile.program_id()
+            || self.config.vault_state != identity.vault_state
+            || self.config.genesis_hash != identity.genesis_hash
+        {
+            return Err(LedgerError::DeploymentMismatch(
+                "Solana ledger is not the profile program under the network identity".into(),
+            ));
+        }
+        let executable = self.assert_immutable_program().await?;
+        if executable != profile.executable_sha256() {
+            return Err(LedgerError::DeploymentMismatch(format!(
+                "program executable hash {} is not the profile's {}",
+                to_hex(&executable),
+                profile.program.executable_sha256
+            )));
+        }
+        let view = self.finalized_vault().await?;
+        check_vault_profile(&view, profile, identity)?;
+        Ok(view)
     }
 
     /// Build an owner-signed transaction that closes an abandoned staged
@@ -218,7 +279,9 @@ impl SolanaCreditLedger {
         let payer = account_pubkey(payer);
         let (vault, _) = self.vault_account(LedgerCommitment::Tip).await?;
         if vault.treasury_accrued == 0 {
-            return Err(LedgerError::Rejected("no treasury share has accrued".into()));
+            return Err(LedgerError::Rejected(
+                "no treasury share has accrued".into(),
+            ));
         }
         let instruction = Instruction {
             program_id: self.program_id,
@@ -394,7 +457,10 @@ impl SolanaCreditLedger {
         let Some(snapshot) = self.account_snapshot(address, commitment).await? else {
             return Ok(None);
         };
-        Ok(Some((self.decode_owned(address, &snapshot)?, snapshot.observed_slot)))
+        Ok(Some((
+            self.decode_owned(address, &snapshot)?,
+            snapshot.observed_slot,
+        )))
     }
 
     fn decode_owned<T: AccountDeserialize>(
@@ -494,21 +560,25 @@ impl SolanaCreditLedger {
         commitment: LedgerCommitment,
         min_slot: u64,
     ) -> Result<(u64, Vec<Option<Value>>), LedgerError> {
-        let mut result: Value = self.rpc(
-            "getMultipleAccounts",
-            json!([
-                addresses.iter().map(|(address, _)| address.to_string()).collect::<Vec<_>>(),
-                {"encoding": "base64", "commitment": commitment_name(commitment),
-                 "minContextSlot": min_slot}
-            ]),
-        ).await?;
-        let slot = result["context"]["slot"].as_u64().ok_or_else(|| {
-            LedgerError::InvalidData("account page lacks context slot".into())
-        })?;
+        let mut result: Value = self
+            .rpc(
+                "getMultipleAccounts",
+                json!([
+                    addresses.iter().map(|(address, _)| address.to_string()).collect::<Vec<_>>(),
+                    {"encoding": "base64", "commitment": commitment_name(commitment),
+                     "minContextSlot": min_slot}
+                ]),
+            )
+            .await?;
+        let slot = result["context"]["slot"]
+            .as_u64()
+            .ok_or_else(|| LedgerError::InvalidData("account page lacks context slot".into()))?;
         let accounts: Vec<Option<Value>> = serde_json::from_value(result["value"].take())
             .map_err(|error| LedgerError::InvalidData(error.to_string()))?;
         if slot < min_slot || accounts.len() != addresses.len() {
-            return Err(LedgerError::InvalidData("stale or incomplete account page".into()));
+            return Err(LedgerError::InvalidData(
+                "stale or incomplete account page".into(),
+            ));
         }
         Ok((slot, accounts))
     }
@@ -528,9 +598,12 @@ impl SolanaCreditLedger {
         let expected_owner = self.program_id.to_string();
         let mut start = 0;
         while start < vault.next_note_id {
-            let end = start.saturating_add(ACCOUNT_PAGE_SIZE).min(vault.next_note_id);
+            let end = start
+                .saturating_add(ACCOUNT_PAGE_SIZE)
+                .min(vault.next_note_id);
             let addresses: Vec<_> = (start..end)
-                .map(|id| note_address(self.vault, id, self.program_id)).collect();
+                .map(|id| note_address(self.vault, id, self.program_id))
+                .collect();
             let (page_slot, accounts) = self.account_page(&addresses, commitment, slot).await?;
             slot = page_slot;
             for ((note_id, (_, bump)), account) in (start..end).zip(addresses).zip(accounts) {
@@ -549,7 +622,10 @@ impl SolanaCreditLedger {
                         vault_program::NOTE_STATUS_ACTIVE
                         | vault_program::NOTE_STATUS_PENDING
                         | vault_program::NOTE_STATUS_CLOSED => core::note_leaf(
-                            note_id, &registration, u128::from(note.deposit_amount), note.expiry,
+                            note_id,
+                            &registration,
+                            u128::from(note.deposit_amount),
+                            note.expiry,
                         ),
                         vault_program::NOTE_STATUS_RETIRED => Felt252::ZERO,
                         _ => return Err(LedgerError::InvalidData("invalid note status".into())),
@@ -802,15 +878,21 @@ fn decode_scanned_account<T: AccountDeserialize + Space>(
         || account["executable"].as_bool() != Some(false)
         || account["data"][1].as_str() != Some("base64")
     {
-        return Err(LedgerError::InvalidData("invalid account scan metadata".into()));
+        return Err(LedgerError::InvalidData(
+            "invalid account scan metadata".into(),
+        ));
     }
     let data = base64::engine::general_purpose::STANDARD
-        .decode(account["data"][0].as_str().ok_or_else(|| {
-            LedgerError::InvalidData("account scan data missing".into())
-        })?)
+        .decode(
+            account["data"][0]
+                .as_str()
+                .ok_or_else(|| LedgerError::InvalidData("account scan data missing".into()))?,
+        )
         .map_err(|error| LedgerError::InvalidData(error.to_string()))?;
     if data.len() != 8 + T::INIT_SPACE {
-        return Err(LedgerError::InvalidData("noncanonical account scan size".into()));
+        return Err(LedgerError::InvalidData(
+            "noncanonical account scan size".into(),
+        ));
     }
     T::try_deserialize(&mut data.as_slice())
         .map_err(|error| LedgerError::InvalidData(error.to_string()))
@@ -830,13 +912,55 @@ fn runtime_view(
             commitment,
         },
         paused: vault.paused,
+        version: vault.version,
+        authority: vault.authority.to_bytes(),
+        treasury: vault.treasury.to_bytes(),
         request_charge_cap: vault.request_charge_cap,
+        note_ttl: vault.note_ttl,
         challenge_period: vault.challenge_period,
         state_signing_key_x: felt(vault.state_signing_key_x)?,
         state_signing_key_y: felt(vault.state_signing_key_y)?,
         clearance_signing_key_x: felt(vault.clearance_signing_key_x)?,
         clearance_signing_key_y: felt(vault.clearance_signing_key_y)?,
     })
+}
+
+/// The finalized vault must carry exactly the profile's parameters and the
+/// identity's accounts.
+pub fn check_vault_profile(
+    view: &SolanaVaultRuntimeView,
+    profile: &SharedProfile,
+    identity: &ResolvedIdentity,
+) -> Result<(), LedgerError> {
+    let vault = &profile.vault;
+    let mismatches: Vec<String> = [
+        ("version", u64::from(view.version), u64::from(vault.version)),
+        (
+            "request_charge_cap",
+            view.request_charge_cap,
+            vault.request_charge_cap,
+        ),
+        ("note_ttl", view.note_ttl, vault.note_ttl_seconds),
+        (
+            "challenge_period",
+            view.challenge_period,
+            vault.challenge_period_seconds,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, actual, expected)| actual != expected)
+    .map(|(name, actual, expected)| format!("{name} {actual} (profile {expected})"))
+    .chain((view.authority != identity.vault_authority).then(|| "authority".to_string()))
+    .chain((view.treasury != identity.treasury).then(|| "treasury".to_string()))
+    .collect();
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(LedgerError::DeploymentMismatch(format!(
+            "Solana vault does not match the profile/identity: {}",
+            mismatches.join(", ")
+        )))
+    }
 }
 
 impl CreditLedger for SolanaCreditLedger {
@@ -1020,9 +1144,12 @@ impl CreditLedger for SolanaCreditLedger {
             let mut escapes = Vec::new();
             let mut start = 0;
             while start < vault.next_note_id {
-                let end = start.saturating_add(ACCOUNT_PAGE_SIZE).min(vault.next_note_id);
+                let end = start
+                    .saturating_add(ACCOUNT_PAGE_SIZE)
+                    .min(vault.next_note_id);
                 let addresses: Vec<_> = (start..end)
-                    .map(|id| pending_address(self.vault, id, self.program_id)).collect();
+                    .map(|id| pending_address(self.vault, id, self.program_id))
+                    .collect();
                 let (page_slot, accounts) = self.account_page(&addresses, commitment, slot).await?;
                 slot = page_slot;
                 for ((note_id, (_, bump)), account) in (start..end).zip(addresses).zip(accounts) {
@@ -1031,20 +1158,22 @@ impl CreditLedger for SolanaCreditLedger {
                     };
                     let pending: vault_program::PendingWithdrawal =
                         decode_scanned_account(&account, &expected_owner)?;
-                    if pending.note_id != note_id || pending.bump != bump
+                    if pending.note_id != note_id
+                        || pending.bump != bump
                         || pending.vault != self.vault
                     {
                         return Err(LedgerError::DeploymentMismatch(
                             "pending withdrawal does not match its canonical PDA".into(),
                         ));
                     }
-                    let felt = |bytes| Felt252::try_from_bytes_be(bytes)
-                        .map_err(LedgerError::InvalidData);
+                    let felt =
+                        |bytes| Felt252::try_from_bytes_be(bytes).map_err(LedgerError::InvalidData);
                     if pending.final_balance.checked_add(pending.conceded)
                         != Some(pending.state_balance)
                     {
                         return Err(LedgerError::InvalidData(
-                            "pending withdrawal balance does not equal payout plus concession".into(),
+                            "pending withdrawal balance does not equal payout plus concession"
+                                .into(),
                         ));
                     }
                     escapes.push(LedgerPendingEscape {
@@ -1060,9 +1189,13 @@ impl CreditLedger for SolanaCreditLedger {
                 start = end;
             }
             let observed_time: Option<i64> = self.rpc("getBlockTime", json!([slot])).await?;
-            let observed_time = observed_time.map(|time| u64::try_from(time).map_err(|_| {
-                LedgerError::InvalidData("pending-account block time is negative".into())
-            })).transpose()?;
+            let observed_time = observed_time
+                .map(|time| {
+                    u64::try_from(time).map_err(|_| {
+                        LedgerError::InvalidData("pending-account block time is negative".into())
+                    })
+                })
+                .transpose()?;
             for escape in &mut escapes {
                 escape.observed_time = observed_time;
             }
@@ -1196,7 +1329,11 @@ impl CreditLedger for SolanaCreditLedger {
                     vault: self.vault,
                     note,
                     pending: pending_address,
-                    used_nullifier: nullifier_address(self.vault, pending.nullifier, self.program_id),
+                    used_nullifier: nullifier_address(
+                        self.vault,
+                        pending.nullifier,
+                        self.program_id,
+                    ),
                     next_nullifier: nullifier_address(
                         self.vault,
                         pending.next_nullifier,
@@ -1490,7 +1627,9 @@ impl SolanaCreditLedger {
             _ => return Err(LedgerError::Rejected("note has no pending escape".into())),
         };
         let pending: vault_program::PendingWithdrawal = self.decode_owned(address, &snapshot)?;
-        if pending.vault != self.vault || pending.note_id != note_id || pending.bump != expected_bump
+        if pending.vault != self.vault
+            || pending.note_id != note_id
+            || pending.bump != expected_bump
         {
             return Err(LedgerError::DeploymentMismatch(
                 "pending withdrawal does not match its canonical PDA".into(),
@@ -1564,7 +1703,7 @@ impl SolanaCreditLedger {
         if public
             .final_balance
             .checked_add(public.conceded)
-            .map_or(true, |balance| balance > deposit)
+            .is_none_or(|balance| balance > deposit)
         {
             return Err(LedgerError::Rejected(
                 "withdrawal balance exceeds the note deposit".into(),
@@ -1661,13 +1800,14 @@ fn immutable_program_data_address(
 fn assert_immutable_program_data(
     address: Pubkey,
     account: &SolanaAccountSnapshot,
-) -> Result<(), LedgerError> {
+) -> Result<[u8; 32], LedgerError> {
     if account.owner != bpf_loader_upgradeable::ID || account.executable {
         return Err(LedgerError::DeploymentMismatch(format!(
             "program-data account {address} has invalid owner or executable state"
         )));
     }
-    if account.data.len() < UpgradeableLoaderState::size_of_programdata_metadata() {
+    let metadata = UpgradeableLoaderState::size_of_programdata_metadata();
+    if account.data.len() < metadata {
         return Err(LedgerError::DeploymentMismatch(format!(
             "program-data account {address} is truncated"
         )));
@@ -1676,7 +1816,7 @@ fn assert_immutable_program_data(
         Ok(UpgradeableLoaderState::ProgramData {
             upgrade_authority_address: None,
             ..
-        }) => Ok(()),
+        }) => Ok(executable_sha256(&account.data[metadata..])),
         Ok(UpgradeableLoaderState::ProgramData {
             upgrade_authority_address: Some(_),
             ..
@@ -1876,12 +2016,18 @@ mod tests {
     }
 
     async fn response_sequence_rpc(results: Vec<Value>) -> (String, tokio::task::JoinHandle<()>) {
-        raw_response_sequence_rpc(results.into_iter().map(|result| {
-            json!({"jsonrpc": "2.0", "id": 1, "result": result})
-        }).collect()).await
+        raw_response_sequence_rpc(
+            results
+                .into_iter()
+                .map(|result| json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+                .collect(),
+        )
+        .await
     }
 
-    async fn raw_response_sequence_rpc(replies: Vec<Value>) -> (String, tokio::task::JoinHandle<()>) {
+    async fn raw_response_sequence_rpc(
+        replies: Vec<Value>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -1924,18 +2070,27 @@ mod tests {
     #[tokio::test]
     async fn account_pages_check_cardinality_and_context() {
         let addresses: Vec<_> = (0..ACCOUNT_PAGE_SIZE)
-            .map(|_| (Pubkey::new_unique(), 0)).collect();
+            .map(|_| (Pubkey::new_unique(), 0))
+            .collect();
         for (count, slot, valid) in [(100, 44, true), (99, 44, false), (100, 43, false)] {
             let (rpc_url, server) = single_response_rpc(json!({
                 "context": {"slot": slot}, "value": vec![Value::Null; count],
-            })).await;
+            }))
+            .await;
             let ledger = SolanaCreditLedger::new(SolanaLedgerConfig {
-                rpc_url, indexer_url: None, network: "localnet".into(),
+                rpc_url,
+                indexer_url: None,
+                network: "localnet".into(),
                 program_id: vault_program::ID.to_bytes(),
-                vault_state: [2; 32], genesis_hash: [3; 32],
-            }).unwrap();
+                vault_state: [2; 32],
+                genesis_hash: [3; 32],
+            })
+            .unwrap();
             assert_eq!(
-                ledger.account_page(&addresses, LedgerCommitment::Tip, 44).await.is_ok(),
+                ledger
+                    .account_page(&addresses, LedgerCommitment::Tip, 44)
+                    .await
+                    .is_ok(),
                 valid,
             );
             server.await.unwrap();
@@ -1947,7 +2102,12 @@ mod tests {
         let program_failure = json!({"InstructionError": [2, {"Custom": 6000}]});
         for (method, code, err, rejected) in [
             ("sendTransaction", -32002, program_failure.clone(), true),
-            ("sendTransaction", -32002, json!("InsufficientFundsForFee"), true),
+            (
+                "sendTransaction",
+                -32002,
+                json!("InsufficientFundsForFee"),
+                true,
+            ),
             // An earlier send landed, or the node lags the plan's blockhash.
             ("sendTransaction", -32002, json!("AlreadyProcessed"), false),
             ("sendTransaction", -32002, json!("BlockhashNotFound"), false),
@@ -1961,14 +2121,23 @@ mod tests {
                     "code": code, "message": "simulation failed",
                     "data": {"err": err}
                 }
-            })]).await;
+            })])
+            .await;
             let ledger = SolanaCreditLedger::new(SolanaLedgerConfig {
-                rpc_url, indexer_url: None, network: "localnet".into(),
+                rpc_url,
+                indexer_url: None,
+                network: "localnet".into(),
                 program_id: vault_program::ID.to_bytes(),
-                vault_state: [2; 32], genesis_hash: [3; 32],
-            }).unwrap();
+                vault_state: [2; 32],
+                genesis_hash: [3; 32],
+            })
+            .unwrap();
             let error = ledger.rpc::<Value>(method, json!([])).await.unwrap_err();
-            assert_eq!(matches!(error, LedgerError::Rejected(_)), rejected, "{error}");
+            assert_eq!(
+                matches!(error, LedgerError::Rejected(_)),
+                rejected,
+                "{error}"
+            );
             if !rejected {
                 assert!(matches!(error, LedgerError::Unavailable(_)));
             }
@@ -1995,8 +2164,11 @@ mod tests {
             genesis_hash,
             chain_id: solana_chain_id(&genesis_hash),
             protocol_binding: *solana_deployment_binding(
-                &program_id.to_bytes(), &address.to_bytes(), &genesis_hash,
-            ).as_bytes(),
+                &program_id.to_bytes(),
+                &address.to_bytes(),
+                &genesis_hash,
+            )
+            .as_bytes(),
             current_root: *root.as_bytes(),
             next_note_id,
             note_ttl: 86_400,
@@ -2019,7 +2191,10 @@ mod tests {
         let mut data = Vec::new();
         value.try_serialize(&mut data).unwrap();
         rpc_account(&SolanaAccountSnapshot {
-            data, owner: program_id, executable: false, observed_slot: 44,
+            data,
+            owner: program_id,
+            executable: false,
+            observed_slot: 44,
         })
     }
 
@@ -2040,11 +2215,21 @@ mod tests {
         let vault_response = program_account(&vault, program_id);
         let note_value = |note_id: u32, status: u8| {
             let (_, bump) = note_address(vault_address, note_id, program_id);
-            program_account(&vault_program::NoteState {
-                vault: vault_address, note_id, commitment: *registration.as_bytes(),
-                deposit_amount: 50, expiry: 4_000_000_000, status, bump,
-                claimable_after: 4_000_000_000, paused_offset: 0,
-            }, program_id)["value"].clone()
+            program_account(
+                &vault_program::NoteState {
+                    vault: vault_address,
+                    note_id,
+                    commitment: *registration.as_bytes(),
+                    deposit_amount: 50,
+                    expiry: 4_000_000_000,
+                    status,
+                    bump,
+                    claimable_after: 4_000_000_000,
+                    paused_offset: 0,
+                },
+                program_id,
+            )["value"]
+                .clone()
         };
         let notes = vec![
             note_value(0, vault_program::NOTE_STATUS_PENDING),
@@ -2090,12 +2275,17 @@ mod tests {
                 json!(Hash::new_from_array(genesis_hash).to_string()),
                 vault_response.clone(),
                 response,
-            ]).await;
+            ])
+            .await;
             let ledger = SolanaCreditLedger::new(SolanaLedgerConfig {
-                rpc_url, indexer_url: None, network: "localnet".into(),
-                program_id: program_id.to_bytes(), vault_state: vault_address.to_bytes(),
+                rpc_url,
+                indexer_url: None,
+                network: "localnet".into(),
+                program_id: program_id.to_bytes(),
+                vault_state: vault_address.to_bytes(),
                 genesis_hash,
-            }).unwrap();
+            })
+            .unwrap();
             let result = ledger.path(3, true, LedgerCommitment::Tip).await;
             if matches!(variant, 0 | 6) {
                 let path = result.unwrap();
@@ -2104,7 +2294,10 @@ mod tests {
                 assert_eq!(path.leaf, Felt252::ZERO);
                 assert_eq!(path.siblings, tree.get_siblings(3));
             } else {
-                assert!(result.is_err(), "accepted malformed live snapshot {variant}");
+                assert!(
+                    result.is_err(),
+                    "accepted malformed live snapshot {variant}"
+                );
             }
             server.await.unwrap();
         }
@@ -2158,7 +2351,10 @@ mod tests {
             },
             false,
         );
-        assert_immutable_program_data(program_data_address, &immutable).unwrap();
+        assert_eq!(
+            assert_immutable_program_data(program_data_address, &immutable).unwrap(),
+            executable_sha256(b"program bytes")
+        );
 
         let mutable = loader_snapshot(
             UpgradeableLoaderState::ProgramData {
@@ -2232,7 +2428,10 @@ mod tests {
         })
         .unwrap();
 
-        ledger.assert_immutable_program().await.unwrap();
+        assert_eq!(
+            ledger.assert_immutable_program().await.unwrap(),
+            executable_sha256(b"program bytes")
+        );
         server.await.unwrap();
     }
 
@@ -2241,28 +2440,39 @@ mod tests {
         let genesis_hash = [3; 32];
         let program_id = vault_program::ID;
         let count = 4_096;
-        let (vault, state) =
-            test_vault(program_id, genesis_hash, core::EMPTY_MERKLE_ROOT, count);
+        let (vault, state) = test_vault(program_id, genesis_hash, core::EMPTY_MERKLE_ROOT, count);
         let authority = state.authority;
         let vault_response = program_account(&state, program_id);
-        let accounts: Vec<Value> = (0..count).map(|note_id| {
-            let (_, bump) = pending_address(vault, note_id, program_id);
-            let pending = vault_program::PendingWithdrawal {
-                vault, note_id,
-                nullifier: *Felt252::from_u64(u64::from(note_id) + 1).as_bytes(),
-                next_nullifier: *Felt252::from_u64(u64::from(note_id) + 100_000).as_bytes(),
-                state_balance: 10, conceded: 9, final_balance: 1, destination: authority,
-                deadline: 1_900_000_000, bump,
-            };
-            let mut data = Vec::new();
-            pending.try_serialize(&mut data).unwrap();
-            rpc_account(&SolanaAccountSnapshot {
-                data, owner: program_id, executable: false, observed_slot: 44,
-            })["value"].clone()
-        }).collect();
+        let accounts: Vec<Value> = (0..count)
+            .map(|note_id| {
+                let (_, bump) = pending_address(vault, note_id, program_id);
+                let pending = vault_program::PendingWithdrawal {
+                    vault,
+                    note_id,
+                    nullifier: *Felt252::from_u64(u64::from(note_id) + 1).as_bytes(),
+                    next_nullifier: *Felt252::from_u64(u64::from(note_id) + 100_000).as_bytes(),
+                    state_balance: 10,
+                    conceded: 9,
+                    final_balance: 1,
+                    destination: authority,
+                    deadline: 1_900_000_000,
+                    bump,
+                };
+                let mut data = Vec::new();
+                pending.try_serialize(&mut data).unwrap();
+                rpc_account(&SolanaAccountSnapshot {
+                    data,
+                    owner: program_id,
+                    executable: false,
+                    observed_slot: 44,
+                })["value"]
+                    .clone()
+            })
+            .collect();
         assert!(serde_json::to_vec(&accounts).unwrap().len() > MAX_RPC_RESPONSE_BYTES);
         let mut responses = vec![
-            json!(Hash::new_from_array(genesis_hash).to_string()), vault_response.clone(),
+            json!(Hash::new_from_array(genesis_hash).to_string()),
+            vault_response.clone(),
         ];
         for page in accounts.chunks(ACCOUNT_PAGE_SIZE as usize) {
             let response = json!({"context": {"slot": 44}, "value": page});
@@ -2272,15 +2482,26 @@ mod tests {
         responses.push(json!(1_800_000_000i64));
         let (rpc_url, server) = response_sequence_rpc(responses).await;
         let ledger = SolanaCreditLedger::new(SolanaLedgerConfig {
-            rpc_url, indexer_url: None, network: "localnet".into(),
-            program_id: program_id.to_bytes(), vault_state: vault.to_bytes(), genesis_hash,
-        }).unwrap();
-        let escapes = ledger.pending_escapes(LedgerCommitment::Finalized).await.unwrap();
+            rpc_url,
+            indexer_url: None,
+            network: "localnet".into(),
+            program_id: program_id.to_bytes(),
+            vault_state: vault.to_bytes(),
+            genesis_hash,
+        })
+        .unwrap();
+        let escapes = ledger
+            .pending_escapes(LedgerCommitment::Finalized)
+            .await
+            .unwrap();
         assert_eq!(escapes.len(), count as usize);
         for (note_id, escape) in escapes.iter().enumerate() {
             assert_eq!(escape.note_id, note_id as u32);
             assert_eq!(escape.nullifier, Felt252::from_u64(note_id as u64 + 1));
-            assert_eq!(escape.next_nullifier, Felt252::from_u64(note_id as u64 + 100_000));
+            assert_eq!(
+                escape.next_nullifier,
+                Felt252::from_u64(note_id as u64 + 100_000)
+            );
             assert_eq!((escape.state_balance, escape.conceded), (10, 9));
             assert_eq!(escape.observed_time, Some(1_800_000_000));
         }
@@ -2296,7 +2517,8 @@ mod tests {
         funded[7] = unclaimed.clone();
         funded[count as usize - 1] = unclaimed;
         let mut responses = vec![
-            json!(Hash::new_from_array(genesis_hash).to_string()), vault_response.clone(),
+            json!(Hash::new_from_array(genesis_hash).to_string()),
+            vault_response.clone(),
         ];
         for page in funded.chunks(ACCOUNT_PAGE_SIZE as usize) {
             responses.push(json!({"context": {"slot": 44}, "value": page}));
@@ -2304,11 +2526,18 @@ mod tests {
         responses.push(json!(1_800_000_000i64));
         let (rpc_url, server) = response_sequence_rpc(responses).await;
         let ledger = SolanaCreditLedger::new(SolanaLedgerConfig {
-            rpc_url, ..ledger.config.clone()
-        }).unwrap();
-        let escapes = ledger.pending_escapes(LedgerCommitment::Finalized).await.unwrap();
+            rpc_url,
+            ..ledger.config.clone()
+        })
+        .unwrap();
+        let escapes = ledger
+            .pending_escapes(LedgerCommitment::Finalized)
+            .await
+            .unwrap();
         assert_eq!(escapes.len(), count as usize - 2);
-        assert!(escapes.iter().all(|escape| escape.note_id != 7 && escape.note_id != count - 1));
+        assert!(escapes
+            .iter()
+            .all(|escape| escape.note_id != 7 && escape.note_id != count - 1));
         assert!(escapes.iter().any(|escape| escape.note_id == 8));
         server.await.unwrap();
 
@@ -2318,10 +2547,13 @@ mod tests {
             json!(Hash::new_from_array(genesis_hash).to_string()),
             vault_response,
             json!({"context": {"slot": 44}, "value": wrong_accounts}),
-        ]).await;
+        ])
+        .await;
         let ledger = SolanaCreditLedger::new(SolanaLedgerConfig {
-            rpc_url, ..ledger.config.clone()
-        }).unwrap();
+            rpc_url,
+            ..ledger.config.clone()
+        })
+        .unwrap();
         assert!(matches!(
             ledger.pending_escapes(LedgerCommitment::Finalized).await,
             Err(LedgerError::DeploymentMismatch(_)),
@@ -2332,19 +2564,33 @@ mod tests {
         // malformed, not silently passed to the challenger's raise policy.
         let (_, bump) = pending_address(vault, 0, program_id);
         let mut inconsistent = accounts[..ACCOUNT_PAGE_SIZE as usize].to_vec();
-        inconsistent[0] = program_account(&vault_program::PendingWithdrawal {
-            vault, note_id: 0, nullifier: *Felt252::ONE.as_bytes(),
-            next_nullifier: *Felt252::from_u64(2).as_bytes(), state_balance: 10, conceded: 3,
-            final_balance: 1, destination: authority, deadline: 1_900_000_000, bump,
-        }, program_id)["value"].clone();
+        inconsistent[0] = program_account(
+            &vault_program::PendingWithdrawal {
+                vault,
+                note_id: 0,
+                nullifier: *Felt252::ONE.as_bytes(),
+                next_nullifier: *Felt252::from_u64(2).as_bytes(),
+                state_balance: 10,
+                conceded: 3,
+                final_balance: 1,
+                destination: authority,
+                deadline: 1_900_000_000,
+                bump,
+            },
+            program_id,
+        )["value"]
+            .clone();
         let (rpc_url, server) = response_sequence_rpc(vec![
             json!(Hash::new_from_array(genesis_hash).to_string()),
             program_account(&state, program_id),
             json!({"context": {"slot": 44}, "value": inconsistent}),
-        ]).await;
+        ])
+        .await;
         let ledger = SolanaCreditLedger::new(SolanaLedgerConfig {
-            rpc_url, ..ledger.config.clone()
-        }).unwrap();
+            rpc_url,
+            ..ledger.config.clone()
+        })
+        .unwrap();
         assert!(matches!(
             ledger.pending_escapes(LedgerCommitment::Finalized).await,
             Err(LedgerError::InvalidData(_)),
@@ -2396,10 +2642,63 @@ mod tests {
         assert!(view.paused);
         assert_eq!(view.request_charge_cap, 1_000_000);
         assert_eq!(view.challenge_period, 60);
+        assert_eq!(view.note_ttl, 86_400);
+        assert_eq!(view.version, vault_program::VAULT_VERSION);
         assert_eq!(view.state_signing_key_x, state_x);
         assert_eq!(view.state_signing_key_y, state_y);
         assert_eq!(view.clearance_signing_key_x, clear_x);
         assert_eq!(view.clearance_signing_key_y, clear_y);
+    }
+
+    /// The vault must carry exactly the profile's parameters and the
+    /// identity's authority and treasury; each difference is reported.
+    #[test]
+    fn vault_profile_gate_rejects_every_parameter_and_account_difference() {
+        let profile = SharedProfile::embedded();
+        let identity = ResolvedIdentity {
+            genesis_hash: [3; 32],
+            vault_authority: [5; 32],
+            vault_state: [6; 32],
+            treasury: [7; 32],
+            pyth_price_account: [8; 32],
+        };
+        let view = SolanaVaultRuntimeView {
+            state: LedgerState {
+                root: Felt252::ZERO,
+                next_note_id: 0,
+                observed_height: Some(1),
+                commitment: LedgerCommitment::Finalized,
+            },
+            paused: false,
+            version: profile.vault.version,
+            authority: identity.vault_authority,
+            treasury: identity.treasury,
+            request_charge_cap: profile.vault.request_charge_cap,
+            note_ttl: profile.vault.note_ttl_seconds,
+            challenge_period: profile.vault.challenge_period_seconds,
+            state_signing_key_x: Felt252::ZERO,
+            state_signing_key_y: Felt252::ZERO,
+            clearance_signing_key_x: Felt252::ZERO,
+            clearance_signing_key_y: Felt252::ZERO,
+        };
+        check_vault_profile(&view, profile, &identity).unwrap();
+        type Mutation = (&'static str, fn(&mut SolanaVaultRuntimeView));
+        let mutations: [Mutation; 6] = [
+            ("version", |view| view.version += 1),
+            ("request_charge_cap", |view| view.request_charge_cap += 1),
+            ("note_ttl", |view| view.note_ttl -= 1),
+            ("challenge_period", |view| view.challenge_period = 3_600),
+            ("authority", |view| view.authority = [9; 32]),
+            ("treasury", |view| view.treasury = [9; 32]),
+        ];
+        for (name, mutate) in mutations {
+            let mut changed = view.clone();
+            mutate(&mut changed);
+            let error = check_vault_profile(&changed, profile, &identity)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(name), "{name}: {error}");
+        }
     }
 
     #[test]
@@ -2479,59 +2778,150 @@ mod tests {
             },
             proof: vec![9; 256],
         };
-        let build = |accounts, data| Instruction { program_id: vault_program::ID, accounts, data };
+        let build = |accounts, data| Instruction {
+            program_id: vault_program::ID,
+            accounts,
+            data,
+        };
         let cases = [
-            ("escape", true, build(
-                accounts::ExecuteEscape {
-                    vault, note: unique(), pending: unique(), used_nullifier: unique(),
-                    next_nullifier: unique(), owner: payer, destination, system_program,
-                }.to_account_metas(None),
-                instruction::ExecuteEscape { note_id: u32::MAX, payload: withdrawal.clone() }.data(),
-            )),
-            ("close", true, build(
-                accounts::ExecuteClose {
-                    vault, note: unique(), used_nullifier: unique(), owner: payer, destination,
-                    system_program,
-                }.to_account_metas(None),
-                instruction::ExecuteClose { note_id: u32::MAX, payload: withdrawal }.data(),
-            )),
-            ("defeat", false, build(
-                accounts::ExecuteChallenge {
-                    vault, note: unique(), pending: unique(), used_nullifier: unique(),
-                    next_nullifier: unique(), payer,
-                }.to_account_metas(None),
-                instruction::ExecuteChallenge { note_id: u32::MAX, payload: evidence.clone() }.data(),
-            )),
-            ("raise", false, build(
-                accounts::RaiseEscapeConcession { vault, note: unique(), pending: unique(), payer }
+            (
+                "escape",
+                true,
+                build(
+                    accounts::ExecuteEscape {
+                        vault,
+                        note: unique(),
+                        pending: unique(),
+                        used_nullifier: unique(),
+                        next_nullifier: unique(),
+                        owner: payer,
+                        destination,
+                        system_program,
+                    }
                     .to_account_metas(None),
-                instruction::RaiseEscapeConcession {
-                    note_id: u32::MAX, payload: evidence, amount: u128::MAX,
-                }.data(),
-            )),
-            ("retire", true, build(
-                accounts::RetireClosedLeaf { vault, note: unique(), payer }.to_account_metas(None),
-                instruction::RetireClosedLeaf {
-                    note_id: u32::MAX, new_root: felt, transition_proof: vec![9; 256],
-                }.data(),
-            )),
-            ("withdraw_treasury", true, build(
-                accounts::WithdrawTreasury { vault, treasury: unique() }.to_account_metas(None),
-                instruction::WithdrawTreasury {}.data(),
-            )),
-            ("claim_expired", true, build(
-                accounts::ExecuteClaimExpired { vault, note: unique(), owner: payer }
+                    instruction::ExecuteEscape {
+                        note_id: u32::MAX,
+                        payload: withdrawal.clone(),
+                    }
+                    .data(),
+                ),
+            ),
+            (
+                "close",
+                true,
+                build(
+                    accounts::ExecuteClose {
+                        vault,
+                        note: unique(),
+                        used_nullifier: unique(),
+                        owner: payer,
+                        destination,
+                        system_program,
+                    }
                     .to_account_metas(None),
-                instruction::ExecuteClaimExpired { note_id: u32::MAX }.data(),
-            )),
+                    instruction::ExecuteClose {
+                        note_id: u32::MAX,
+                        payload: withdrawal,
+                    }
+                    .data(),
+                ),
+            ),
+            (
+                "defeat",
+                false,
+                build(
+                    accounts::ExecuteChallenge {
+                        vault,
+                        note: unique(),
+                        pending: unique(),
+                        used_nullifier: unique(),
+                        next_nullifier: unique(),
+                        payer,
+                    }
+                    .to_account_metas(None),
+                    instruction::ExecuteChallenge {
+                        note_id: u32::MAX,
+                        payload: evidence.clone(),
+                    }
+                    .data(),
+                ),
+            ),
+            (
+                "raise",
+                false,
+                build(
+                    accounts::RaiseEscapeConcession {
+                        vault,
+                        note: unique(),
+                        pending: unique(),
+                        payer,
+                    }
+                    .to_account_metas(None),
+                    instruction::RaiseEscapeConcession {
+                        note_id: u32::MAX,
+                        payload: evidence,
+                        amount: u128::MAX,
+                    }
+                    .data(),
+                ),
+            ),
+            (
+                "retire",
+                true,
+                build(
+                    accounts::RetireClosedLeaf {
+                        vault,
+                        note: unique(),
+                        payer,
+                    }
+                    .to_account_metas(None),
+                    instruction::RetireClosedLeaf {
+                        note_id: u32::MAX,
+                        new_root: felt,
+                        transition_proof: vec![9; 256],
+                    }
+                    .data(),
+                ),
+            ),
+            (
+                "withdraw_treasury",
+                true,
+                build(
+                    accounts::WithdrawTreasury {
+                        vault,
+                        treasury: unique(),
+                    }
+                    .to_account_metas(None),
+                    instruction::WithdrawTreasury {}.data(),
+                ),
+            ),
+            (
+                "claim_expired",
+                true,
+                build(
+                    accounts::ExecuteClaimExpired {
+                        vault,
+                        note: unique(),
+                        owner: payer,
+                    }
+                    .to_account_metas(None),
+                    instruction::ExecuteClaimExpired { note_id: u32::MAX }.data(),
+                ),
+            ),
         ];
         for (name, vault_writable, instruction) in cases {
             // The SDK transport pins the vault as the first vault-ix account;
             // root-free disputes must not take the vault write lock.
             assert_eq!(instruction.accounts[0].pubkey, vault, "{name}");
-            assert_eq!(instruction.accounts[0].is_writable, vault_writable, "{name}");
+            assert_eq!(
+                instruction.accounts[0].is_writable, vault_writable,
+                "{name}"
+            );
             let prepared = SolanaCreditLedger::compute_intensive_message(
-                instruction, payer, Hash::new_unique(), 10,
+                instruction,
+                payer,
+                Hash::new_unique(),
+                10,
             )
             .unwrap();
             eprintln!("{name}: {} of 1232 signed bytes", prepared.bytes.len() + 65);
@@ -2551,22 +2941,41 @@ mod tests {
             &[b"nullifier", vault.as_ref(), nullifier.as_bytes()],
             &vault_program::ID,
         );
-        let used = |status, bump| program_account(&vault_program::UsedNullifier {
-            vault, nullifier: *nullifier.as_bytes(), bump, status,
-        }, vault_program::ID);
-        let bare = |owner| rpc_account(&SolanaAccountSnapshot {
-            data: Vec::new(), owner, executable: false, observed_slot: 44,
-        });
+        let used = |status, bump| {
+            program_account(
+                &vault_program::UsedNullifier {
+                    vault,
+                    nullifier: *nullifier.as_bytes(),
+                    bump,
+                    status,
+                },
+                vault_program::ID,
+            )
+        };
+        let bare = |owner| {
+            rpc_account(&SolanaAccountSnapshot {
+                data: Vec::new(),
+                owner,
+                executable: false,
+                observed_slot: 44,
+            })
+        };
         use LedgerNullifierStatus::{Unused, Used};
         for (account, expected) in [
-            (json!({"context": {"slot": 44}, "value": null}), Some(Unused)),
+            (
+                json!({"context": {"slot": 44}, "value": null}),
+                Some(Unused),
+            ),
             (bare(anchor_lang::system_program::ID), Some(Unused)),
             (bare(Pubkey::new_unique()), None),
             (used(vault_program::NULLIFIER_RELEASED, bump), Some(Unused)),
             (used(vault_program::NULLIFIER_CONSUMED, bump), Some(Used)),
             (used(vault_program::NULLIFIER_CHALLENGED, bump), Some(Used)),
             (used(7, bump), None),
-            (used(vault_program::NULLIFIER_CONSUMED, bump.wrapping_sub(1)), None),
+            (
+                used(vault_program::NULLIFIER_CONSUMED, bump.wrapping_sub(1)),
+                None,
+            ),
         ] {
             let (rpc_url, server) = response_sequence_rpc(vec![
                 json!(Hash::new_from_array(genesis_hash).to_string()),
@@ -2574,11 +2983,17 @@ mod tests {
             ])
             .await;
             let ledger = SolanaCreditLedger::new(SolanaLedgerConfig {
-                rpc_url, indexer_url: None, network: "localnet".into(),
-                program_id: vault_program::ID.to_bytes(), vault_state: vault.to_bytes(), genesis_hash,
+                rpc_url,
+                indexer_url: None,
+                network: "localnet".into(),
+                program_id: vault_program::ID.to_bytes(),
+                vault_state: vault.to_bytes(),
+                genesis_hash,
             })
             .unwrap();
-            let status = ledger.nullifier_status(nullifier, LedgerCommitment::Tip).await;
+            let status = ledger
+                .nullifier_status(nullifier, LedgerCommitment::Tip)
+                .await;
             assert_eq!(status.as_ref().ok().copied(), expected, "{status:?}");
             server.await.unwrap();
         }
@@ -2596,9 +3011,16 @@ mod tests {
         let (escaped, successor) = (Felt252::from_u64(901), Felt252::from_u64(902));
         let (_, bump) = pending_address(vault_address, 0, program_id);
         let pending = vault_program::PendingWithdrawal {
-            vault: vault_address, note_id: 0, nullifier: *escaped.as_bytes(),
-            next_nullifier: *successor.as_bytes(), state_balance: 10, conceded: 3,
-            final_balance: 7, destination: Pubkey::new_unique(), deadline: 1_900_000_000, bump,
+            vault: vault_address,
+            note_id: 0,
+            nullifier: *escaped.as_bytes(),
+            next_nullifier: *successor.as_bytes(),
+            state_balance: 10,
+            conceded: 3,
+            final_balance: 7,
+            destination: Pubkey::new_unique(),
+            deadline: 1_900_000_000,
+            bump,
         };
         let request = |nullifier, solvency_bound| RequestPublicInputsV2 {
             protocol_version: PROTOCOL_VERSION,
@@ -2650,23 +3072,41 @@ mod tests {
             }
             let (rpc_url, server) = response_sequence_rpc(responses).await;
             let ledger = SolanaCreditLedger::new(SolanaLedgerConfig {
-                rpc_url, indexer_url: None, network: "localnet".into(),
-                program_id: program_id.to_bytes(), vault_state: vault_address.to_bytes(),
+                rpc_url,
+                indexer_url: None,
+                network: "localnet".into(),
+                program_id: program_id.to_bytes(),
+                vault_state: vault_address.to_bytes(),
                 genesis_hash,
-            }).unwrap();
+            })
+            .unwrap();
             let result = if defeat {
-                ledger.prepare_challenge(ChallengeRequest {
-                    payer, note_id: 0, public_inputs, proof: proof.clone(),
-                }).await
+                ledger
+                    .prepare_challenge(ChallengeRequest {
+                        payer,
+                        note_id: 0,
+                        public_inputs,
+                        proof: proof.clone(),
+                    })
+                    .await
             } else {
-                ledger.prepare_raise_concession(RaiseConcessionRequest {
-                    payer, note_id: 0, public_inputs, proof: proof.clone(), amount,
-                }).await
+                ledger
+                    .prepare_raise_concession(RaiseConcessionRequest {
+                        payer,
+                        note_id: 0,
+                        public_inputs,
+                        proof: proof.clone(),
+                        amount,
+                    })
+                    .await
             };
             if accepted {
                 assert_eq!(result.unwrap().transactions.len(), 1, "case {index}");
             } else {
-                assert!(matches!(result, Err(LedgerError::Rejected(_))), "case {index}");
+                assert!(
+                    matches!(result, Err(LedgerError::Rejected(_))),
+                    "case {index}"
+                );
             }
             server.await.unwrap();
         }
@@ -2692,11 +3132,17 @@ mod tests {
             }
             let (rpc_url, server) = response_sequence_rpc(responses).await;
             let ledger = SolanaCreditLedger::new(SolanaLedgerConfig {
-                rpc_url, indexer_url: None, network: "localnet".into(),
-                program_id: program_id.to_bytes(), vault_state: vault_address.to_bytes(),
+                rpc_url,
+                indexer_url: None,
+                network: "localnet".into(),
+                program_id: program_id.to_bytes(),
+                vault_state: vault_address.to_bytes(),
                 genesis_hash,
-            }).unwrap();
-            let result = ledger.prepare_withdraw_treasury(LedgerAccount::new([6; 32])).await;
+            })
+            .unwrap();
+            let result = ledger
+                .prepare_withdraw_treasury(LedgerAccount::new([6; 32]))
+                .await;
             if accrued == 0 {
                 assert!(matches!(result, Err(LedgerError::Rejected(_))));
             } else {

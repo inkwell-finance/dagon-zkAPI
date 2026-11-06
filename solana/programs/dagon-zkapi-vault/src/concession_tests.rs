@@ -1,7 +1,7 @@
 use super::*;
 
 fn fixture() -> serde_json::Value {
-    serde_json::from_str(include_str!("../../../../protocol/contracts/test/fixtures/vault-challenge.json")).unwrap()
+    serde_json::from_str(include_str!("../../../../protocol/test-vectors/vault-challenge.json")).unwrap()
 }
 
 fn proof(value: &serde_json::Value) -> Vec<u8> {
@@ -128,8 +128,8 @@ fn leaf_binding_exit_ttl_and_pause_checks_ignore_front_running_deposits() {
     let mut escape = withdrawal(&f["esc1"]);
     let (mut vault, mut note, _) = state(&escape.public_inputs);
     note.status = NOTE_STATUS_ACTIVE;
-    // The fixture's real proof is verified above. Adapt only the destination for
-    // these pre-verification Solana account-binding checks (fixture is EVM-bound).
+    // The fixture's real proof is verified above. Bind the destination to this
+    // test's fresh account for the pre-verification account-binding checks.
     escape.public_inputs.destination = zkapi_types::solana_destination_binding(&escape.destination.to_bytes());
     let now = escape.public_inputs.valid_until.min(note.expiry - 1);
     assert!(validate_withdrawal(&vault, &note, &escape, &escape.destination, false, now).is_ok());

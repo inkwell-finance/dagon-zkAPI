@@ -1,0 +1,30 @@
+[package]
+name = "dagon-zkapi-deploy"
+description = "Profile-bound Solana deployment and fail-closed parity tooling"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+anchor-lang = "=0.32.1"
+base64.workspace = true
+bs58 = "0.5"
+clap.workspace = true
+dagon-zkapi-profile = { path = "../dagon-zkapi-profile" }
+dagon-zkapi-vault = { path = "../../solana/programs/dagon-zkapi-vault", features = ["no-entrypoint"] }
+pyth-solana-receiver-sdk = "=1.2.0"
+solana-program = "=2.3.0"
+reqwest.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+solana-compute-budget-interface = "=2.2.2"
+solana-hash = "=2.3.0"
+solana-instruction = "=2.3.3"
+solana-keypair = "=2.2.3"
+solana-message = { version = "=2.4.0", features = ["bincode"] }
+solana-pubkey = "=2.4.0"
+solana-signer = "=2.2.1"
+tokio.workspace = true
+zkapi-proof = { path = "../../protocol/rust/crates/zkapi-proof" }
+zkapi-types = { path = "../../protocol/rust/crates/zkapi-types" }

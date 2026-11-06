@@ -1,0 +1,17 @@
+[package]
+name = "dagon-zkapi-profile"
+description = "Dagon zkAPI Solana deployment profile: shared parameters, network identity and parity rules"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+bs58 = "=0.5.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+solana-pubkey = { version = "=2.4.0", features = ["curve25519"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+dagon-zkapi-vault = { path = "../../solana/programs/dagon-zkapi-vault", features = ["no-entrypoint"] }

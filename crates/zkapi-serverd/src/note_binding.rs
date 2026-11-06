@@ -50,18 +50,20 @@ async fn sequential_signed_state_cannot_branch_across_equal_or_unequal_notes() {
         b_path[0] = a_leaf;
         let root = core::merkle_root(0, &a_leaf, &a_path);
         assert_eq!(root, core::merkle_root(1, &b_leaf, &b_path));
-        let config = ServerConfig {
-            backend: crate::config::LedgerBackend::Evm,
-            request_charge_cap: 1,
-            native_billing: Some(crate::test_support::native_config()),
-            openrouter_leases: Some(crate::test_support::lease_config()),
-            contract_address: Felt252::from_u64(0xdead),
-            proof_setup_dir: setup.to_string_lossy().into_owned(),
-            ..Default::default()
-        };
+        let mut config: ServerConfig =
+            crate::test_support::config(crate::test_support::oa_source());
+        config.profile.vault.request_charge_cap = 1;
+        config.proof_setup_dir = setup.to_string_lossy().into_owned();
         let store = Arc::new(NullifierStore::in_memory().unwrap());
-        let processor =
-            RequestProcessor::try_new(config.clone(), store, signer.clone(), root).unwrap();
+        let processor = RequestProcessor::try_new(
+            config.clone(),
+            store,
+            signer.clone(),
+            root,
+            crate::test_support::StubLedger::unavailable(&config),
+            crate::test_support::StubBilling::accepting(&config),
+        )
+        .unwrap();
         let prepare = |id: &str, witness: &RequestWitnessData| {
             let payload = crate::test_support::lease_payload(&config, now);
             let payload_hash = canonical_payload_hash(payload.as_bytes());
@@ -81,9 +83,9 @@ async fn sequential_signed_state_cannot_branch_across_equal_or_unequal_notes() {
                 core::nullifier(&witness.secret, witness.note_id, &witness.current_anchor);
             (
                 RequestPublicInputsV2 {
-                    protocol_version: config.protocol_version,
-                    chain_id: config.chain_id,
-                    contract_address: config.contract_address,
+                    protocol_version: config.protocol_version(),
+                    chain_id: config.chain_id(),
+                    contract_address: config.contract_address(),
                     active_root: root,
                     state_signing_key_x: key.x,
                     state_signing_key_y: key.y,
@@ -162,9 +164,9 @@ async fn sequential_signed_state_cannot_branch_across_equal_or_unequal_notes() {
         for has_clearance in [false, true] {
             let nullifier = core::nullifier(&a.secret, 0, &a.current_anchor);
             let public = WithdrawalPublicInputsV2 {
-                protocol_version: config.protocol_version,
-                chain_id: config.chain_id,
-                contract_address: config.contract_address,
+                protocol_version: config.protocol_version(),
+                chain_id: config.chain_id(),
+                contract_address: config.contract_address(),
                 registration: core::registration_commitment(&a.secret),
                 state_signing_key_x: key.x,
                 state_signing_key_y: key.y,
@@ -194,9 +196,9 @@ async fn sequential_signed_state_cannot_branch_across_equal_or_unequal_notes() {
                 state_signature: a.state_signature,
                 clearance_signature: has_clearance.then(|| {
                     signer.sign_clearance(&core::clearance_message(
-                        config.protocol_version,
-                        config.chain_id,
-                        &config.contract_address,
+                        config.protocol_version(),
+                        config.chain_id(),
+                        &config.contract_address(),
                         &nullifier,
                     ))
                 }),

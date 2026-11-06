@@ -10,6 +10,7 @@ name = "dagon-zkapi-indexerd"
 path = "src/main.rs"
 
 [dependencies]
+dagon-zkapi-profile = { path = "../dagon-zkapi-profile" }
 dagon-zkapi-vault = { path = "../../solana/programs/dagon-zkapi-vault", features = ["no-entrypoint"] }
 zkapi-types = { path = "../../protocol/rust/crates/zkapi-types" }
 zkapi-core = { path = "../../protocol/rust/crates/zkapi-core" }
@@ -18,15 +19,9 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
-hex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha3 = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-
-[dev-dependencies]
-reqwest = { workspace = true }

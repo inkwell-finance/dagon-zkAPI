@@ -10,7 +10,8 @@ pub enum ServerError {
     #[error("native billing quote expired before request acceptance")]
     NativeQuoteExpired,
 
-    /// A newer finalized oracle round exists before request acceptance.
+    /// The quote is neither one this server observed from the finalized
+    /// price account nor the current finalized update.
     /// Recover this exact request before preparing another proof.
     #[error("native billing quote superseded before request acceptance")]
     NativeQuoteSuperseded,

@@ -1,7 +1,7 @@
 //! Explicit local-validator integration test of the concession-exit lifecycle.
 //!
-//! Run with a validator that loads the built program at the declared ID:
-//! `cargo test -p dagon-zkapi-solana-ledger --test localnet -- --ignored --nocapture`.
+//! Start the profile-bound validator with `scripts/localnet/stack.mjs`, then run:
+//! `cargo test --release -p dagon-zkapi-solana-ledger --test localnet -- --ignored --nocapture`.
 //!
 //! Threats exercised against the real SBF program, real Groth16 proofs and the
 //! production ledger transaction builder:
@@ -30,6 +30,7 @@ use dagon_zkapi_ledger::{
     LedgerAccount, LedgerCommitment, LedgerNullifierStatus, PreparedLedgerOperation,
     RaiseConcessionRequest, RetireClosedLeafRequest, WithdrawalRequest,
 };
+use dagon_zkapi_profile::{NetworkIdentity, SharedProfile, IDENTITY_SCHEMA};
 use dagon_zkapi_solana_ledger::{SolanaCreditLedger, SolanaLedgerConfig};
 use dagon_zkapi_vault as vault_program;
 use serde::de::DeserializeOwned;
@@ -55,8 +56,9 @@ use zkapi_types::{
     WithdrawalPublicInputsV2, MERKLE_DEPTH, PROTOCOL_VERSION,
 };
 
-const DEPOSIT: u128 = 1_000_000;
-const CHALLENGE_PERIOD: u64 = 40;
+/// Lamports per note: covers the profile's request charge cap, the smallest
+/// request bound the server signs, with room for the charges below.
+const DEPOSIT: u128 = 25_000_000;
 
 fn browser_exit(funding: &Value, kind: &str, mut body: Value) -> PreparedLedgerOperation {
     use std::io::Write;
@@ -65,14 +67,30 @@ fn browser_exit(funding: &Value, kind: &str, mut body: Value) -> PreparedLedgerO
         public["chain_id"] = funding["chain_id"].clone();
     }
     let mut child = Command::new("node")
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../sdk/test/helpers/prepare-solana-exit.mjs"))
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().expect("localnet requires Node for the production browser exit codec");
-    child.stdin.take().unwrap().write_all(
-        &serde_json::to_vec(&json!({ "funding": funding, "kind": kind, "body": body })).unwrap(),
-    ).unwrap();
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../sdk/test/helpers/prepare-solana-exit.mjs"
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("localnet requires Node for the production browser exit codec");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            &serde_json::to_vec(&json!({ "funding": funding, "kind": kind, "body": body }))
+                .unwrap(),
+        )
+        .unwrap();
     let output = child.wait_with_output().unwrap();
-    assert!(output.status.success(), "browser exit: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "browser exit: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
@@ -306,7 +324,9 @@ impl Rpc {
                 json!([signature, {"commitment":"confirmed","maxSupportedTransactionVersion":0}]),
             )
             .await;
-        transaction["meta"]["computeUnitsConsumed"].as_u64().unwrap()
+        transaction["meta"]["computeUnitsConsumed"]
+            .as_u64()
+            .unwrap()
     }
 
     /// A plain System transfer anyone can make to any address, including a
@@ -632,8 +652,6 @@ async fn concession_exit_lifecycle_on_localnet() {
     let destination_account = LedgerAccount::new(destination.to_bytes());
     let state_signer = CompactSigner::from_seed(&Felt252::from_u64(101));
     let clearance_signer = CompactSigner::from_seed(&Felt252::from_u64(102));
-    let state_key = state_signer.public_key();
-    let clearance_key = clearance_signer.public_key();
     let setup = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../protocol/setup/v2");
     let request_prover = RequestProver::load(&setup).unwrap();
     let withdrawal_prover = WithdrawalProver::load(&setup).unwrap();
@@ -646,29 +664,33 @@ async fn concession_exit_lifecycle_on_localnet() {
     let genesis_hash = Hash::from_str(&genesis).unwrap().to_bytes();
     let (vault, _) =
         Pubkey::find_program_address(&[b"vault", authority.pubkey().as_ref()], &vault_program::ID);
-    let initialize = Instruction {
-        program_id: vault_program::ID,
-        accounts: vault_program::accounts::Initialize {
-            vault,
-            authority: authority.pubkey(),
-            treasury,
-            system_program: anchor_lang::system_program::ID,
-        }
-        .to_account_metas(None),
-        data: vault_program::instruction::Initialize {
-            args: vault_program::InitializeArgs {
-                genesis_hash,
-                note_ttl: 86_400,
-                challenge_period: CHALLENGE_PERIOD,
-                request_charge_cap: 1_000_000,
-                state_signing_key_x: *state_key.x.as_bytes(),
-                state_signing_key_y: *state_key.y.as_bytes(),
-                clearance_signing_key_x: *clearance_key.x.as_bytes(),
-                clearance_signing_key_y: *clearance_key.y.as_bytes(),
-            },
-        }
-        .data(),
+    // This is the sole test-only override reader. No binary reads this file:
+    // server startup requires the shared profile's challenge period, and its
+    // settlement/challenger timing inequality independently rejects 40 seconds.
+    let mut profile = SharedProfile::embedded().clone();
+    let overrides: Value = serde_json::from_str(include_str!(
+        "../../../solana/profile/localnet-test-overrides.json"
+    ))
+    .unwrap();
+    profile.vault.challenge_period_seconds =
+        overrides["challenge_period_seconds"].as_u64().unwrap();
+    let identity = NetworkIdentity {
+        schema: IDENTITY_SCHEMA.into(),
+        network: "localnet".into(),
+        genesis_hash: genesis.clone(),
+        vault_authority: Some(authority.pubkey().to_string()),
+        vault_state: Some(vault.to_string()),
+        treasury: Some(treasury.to_string()),
+        pyth_price_account: NetworkIdentity::mainnet().pyth_price_account,
     };
+    let resolved = identity.resolve(&profile).unwrap();
+    let initialize = dagon_zkapi_deploy::initialize_instruction(
+        &profile,
+        &identity,
+        &state_signer,
+        &clearance_signer,
+    )
+    .unwrap();
     rpc.send_instruction(initialize, &authority).await;
     let set_paused = |paused: bool| Instruction {
         program_id: vault_program::ID,
@@ -697,11 +719,11 @@ async fn concession_exit_lifecycle_on_localnet() {
         "program_id": vault_program::ID.to_string(), "vault_state": vault.to_string(),
         "genesis_hash": genesis, "network": "localnet", "wallet_standard_chain": "solana:localnet",
         "rpc_url": rpc_url, "protocol_server_url": "http://127.0.0.1:1",
-        // Price accounts are irrelevant to exits; these valid fixture addresses
-        // satisfy the shared deployment schema without an oracle server.
-        "pyth_receiver_program": authority.pubkey().to_string(),
-        "pyth_price_account": authority.pubkey().to_string(),
-        "pyth_feed_id": format!("0x{:064x}", 1), "pyth_max_age_seconds": 30, "pyth_max_confidence_bps": 100
+        "pyth_receiver_program": profile.pyth.receiver_program,
+        "pyth_price_account": identity.pyth_price_account,
+        "pyth_feed_id": profile.pyth.feed_id,
+        "pyth_max_age_seconds": profile.pyth.max_age_seconds,
+        "pyth_max_confidence_bps": profile.pyth.max_confidence_bps
     });
     let wallet = Wallet {
         ledger: &ledger,
@@ -711,11 +733,9 @@ async fn concession_exit_lifecycle_on_localnet() {
         withdrawal_prover: &withdrawal_prover,
     };
     let service = IndexerService::new_syncing(Arc::new(RwLock::new(TreeMirror::new())));
-    let poller = SolanaAccountPoller::new(SolanaPollerConfig {
-        rpc_url,
-        program_id: vault_program::ID.to_string(),
-        vault_state: vault.to_string(),
-    })
+    let poller = SolanaAccountPoller::new(SolanaPollerConfig::from_identity(
+        rpc_url, &profile, &resolved,
+    ))
     .unwrap();
     let mut tree = MerkleTree::new();
     let deposit = |note_id: u32, secret: Felt252, zero_path: [Felt252; MERKLE_DEPTH]| {
@@ -744,10 +764,17 @@ async fn concession_exit_lifecycle_on_localnet() {
     let note_a: vault_program::NoteState = rpc.anchor_account(note_address(vault, 0)).await;
     let a0 = PrivateNoteState::genesis(0, secret_a, note_a.expiry);
     tree.set_leaf(0, a0.leaf());
-    assert_eq!(ledger.state(LedgerCommitment::Confirmed).await.unwrap().root, tree.root());
+    assert_eq!(
+        ledger
+            .state(LedgerCommitment::Confirmed)
+            .await
+            .unwrap()
+            .root,
+        tree.root()
+    );
     let valid_until = rpc.block_time().await + 3_600;
 
-    let a1 = wallet.advance(&a0, 200_000);
+    let a1 = wallet.advance(&a0, 40_000);
     let (close_public, close_proof) = wallet.withdrawal(&a1, destination, 0, true, valid_until);
     let close_nullifier = close_public.withdrawal_nullifier;
     let close_request = WithdrawalRequest {
@@ -759,26 +786,59 @@ async fn concession_exit_lifecycle_on_localnet() {
     let (destination_before, treasury_before) =
         (rpc.balance(destination).await, rpc.balance(treasury).await);
     let accrued = |vault_state: vault_program::VaultState| vault_state.treasury_accrued;
-    let operation = browser_exit(&browser_funding, "mutual", json!({
-        "payer": authority.pubkey().to_string(), "destination": destination.to_string(),
-        "public_inputs": close_request.public_inputs, "proof": close_request.proof
-    }));
-    assert_eq!(operation.transactions.len(), 1, "close is one direct transaction");
+    let operation = browser_exit(
+        &browser_funding,
+        "mutual",
+        json!({
+            "payer": authority.pubkey().to_string(), "destination": destination.to_string(),
+            "public_inputs": close_request.public_inputs, "proof": close_request.proof
+        }),
+    );
+    assert_eq!(
+        operation.transactions.len(),
+        1,
+        "close is one direct transaction"
+    );
     let signature = rpc.send_operation(operation, &authority).await;
     compute_units.push(("close", rpc.compute_units(&signature).await));
-    assert_eq!(rpc.balance(destination).await - destination_before, 800_000);
+    assert_eq!(
+        u128::from(rpc.balance(destination).await - destination_before),
+        DEPOSIT - 40_000
+    );
     // The operator share accrues in the vault; exits never touch the treasury.
     assert_eq!(rpc.balance(treasury).await, treasury_before);
-    assert_eq!(accrued(rpc.anchor_account(vault).await), 200_000);
+    assert_eq!(accrued(rpc.anchor_account(vault).await), 40_000);
+    let sweeper = Keypair::new();
+    rpc.airdrop(sweeper.pubkey(), 100_000_000).await;
+    let sweep = || async {
+        ledger
+            .prepare_withdraw_treasury(LedgerAccount::new(sweeper.pubkey().to_bytes()))
+            .await
+            .unwrap()
+    };
+    // Sweeping a share below the rent-exempt minimum into the unfunded
+    // treasury fails (rent) without losing the debt.
+    assert!(rpc
+        .try_send_operation(sweep().await, &sweeper)
+        .await
+        .is_err());
+    assert_eq!(accrued(rpc.anchor_account(vault).await), 40_000);
     let closed: vault_program::NoteState = rpc.anchor_account(note_address(vault, 0)).await;
     assert_eq!(closed.status, vault_program::NOTE_STATUS_CLOSED);
     assert_eq!(
-        ledger.state(LedgerCommitment::Confirmed).await.unwrap().root,
+        ledger
+            .state(LedgerCommitment::Confirmed)
+            .await
+            .unwrap()
+            .root,
         tree.root(),
         "a closed note keeps its leaf until retired"
     );
     assert_eq!(
-        ledger.nullifier_status(close_nullifier, LedgerCommitment::Confirmed).await.unwrap(),
+        ledger
+            .nullifier_status(close_nullifier, LedgerCommitment::Confirmed)
+            .await
+            .unwrap(),
         LedgerNullifierStatus::Used
     );
     // Replaying the close cannot pay twice.
@@ -799,7 +859,14 @@ async fn concession_exit_lifecycle_on_localnet() {
     compute_units.push(("retire_closed_leaf", rpc.compute_units(&signature).await));
     rpc.wait_finalized(&signature).await;
     tree.set_leaf(0, Felt252::ZERO);
-    assert_eq!(ledger.state(LedgerCommitment::Confirmed).await.unwrap().root, tree.root());
+    assert_eq!(
+        ledger
+            .state(LedgerCommitment::Confirmed)
+            .await
+            .unwrap()
+            .root,
+        tree.root()
+    );
     let retired: vault_program::NoteState = rpc.anchor_account(note_address(vault, 0)).await;
     assert_eq!(retired.status, vault_program::NOTE_STATUS_RETIRED);
     assert!(ledger
@@ -824,8 +891,9 @@ async fn concession_exit_lifecycle_on_localnet() {
     let note_b: vault_program::NoteState = rpc.anchor_account(note_address(vault, 1)).await;
     let b0 = PrivateNoteState::genesis(1, secret_b, note_b.expiry);
     tree.set_leaf(1, b0.leaf());
-    let b1 = wallet.advance(&b0, 200_000);
-    let bound_b = 50_000u128;
+    let b1 = wallet.advance(&b0, 40_000);
+    // The server signs no request bound below the profile's request charge cap.
+    let bound_b = u128::from(profile.vault.request_charge_cap);
     let (b_request, b_request_proof) = wallet.request(&b1, bound_b);
     let (b_escape, b_escape_proof) =
         wallet.withdrawal(&b1, destination, bound_b, false, valid_until);
@@ -836,7 +904,10 @@ async fn concession_exit_lifecycle_on_localnet() {
     // with the note Pending forever: a reserved key the runtime demotes to
     // read-only, or the vault itself. Both are refused at escape time.
     for (uncreditable, label) in [
-        (anchor_lang::system_program::ID, "escape to the read-only System program"),
+        (
+            anchor_lang::system_program::ID,
+            "escape to the read-only System program",
+        ),
         (vault, "escape to the vault"),
     ] {
         let (public_inputs, proof) =
@@ -868,16 +939,27 @@ async fn concession_exit_lifecycle_on_localnet() {
         rpc.fund_address(nullifier_address(vault, nullifier), rent_floor, &authority)
             .await;
         assert_eq!(
-            ledger.nullifier_status(nullifier, LedgerCommitment::Confirmed).await.unwrap(),
+            ledger
+                .nullifier_status(nullifier, LedgerCommitment::Confirmed)
+                .await
+                .unwrap(),
             LedgerNullifierStatus::Unused,
             "a funded System PDA is not a spent nullifier"
         );
     }
-    let escape_b = browser_exit(&browser_funding, "escape", json!({
-        "payer": authority.pubkey().to_string(), "destination": destination.to_string(),
-        "public_inputs": b_escape, "proof": b_escape_proof
-    }));
-    assert_eq!(escape_b.transactions.len(), 1, "escape is one direct transaction");
+    let escape_b = browser_exit(
+        &browser_funding,
+        "escape",
+        json!({
+            "payer": authority.pubkey().to_string(), "destination": destination.to_string(),
+            "public_inputs": b_escape, "proof": b_escape_proof
+        }),
+    );
+    assert_eq!(
+        escape_b.transactions.len(),
+        1,
+        "escape is one direct transaction"
+    );
 
     // FRONT-RUN: an unrelated deposit (note C) changes the root after the
     // escape was prepared and signed. Leaf-bound exits do not care.
@@ -889,28 +971,55 @@ async fn concession_exit_lifecycle_on_localnet() {
     let note_c: vault_program::NoteState = rpc.anchor_account(note_address(vault, 2)).await;
     let c0 = PrivateNoteState::genesis(2, secret_c, note_c.expiry);
     tree.set_leaf(2, c0.leaf());
-    assert_eq!(ledger.state(LedgerCommitment::Confirmed).await.unwrap().root, tree.root());
+    assert_eq!(
+        ledger
+            .state(LedgerCommitment::Confirmed)
+            .await
+            .unwrap()
+            .root,
+        tree.root()
+    );
     let signature = rpc.send_operation(escape_b, &authority).await;
-    compute_units.push(("escape (pre-funded N and N+)", rpc.compute_units(&signature).await));
+    compute_units.push((
+        "escape (pre-funded N and N+)",
+        rpc.compute_units(&signature).await,
+    ));
     eprintln!("note B escape landed after a front-running deposit");
     assert_eq!(
-        ledger.state(LedgerCommitment::Confirmed).await.unwrap().root,
+        ledger
+            .state(LedgerCommitment::Confirmed)
+            .await
+            .unwrap()
+            .root,
         tree.root(),
         "an escape does not touch the tree"
     );
     for nullifier in [b_n, b_next] {
         assert_eq!(
-            ledger.nullifier_status(nullifier, LedgerCommitment::Confirmed).await.unwrap(),
+            ledger
+                .nullifier_status(nullifier, LedgerCommitment::Confirmed)
+                .await
+                .unwrap(),
             LedgerNullifierStatus::Used
         );
     }
-    let pending = ledger.pending_escapes(LedgerCommitment::Confirmed).await.unwrap();
+    let pending = ledger
+        .pending_escapes(LedgerCommitment::Confirmed)
+        .await
+        .unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(
-        (pending[0].note_id, pending[0].nullifier, pending[0].next_nullifier),
+        (
+            pending[0].note_id,
+            pending[0].nullifier,
+            pending[0].next_nullifier
+        ),
         (1, b_n, b_next)
     );
-    assert_eq!((pending[0].state_balance, pending[0].conceded), (b1.balance, bound_b));
+    assert_eq!(
+        (pending[0].state_balance, pending[0].conceded),
+        (b1.balance, bound_b)
+    );
     let b_deadline = pending[0].deadline;
     // Replaying the escape proof cannot open a second exit.
     let replay = ledger
@@ -921,7 +1030,10 @@ async fn concession_exit_lifecycle_on_localnet() {
             proof: b_escape_proof,
         })
         .await;
-    assert!(replay.is_err(), "pending note must reject a replayed escape");
+    assert!(
+        replay.is_err(),
+        "pending note must reject a replayed escape"
+    );
 
     // The operator holds R1 (at N), but that proves nothing about S2: it can
     // neither defeat the escape nor raise c beyond the bound already conceded.
@@ -1004,26 +1116,33 @@ async fn concession_exit_lifecycle_on_localnet() {
 
     // ---- Note C: a cheater spent S1 (R1 at N1) and S2 (R2 at N2), then
     // escapes stale from S1 with c = 0.
-    let c1 = wallet.advance(&c0, 100_000);
-    let c2 = wallet.advance(&c1, 100_000);
-    let (c_r1, c_r1_proof) = wallet.request(&c1, 100_000);
-    let (c_r2, c_r2_proof) = wallet.request(&c2, 100_000);
+    let c1 = wallet.advance(&c0, 20_000);
+    let c2 = wallet.advance(&c1, 20_000);
+    let (c_r1, c_r1_proof) = wallet.request(&c1, 20_000);
+    let (c_r2, c_r2_proof) = wallet.request(&c2, 20_000);
     let (c_stale, c_stale_proof) = wallet.withdrawal(&c1, destination, 0, false, valid_until);
     let (c_older, c_older_proof) = wallet.withdrawal(&c0, destination, 0, false, valid_until);
     let (c_newest, c_newest_proof) = wallet.withdrawal(&c2, destination, 0, false, valid_until);
     let (c_n1, c_n2) = (c_stale.withdrawal_nullifier, c_stale.next_nullifier);
-    assert_eq!((c_r1.request_nullifier, c_r2.request_nullifier), (c_n1, c_n2));
+    assert_eq!(
+        (c_r1.request_nullifier, c_r2.request_nullifier),
+        (c_n1, c_n2)
+    );
     assert_eq!(c_older.next_nullifier, c_n1);
     assert_eq!(c_newest.withdrawal_nullifier, c_n2);
-    let c_escape = |public: &WithdrawalPublicInputsV2, proof: &Groth16ProofWire| WithdrawalRequest {
-        payer,
-        destination: destination_account,
-        public_inputs: public.clone(),
-        proof: proof.clone(),
-    };
+    let c_escape =
+        |public: &WithdrawalPublicInputsV2, proof: &Groth16ProofWire| WithdrawalRequest {
+            payer,
+            destination: destination_account,
+            public_inputs: public.clone(),
+            proof: proof.clone(),
+        };
     let signature = rpc
         .send_operation(
-            ledger.prepare_escape(c_escape(&c_stale, &c_stale_proof)).await.unwrap(),
+            ledger
+                .prepare_escape(c_escape(&c_stale, &c_stale_proof))
+                .await
+                .unwrap(),
             &authority,
         )
         .await;
@@ -1035,14 +1154,14 @@ async fn concession_exit_lifecycle_on_localnet() {
     let signature = rpc.send_instruction(set_paused(true), &authority).await;
     compute_units.push(("set_paused(true)", rpc.compute_units(&signature).await));
 
-    // Under-concession: R1 (at the escaped N1, bound 100k) raises c to 60k.
+    // Under-concession: R1 (at the escaped N1, bound 20k) raises c to 15k.
     let operation = ledger
         .prepare_raise_concession(RaiseConcessionRequest {
             payer,
             note_id: 2,
             public_inputs: c_r1.clone(),
             proof: c_r1_proof.clone(),
-            amount: 60_000,
+            amount: 15_000,
         })
         .await
         .unwrap();
@@ -1053,7 +1172,7 @@ async fn concession_exit_lifecycle_on_localnet() {
         rpc.anchor_account(pending_address(vault, 2)).await;
     assert_eq!(
         (raised.conceded, raised.final_balance, raised.state_balance),
-        (60_000, 840_000, 900_000)
+        (15_000, (DEPOSIT - 35_000) as u64, (DEPOSIT - 20_000) as u64)
     );
 
     // Stale escape: R2 spends the successor N2 and defeats the exit.
@@ -1079,12 +1198,18 @@ async fn concession_exit_lifecycle_on_localnet() {
     assert!(defeated.claimable_after >= defeated.expiry);
     assert!(rpc.account_value(pending_address(vault, 2)).await.is_none());
     assert_eq!(
-        ledger.nullifier_status(c_n1, LedgerCommitment::Confirmed).await.unwrap(),
+        ledger
+            .nullifier_status(c_n1, LedgerCommitment::Confirmed)
+            .await
+            .unwrap(),
         LedgerNullifierStatus::Used,
         "the defeated nullifier is challenged forever"
     );
     assert_eq!(
-        ledger.nullifier_status(c_n2, LedgerCommitment::Confirmed).await.unwrap(),
+        ledger
+            .nullifier_status(c_n2, LedgerCommitment::Confirmed)
+            .await
+            .unwrap(),
         LedgerNullifierStatus::Unused,
         "the successor nullifier is released"
     );
@@ -1094,10 +1219,17 @@ async fn concession_exit_lifecycle_on_localnet() {
         rpc.anchor_account(nullifier_address(vault, c_n2)).await;
     assert_eq!(
         (n1_account.status, n2_account.status),
-        (vault_program::NULLIFIER_CHALLENGED, vault_program::NULLIFIER_RELEASED)
+        (
+            vault_program::NULLIFIER_CHALLENGED,
+            vault_program::NULLIFIER_RELEASED
+        )
     );
     assert_eq!(
-        ledger.state(LedgerCommitment::Confirmed).await.unwrap().root,
+        ledger
+            .state(LedgerCommitment::Confirmed)
+            .await
+            .unwrap()
+            .root,
         tree.root(),
         "disputes never touch the tree"
     );
@@ -1106,7 +1238,10 @@ async fn concession_exit_lifecycle_on_localnet() {
     // expired-claim sweep (Paused is checked before expiry).
     assert_vault_error(
         rpc.try_send_operation(
-            ledger.prepare_escape(c_escape(&c_newest, &c_newest_proof)).await.unwrap(),
+            ledger
+                .prepare_escape(c_escape(&c_newest, &c_newest_proof))
+                .await
+                .unwrap(),
             &authority,
         )
         .await,
@@ -1146,13 +1281,20 @@ async fn concession_exit_lifecycle_on_localnet() {
     assert!(b_pending_rent > 0);
     let signature = rpc
         .send_operation(
-            browser_exit(&browser_funding, "finalize", json!({
-                "payer": authority.pubkey().to_string(), "note_id": 1
-            })),
+            browser_exit(
+                &browser_funding,
+                "finalize",
+                json!({
+                    "payer": authority.pubkey().to_string(), "note_id": 1
+                }),
+            ),
             &authority,
         )
         .await;
-    compute_units.push(("finalize (while paused)", rpc.compute_units(&signature).await));
+    compute_units.push((
+        "finalize (while paused)",
+        rpc.compute_units(&signature).await,
+    ));
     assert_eq!(
         u128::from(rpc.balance(destination).await - destination_before),
         b1.balance - bound_b + u128::from(b_pending_rent),
@@ -1162,7 +1304,7 @@ async fn concession_exit_lifecycle_on_localnet() {
     assert_eq!(rpc.balance(treasury).await, treasury_before);
     assert_eq!(
         u128::from(accrued(rpc.anchor_account(vault).await)),
-        200_000 + DEPOSIT - (b1.balance - bound_b)
+        40_000 + DEPOSIT - (b1.balance - bound_b)
     );
     let finalized: vault_program::NoteState = rpc.anchor_account(note_address(vault, 1)).await;
     assert_eq!(finalized.status, vault_program::NOTE_STATUS_CLOSED);
@@ -1197,7 +1339,10 @@ async fn concession_exit_lifecycle_on_localnet() {
     // (whose successor N1 is challenged) both revert cheaply.
     assert_vault_error(
         rpc.try_send_operation(
-            ledger.prepare_escape(c_escape(&c_stale, &c_stale_proof)).await.unwrap(),
+            ledger
+                .prepare_escape(c_escape(&c_stale, &c_stale_proof))
+                .await
+                .unwrap(),
             &authority,
         )
         .await,
@@ -1206,7 +1351,10 @@ async fn concession_exit_lifecycle_on_localnet() {
     );
     assert_vault_error(
         rpc.try_send_operation(
-            ledger.prepare_escape(c_escape(&c_older, &c_older_proof)).await.unwrap(),
+            ledger
+                .prepare_escape(c_escape(&c_older, &c_older_proof))
+                .await
+                .unwrap(),
             &authority,
         )
         .await,
@@ -1216,18 +1364,30 @@ async fn concession_exit_lifecycle_on_localnet() {
     // The newest state reuses the released N2 and is judged on its own.
     let signature = rpc
         .send_operation(
-            ledger.prepare_escape(c_escape(&c_newest, &c_newest_proof)).await.unwrap(),
+            ledger
+                .prepare_escape(c_escape(&c_newest, &c_newest_proof))
+                .await
+                .unwrap(),
             &authority,
         )
         .await;
-    compute_units.push(("escape (released N reused)", rpc.compute_units(&signature).await));
+    compute_units.push((
+        "escape (released N reused)",
+        rpc.compute_units(&signature).await,
+    ));
     for nullifier in [c_n2, c_newest.next_nullifier] {
         assert_eq!(
-            ledger.nullifier_status(nullifier, LedgerCommitment::Confirmed).await.unwrap(),
+            ledger
+                .nullifier_status(nullifier, LedgerCommitment::Confirmed)
+                .await
+                .unwrap(),
             LedgerNullifierStatus::Used
         );
     }
-    let pending = ledger.pending_escapes(LedgerCommitment::Confirmed).await.unwrap();
+    let pending = ledger
+        .pending_escapes(LedgerCommitment::Confirmed)
+        .await
+        .unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!((pending[0].note_id, pending[0].nullifier), (2, c_n2));
     rpc.wait_until_after(pending[0].deadline).await;
@@ -1251,28 +1411,17 @@ async fn concession_exit_lifecycle_on_localnet() {
 
     let vault_state: vault_program::VaultState = rpc.anchor_account(vault).await;
     assert_eq!(vault_state.total_credits, 0);
-    let owed = 200_000 + (DEPOSIT - (b1.balance - bound_b)) + (DEPOSIT - c2.balance);
+    let owed = 40_000 + (DEPOSIT - (b1.balance - bound_b)) + (DEPOSIT - c2.balance);
     assert_eq!(u128::from(vault_state.treasury_accrued), owed);
     // The treasury account never existed (zero lamports) during every exit
     // above: a drained or unreachable treasury cannot block user payouts.
     assert_eq!(rpc.balance(treasury).await, 0);
-    let sweeper = Keypair::new();
-    rpc.airdrop(sweeper.pubkey(), 100_000_000).await;
-    let sweep = || async {
-        ledger
-            .prepare_withdraw_treasury(LedgerAccount::new(sweeper.pubkey().to_bytes()))
-            .await
-            .unwrap()
-    };
-    // Sweeping into the unfunded account fails (rent) without losing the debt.
-    assert!(rpc.try_send_operation(sweep().await, &sweeper).await.is_err());
-    assert_eq!(u128::from(accrued(rpc.anchor_account(vault).await)), owed);
-    // Once the treasury is funded, anyone may sweep the accrued share.
-    rpc.airdrop(treasury, 1_000_000_000).await;
-    let treasury_before = rpc.balance(treasury).await;
+    // The accrued share now includes a concession of a whole minimum lease,
+    // above the rent-exempt minimum: anyone may sweep it, even into the
+    // never-funded treasury account.
     let signature = rpc.send_operation(sweep().await, &sweeper).await;
     compute_units.push(("withdraw_treasury", rpc.compute_units(&signature).await));
-    assert_eq!(u128::from(rpc.balance(treasury).await - treasury_before), owed);
+    assert_eq!(u128::from(rpc.balance(treasury).await), owed);
     assert_eq!(accrued(rpc.anchor_account(vault).await), 0);
     assert!(ledger
         .prepare_withdraw_treasury(LedgerAccount::new(sweeper.pubkey().to_bytes()))

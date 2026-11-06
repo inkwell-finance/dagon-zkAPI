@@ -5,17 +5,21 @@
 //! therefore yields the complete current leaf vector without trusting event
 //! history. A snapshot is published only when its Merkle root exactly matches
 //! the finalized vault account.
+//!
+//! The poller is bound to the profile's program and a network identity: it
+//! refuses an RPC on another cluster and a vault whose genesis hash, version,
+//! request charge cap, note TTL or challenge period differ from the profile.
 
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anchor_lang::{AccountDeserialize, Space};
 use anyhow::{anyhow, ensure, Context};
 use base64::Engine;
+use dagon_zkapi_profile::{ResolvedIdentity, SharedProfile, VaultProfile};
 use dagon_zkapi_vault::{
     NoteState, VaultState, NOTE_STATUS_ACTIVE, NOTE_STATUS_CLOSED, NOTE_STATUS_PENDING,
-    NOTE_STATUS_RETIRED, VAULT_VERSION,
+    NOTE_STATUS_RETIRED,
 };
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -31,8 +35,28 @@ const COMMITMENT: &str = "finalized";
 #[derive(Debug, Clone)]
 pub struct SolanaPollerConfig {
     pub rpc_url: String,
-    pub program_id: String,
-    pub vault_state: String,
+    pub program_id: [u8; 32],
+    pub vault_state: [u8; 32],
+    pub genesis_hash: [u8; 32],
+    /// Vault parameters every finalized vault read must carry.
+    pub vault: VaultProfile,
+}
+
+impl SolanaPollerConfig {
+    /// The profile's program and vault parameters under a network identity.
+    pub fn from_identity(
+        rpc_url: String,
+        profile: &SharedProfile,
+        identity: &ResolvedIdentity,
+    ) -> Self {
+        Self {
+            rpc_url,
+            program_id: profile.program_id(),
+            vault_state: identity.vault_state,
+            genesis_hash: identity.genesis_hash,
+            vault: profile.vault.clone(),
+        }
+    }
 }
 
 pub struct SolanaAccountPoller {
@@ -40,6 +64,8 @@ pub struct SolanaAccountPoller {
     rpc_url: String,
     program_id: anchor_lang::prelude::Pubkey,
     vault_state: anchor_lang::prelude::Pubkey,
+    genesis_hash: [u8; 32],
+    vault: VaultProfile,
 }
 
 impl SolanaAccountPoller {
@@ -55,10 +81,6 @@ impl SolanaAccountPoller {
             url.username().is_empty() && url.password().is_none() && url.fragment().is_none(),
             "Solana indexer RPC URL cannot contain credentials or a fragment"
         );
-        let program_id = anchor_lang::prelude::Pubkey::from_str(&config.program_id)
-            .context("invalid Solana program ID")?;
-        let vault_state = anchor_lang::prelude::Pubkey::from_str(&config.vault_state)
-            .context("invalid Solana vault-state address")?;
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
@@ -66,15 +88,34 @@ impl SolanaAccountPoller {
         Ok(Self {
             client,
             rpc_url: config.rpc_url,
-            program_id,
-            vault_state,
+            program_id: anchor_lang::prelude::Pubkey::new_from_array(config.program_id),
+            vault_state: anchor_lang::prelude::Pubkey::new_from_array(config.vault_state),
+            genesis_hash: config.genesis_hash,
+            vault: config.vault,
         })
+    }
+
+    /// The RPC must serve the identity's cluster.
+    pub async fn assert_cluster(&self) -> anyhow::Result<()> {
+        let genesis: String = self.rpc("getGenesisHash", json!([])).await?;
+        ensure!(
+            dagon_zkapi_profile::parse_base58_32("RPC genesis hash", &genesis)?
+                == self.genesis_hash,
+            "Solana RPC genesis hash does not match the network identity"
+        );
+        Ok(())
     }
 
     pub async fn poll_once(&self, service: &IndexerService) -> anyhow::Result<usize> {
         let (notes_slot, notes) = self.fetch_notes().await?;
         let (_vault_slot, vault) = self.fetch_vault(notes_slot).await?;
-        validate_deployment(self.program_id, self.vault_state, &vault)?;
+        validate_deployment(
+            self.program_id,
+            self.vault_state,
+            &self.genesis_hash,
+            &self.vault,
+            &vault,
+        )?;
         let count = notes.len();
         let mirror = mirror_from_accounts(self.vault_state, &vault, notes)?;
         service.replace(mirror);
@@ -171,19 +212,13 @@ impl SolanaAccountPoller {
     }
 }
 
+/// Poll forever, publishing each validated snapshot.
 pub fn spawn_solana_account_poller(
     service: Arc<IndexerService>,
-    config: SolanaPollerConfig,
+    poller: SolanaAccountPoller,
     interval: Duration,
 ) {
     tokio::spawn(async move {
-        let poller = match SolanaAccountPoller::new(config) {
-            Ok(poller) => poller,
-            Err(error) => {
-                tracing::error!(%error, "failed to initialize Solana indexer poller");
-                return;
-            }
-        };
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -198,11 +233,20 @@ pub fn spawn_solana_account_poller(
 fn validate_deployment(
     program_id: anchor_lang::prelude::Pubkey,
     vault_address: anchor_lang::prelude::Pubkey,
+    genesis_hash: &[u8; 32],
+    profile: &VaultProfile,
     vault: &VaultState,
 ) -> anyhow::Result<()> {
     ensure!(
-        vault.version == VAULT_VERSION,
-        "unsupported Solana vault version"
+        &vault.genesis_hash == genesis_hash,
+        "Solana vault genesis hash does not match the network identity"
+    );
+    ensure!(
+        vault.version == profile.version
+            && vault.request_charge_cap == profile.request_charge_cap
+            && vault.note_ttl == profile.note_ttl_seconds
+            && vault.challenge_period == profile.challenge_period_seconds,
+        "Solana vault parameters do not match the deployment profile"
     );
     ensure!(
         vault.chain_id == solana_chain_id(&vault.genesis_hash),
@@ -331,7 +375,7 @@ mod tests {
 
     fn vault(next_note_id: u32, current_root: Felt252) -> VaultState {
         VaultState {
-            version: VAULT_VERSION,
+            version: dagon_zkapi_vault::VAULT_VERSION,
             bump: 1,
             paused: false,
             authority: Pubkey::new_unique(),
@@ -423,5 +467,41 @@ mod tests {
         }
         candidate.status = NOTE_STATUS_RETIRED;
         assert!(mirror_from_accounts(address, &vault, vec![candidate]).is_ok());
+    }
+
+    /// The poller accepts only the identity's vault with the profile's
+    /// parameters, bound to the profile program.
+    #[test]
+    fn deployment_gate_requires_identity_genesis_and_profile_parameters() {
+        let profile = SharedProfile::embedded();
+        let program = Pubkey::new_from_array(profile.program_id());
+        let address = Pubkey::new_unique();
+        let genesis = [3; 32];
+        let mut good = vault(0, MerkleTree::new().root());
+        good.version = profile.vault.version;
+        good.request_charge_cap = profile.vault.request_charge_cap;
+        good.note_ttl = profile.vault.note_ttl_seconds;
+        good.challenge_period = profile.vault.challenge_period_seconds;
+        good.chain_id = solana_chain_id(&genesis);
+        good.protocol_binding =
+            *solana_deployment_binding(&program.to_bytes(), &address.to_bytes(), &genesis)
+                .as_bytes();
+        validate_deployment(program, address, &genesis, &profile.vault, &good).unwrap();
+        assert!(validate_deployment(program, address, &[4; 32], &profile.vault, &good).is_err());
+        let mutations: [fn(&mut VaultState); 6] = [
+            |vault| vault.version += 1,
+            |vault| vault.request_charge_cap += 1,
+            |vault| vault.note_ttl -= 1,
+            |vault| vault.challenge_period = 3_600,
+            |vault| vault.chain_id += 1,
+            |vault| vault.protocol_binding = [0; 32],
+        ];
+        for mutate in mutations {
+            let mut changed = good.clone();
+            mutate(&mut changed);
+            assert!(
+                validate_deployment(program, address, &genesis, &profile.vault, &changed).is_err()
+            );
+        }
     }
 }

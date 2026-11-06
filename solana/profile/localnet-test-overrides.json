@@ -1,0 +1,4 @@
+{
+  "challenge_period_seconds": 40,
+  "reason": "Only the ignored local-validator lifecycle test reads this file, to observe escape finalization in a bounded test run. No binary reads it. The production server rejects a vault whose period differs from shared.json and its settlement/challenger timing inequality also rejects 40 seconds."
+}

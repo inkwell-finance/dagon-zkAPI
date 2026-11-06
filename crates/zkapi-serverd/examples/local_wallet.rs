@@ -1,17 +1,25 @@
-//! In-memory wallet driver for scripts/v2-acceptance.mjs.
+//! In-memory JSON-lines wallet for driving a Solana deployment end to end.
 //!
-//! Each stdin line is a JSON command; stdout contains only JSON replies. Wallet
-//! secrets, blindings and pending journals remain in this process. This helper
-//! does no networking and never reads an existing wallet or signing credential.
-//! It calls the same pure wallet operations used by the browser SDK. Named
-//! snapshots deliberately retain a genuine server-signed state for the stale
-//! escape scenarios; the helper never constructs a synthetic signed state.
-//! Exits are leaf-bound: `prepare_withdrawal` takes `conceded` and
-//! `valid_until`, needs no Merkle path, and returns `inputs_abi`, the
-//! 18-word ABI tuple `Types.WithdrawalPublicInputs`.
+//! Usage: `local_wallet SETUP_DIRECTORY`. Each stdin line is a JSON command
+//! `{"id": .., "command": .., ...}`; stdout carries only JSON replies
+//! `{"id", "ok", "result" | "error"}`. Wallet secrets, blindings and pending
+//! journals remain in this process. The helper does no networking and never
+//! reads an existing wallet or signing credential; it calls the same pure
+//! wallet operations as the browser SDK.
+//!
+//! Commands: `public_keys`, `init` (`config`: the browser wallet config,
+//! `solana_identity`: the network identity file it must match),
+//! `deposit_params`, `confirm_deposit`, `tree_path`, `prepare_request`,
+//! `complete_response`, `snapshot`, `prepare_withdrawal`, `status`.
+//!
+//! Named snapshots deliberately retain a genuine server-signed state for the
+//! stale escape scenarios; the helper never constructs a synthetic signed
+//! state. Exits are leaf-bound: `prepare_withdrawal` takes a base58 Solana
+//! `destination`, `conceded` and `valid_until`, needs no Merkle path, and
+//! returns `{mode, public_inputs, proof}` for `POST /v2/ledger/*/prepare`.
 
 use anyhow::{bail, ensure, Context, Result};
-use base64::Engine;
+use dagon_zkapi_profile::{NetworkIdentity, SharedProfile};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -24,38 +32,35 @@ use zkapi_browser::{
     PendingRequestJournal, PrepareRequestArgs, PrepareWithdrawalArgs, TreeSnapshot,
 };
 use zkapi_proof::compact::{CompactSigner, RequestProver, CIRCUIT_ID};
-use zkapi_types::{Felt252, WithdrawalPublicInputsV2};
+use zkapi_types::Felt252;
 
-/// ABI-encode `Types.WithdrawalPublicInputs` (18 static words; the packed
-/// note fields of the proof are unpacked into noteId, depositAmount, expiryTs).
-fn withdrawal_tuple_abi(inputs: &WithdrawalPublicInputsV2) -> String {
-    let words = [
-        Felt252::from_u64(inputs.protocol_version as u64),
-        Felt252::from_u64(inputs.chain_id),
-        inputs.contract_address,
-        inputs.registration,
-        inputs.state_signing_key_x,
-        inputs.state_signing_key_y,
-        inputs.clearance_signing_key_x,
-        inputs.clearance_signing_key_y,
-        Felt252::from_u64(inputs.note_id as u64),
-        Felt252::from_u128(inputs.deposit_amount),
-        Felt252::from_u64(inputs.expiry_ts),
-        Felt252::from_u128(inputs.final_balance),
-        inputs.destination_field(),
-        inputs.withdrawal_nullifier,
-        Felt252::from_u64(inputs.has_clearance as u64),
-        inputs.next_nullifier,
-        Felt252::from_u128(inputs.conceded),
-        Felt252::from_u64(inputs.valid_until),
-    ];
-    format!(
-        "0x{}",
-        words
-            .iter()
-            .map(|value| hex::encode(value.as_bytes()))
-            .collect::<String>()
-    )
+/// The wallet config must be the embedded profile's deployment under the
+/// network identity.
+fn check_deployment(config: &BrowserWalletConfig, identity_path: &str) -> Result<()> {
+    let profile = SharedProfile::embedded();
+    let identity = NetworkIdentity::load(identity_path.as_ref())?.resolve(profile)?;
+    ensure!(
+        config.protocol_version == profile.protocol.protocol_version,
+        "wallet protocol version is not the profile's"
+    );
+    ensure!(
+        config.chain_id == zkapi_types::solana_chain_id(&identity.genesis_hash),
+        "wallet chain ID is not the identity's Solana chain ID"
+    );
+    ensure!(
+        config.contract_address
+            == zkapi_types::solana_deployment_binding(
+                &profile.program_id(),
+                &identity.vault_state,
+                &identity.genesis_hash
+            ),
+        "wallet contract address is not the identity's deployment binding"
+    );
+    ensure!(
+        config.request_charge_cap == u128::from(profile.vault.request_charge_cap),
+        "wallet request charge cap is not the profile's"
+    );
+    Ok(())
 }
 
 struct WalletDriver {
@@ -120,18 +125,12 @@ impl WalletDriver {
                 ensure!(self.config.is_none(), "wallet is already initialized");
                 let config: BrowserWalletConfig =
                     serde_json::from_value(command["config"].clone())?;
-                ensure!(
-                    config.protocol_version == 2,
-                    "only protocol v2 is supported"
-                );
-                ensure!(
-                    config.chain_id == 11_155_111,
-                    "acceptance wallet requires the signer-compatible local chain ID 11155111"
-                );
-                ensure!(
-                    !config.contract_address.is_zero(),
-                    "vault address is required"
-                );
+                check_deployment(
+                    &config,
+                    command["solana_identity"]
+                        .as_str()
+                        .context("solana_identity must be the identity file path")?,
+                )?;
                 self.config = Some(config);
                 Ok(self.status())
             }
@@ -262,17 +261,7 @@ impl WalletDriver {
                         .as_deref()
                         .context("missing withdrawal key")?,
                 )?;
-                let inputs_abi = withdrawal_tuple_abi(&plan.public_inputs);
-                let proof_hex = format!(
-                    "0x{}",
-                    hex::encode(
-                        base64::engine::general_purpose::STANDARD.decode(&plan.proof.proof)?
-                    )
-                );
-                let mut result = serde_json::to_value(plan)?;
-                result["inputs_abi"] = json!(inputs_abi);
-                result["proof_hex"] = json!(proof_hex);
-                Ok(result)
+                Ok(serde_json::to_value(plan)?)
             }
             "tree_path" => {
                 let args: PathArgs = serde_json::from_value(command["args"].clone())?;
@@ -290,14 +279,8 @@ impl WalletDriver {
 
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
-    let setup = PathBuf::from(
-        args.next()
-            .context("usage: v2_acceptance_wallet SETUP_DIRECTORY")?,
-    );
-    ensure!(
-        args.next().is_none(),
-        "usage: v2_acceptance_wallet SETUP_DIRECTORY"
-    );
+    let setup = PathBuf::from(args.next().context("usage: local_wallet SETUP_DIRECTORY")?);
+    ensure!(args.next().is_none(), "usage: local_wallet SETUP_DIRECTORY");
     let mut driver = WalletDriver::new(setup);
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());

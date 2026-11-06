@@ -1,7 +1,13 @@
 //! Server configuration.
+//!
+//! Every shared parameter (protocol, vault, lease timing, Pyth oracle) comes
+//! from the deployment profile; a network differs only through its identity.
 
+pub use dagon_zkapi_profile::{ResolvedIdentity, SharedProfile, MAINNET_BETA};
 pub use dagon_zkapi_solana_ledger::SolanaLedgerConfig;
 use zkapi_types::Felt252;
+
+use crate::billing::BillingPins;
 
 /// Source used to provision prompt-private, short-lived OpenRouter keys.
 #[derive(Clone)]
@@ -46,47 +52,22 @@ impl std::fmt::Debug for OpenRouterLeaseSourceConfig {
     }
 }
 
-/// Prompt-private lease configuration for native-asset billing.
-#[derive(Debug, Clone)]
-pub struct OpenRouterLeaseConfig {
-    pub source: OpenRouterLeaseSourceConfig,
-    /// Runtime-key validity window.
-    pub ttl_seconds: u64,
-    /// Delay after expiry (and after disabling directly managed keys) before
-    /// reading aggregate usage, allowing in-flight calls and accounting to drain.
-    pub settlement_grace_seconds: u64,
-    /// Background settlement scan interval.
-    pub settlement_poll_seconds: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum LedgerBackend {
-    #[default]
-    Solana,
-    Evm,
-}
-
-#[derive(Debug, Clone)]
-pub struct SolanaServerConfig {
-    pub ledger: dagon_zkapi_solana_ledger::SolanaLedgerConfig,
-    pub billing: crate::sol_billing::PythBillingConfig,
-}
-
 /// Configuration for the zkAPI server.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    pub backend: LedgerBackend,
-    pub solana: Option<SolanaServerConfig>,
-    /// Protocol version (must be 2).
-    pub protocol_version: u16,
-    /// Chain ID this server is bound to.
-    pub chain_id: u64,
-    /// Optional shared Sepolia service gate; contains only a redacted digest.
+    /// Shared deployment profile. Operator binaries always use
+    /// [`SharedProfile::embedded`].
+    pub profile: SharedProfile,
+    /// Network label of the identity file.
+    pub network: String,
+    /// Genesis hash and deployed accounts of the network.
+    pub identity: ResolvedIdentity,
+    /// Solana RPC used for every authoritative read.
+    pub rpc_url: String,
+    /// Optional indexer that serves the latest tree snapshot to wallets.
+    pub indexer_url: Option<String>,
+    /// Optional shared testnet service gate; contains only a redacted digest.
     pub testnet_password: Option<crate::testnet_auth::TestnetPassword>,
-    /// On-chain contract address.
-    pub contract_address: Felt252,
-    /// Minimum proof-bound lease budget: lamports on Solana, gwei on EVM.
-    pub request_charge_cap: u128,
     /// HTTP listen address (e.g. "0.0.0.0:3000").
     pub listen_addr: String,
     /// Path to the SQLite database file.
@@ -95,26 +76,12 @@ pub struct ServerConfig {
     pub state_seed: Felt252,
     /// Seed for the proof-friendly clearance-signing key.
     pub clear_seed: Felt252,
-    /// Initial Merkle root the server should accept until the indexer updates it.
-    pub initial_root: Felt252,
-    /// Optional base URL for an indexer that serves the latest tree root.
-    pub indexer_url: Option<String>,
-    /// Poll interval for indexer root refresh.
+    /// Poll interval for the finalized root refresh.
     pub root_poll_interval_ms: u64,
-    /// Required prompt-private OpenRouter lease configuration.
-    pub openrouter_leases: Option<OpenRouterLeaseConfig>,
-    /// Required native ETH oracle configuration, checked before server startup.
-    pub native_billing: Option<crate::native_billing::NativeBillingConfig>,
+    /// Prompt-private OpenRouter lease source.
+    pub lease_source: OpenRouterLeaseSourceConfig,
     /// Directory containing the v2 Groth16 proving/verifying key files.
     pub proof_setup_dir: String,
-    /// The vault's escape challenge period. A settled request whose
-    /// nullifier an exit consumed waits this long plus
-    /// [`EXIT_DEFERRAL_SLACK_SECONDS`] for a defeat before it is terminally
-    /// `exited_unsigned` (O7).
-    pub challenge_period_seconds: u64,
-    /// How long before an escape's deadline the challenger raises with the
-    /// request's solvency bound when its charge is still unsettled.
-    pub raise_lead_seconds: u64,
     /// Drill-only misbehaviour; refused in release builds.
     #[cfg(any(test, feature = "adversary"))]
     pub adversary: Option<crate::adversary::AdversaryMode>,
@@ -128,119 +95,142 @@ pub const USAGE_READ_LATENCY_SECONDS: u64 = 600;
 pub const TIMING_MARGIN_SECONDS: u64 = 1_800;
 
 /// Every request accepted before an escape must settle before the
-/// challenger's raise decision: `lease TTL + settlement grace (twice for a
-/// directly managed OpenRouter key, which drains again after it is disabled)
-/// + two settlement polls + usage-read latency + raise lead + margin ≤
-/// challenge period`.
+/// challenger's raise decision:
+///
+/// `lease TTL + settlement grace (twice for a directly managed OpenRouter
+/// key, which drains again after it is disabled) + two settlement polls +
+/// usage-read latency + raise lead + margin ≤ challenge period`.
 pub fn check_challenge_timing(
-    lease: &OpenRouterLeaseConfig,
-    raise_lead_seconds: u64,
-    challenge_period_seconds: u64,
+    source: &OpenRouterLeaseSourceConfig,
+    profile: &SharedProfile,
 ) -> anyhow::Result<()> {
-    let drains = match lease.source {
+    let server = &profile.server;
+    let drains = match source {
         OpenRouterLeaseSourceConfig::OpenRouter { .. } => 2,
         OpenRouterLeaseSourceConfig::OaOrg { .. } => 1,
     };
-    let grace = lease.settlement_grace_seconds.saturating_mul(drains);
-    let polls = lease.settlement_poll_seconds.max(1).saturating_mul(2);
-    let required = lease
-        .ttl_seconds
+    let grace = server.settlement_grace_seconds.saturating_mul(drains);
+    let polls = server.settlement_poll_seconds.max(1).saturating_mul(2);
+    let raise_lead = server.raise_lead_seconds;
+    let period = profile.vault.challenge_period_seconds;
+    let required = server
+        .lease_ttl_seconds
         .saturating_add(grace)
         .saturating_add(polls)
         .saturating_add(USAGE_READ_LATENCY_SECONDS)
-        .saturating_add(raise_lead_seconds)
+        .saturating_add(raise_lead)
         .saturating_add(TIMING_MARGIN_SECONDS);
     anyhow::ensure!(
-        raise_lead_seconds > 0 && required <= challenge_period_seconds,
+        raise_lead > 0 && required <= period,
         "challenge timing is unsafe: lease TTL {}s + settlement grace {grace}s + settlement \
          polls {polls}s + usage latency {USAGE_READ_LATENCY_SECONDS}s + raise lead \
-         {raise_lead_seconds}s + margin {TIMING_MARGIN_SECONDS}s = {required}s exceeds the \
-         challenge period {challenge_period_seconds}s",
-        lease.ttl_seconds
-    );
-    Ok(())
-}
-
-/// The timing check and the O7 deferral window are only as good as the
-/// configured challenge period: it must be the vault's own.
-pub fn check_vault_challenge_period(configured: u64, vault: u64) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        configured == vault,
-        "--challenge-period-seconds {configured}s does not match the vault's challenge period \
-         {vault}s"
+         {raise_lead}s + margin {TIMING_MARGIN_SECONDS}s = {required}s exceeds the \
+         challenge period {period}s",
+        server.lease_ttl_seconds
     );
     Ok(())
 }
 
 impl ServerConfig {
-    pub fn validate_testnet_auth(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.testnet_password.is_none()
-                || self.chain_id == crate::testnet_auth::SEPOLIA_CHAIN_ID,
-            "ZKAPI_TESTNET_PASSWORD is only supported on Sepolia (chain ID 11155111)"
-        );
-        Ok(())
+    /// A configuration with the embedded profile and default local settings.
+    pub fn new(
+        network: String,
+        identity: ResolvedIdentity,
+        rpc_url: String,
+        lease_source: OpenRouterLeaseSourceConfig,
+        state_seed: Felt252,
+        clear_seed: Felt252,
+    ) -> Self {
+        Self {
+            profile: SharedProfile::embedded().clone(),
+            network,
+            identity,
+            rpc_url,
+            indexer_url: None,
+            testnet_password: None,
+            listen_addr: "127.0.0.1:3000".to_string(),
+            db_path: "zkapi-server.db".to_string(),
+            state_seed,
+            clear_seed,
+            root_poll_interval_ms: 1_000,
+            lease_source,
+            proof_setup_dir: "protocol/setup/v2".to_string(),
+            #[cfg(any(test, feature = "adversary"))]
+            adversary: None,
+        }
     }
 
-    /// Reject incomplete/mixed configurations before startup opens any state.
-    pub fn validate_native_mode(&self) -> anyhow::Result<()> {
-        self.validate_testnet_auth()?;
-        anyhow::ensure!(self.protocol_version == 2, "protocol version must be 2");
-        match self.backend {
-            LedgerBackend::Evm => {
-                anyhow::ensure!(
-                    self.solana.is_none(),
-                    "EVM mode rejects Solana configuration"
-                );
-                anyhow::ensure!(
-                    self.native_billing.is_some(),
-                    "native ETH billing configuration is required"
-                );
-            }
-            LedgerBackend::Solana => {
-                anyhow::ensure!(
-                    self.native_billing.is_none(),
-                    "Solana mode rejects ETH billing configuration"
-                );
-                anyhow::ensure!(
-                    self.testnet_password.is_none(),
-                    "Solana does not support the Sepolia service gate"
-                );
-                let solana = self.solana.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("Solana ledger and Pyth configuration is required")
-                })?;
-                solana.billing.validate()?;
-                let ledger = &solana.ledger;
-                anyhow::ensure!(
-                    self.chain_id == zkapi_types::solana_chain_id(&ledger.genesis_hash)
-                        && self.contract_address
-                            == zkapi_types::solana_deployment_binding(
-                                &ledger.program_id,
-                                &ledger.vault_state,
-                                &ledger.genesis_hash
-                            ),
-                    "Solana protocol identity does not match the derived deployment"
-                );
-                anyhow::ensure!(
-                    self.initial_root == Felt252::ZERO,
-                    "Solana rejects an initial-root override"
-                );
-                anyhow::ensure!(
-                    self.indexer_url == ledger.indexer_url,
-                    "Solana indexer configuration is ambiguous"
-                );
-                dagon_zkapi_solana_ledger::SolanaCreditLedger::new(ledger.clone())?;
-            }
+    pub fn protocol_version(&self) -> u16 {
+        self.profile.protocol.protocol_version
+    }
+
+    /// Protocol chain ID derived from the identity's genesis hash.
+    pub fn chain_id(&self) -> u64 {
+        zkapi_types::solana_chain_id(&self.identity.genesis_hash)
+    }
+
+    /// The v2 `contract_address` statement input: the deployment binding of
+    /// the profile's program, the identity's vault and genesis hash.
+    pub fn contract_address(&self) -> Felt252 {
+        zkapi_types::solana_deployment_binding(
+            &self.profile.program_id(),
+            &self.identity.vault_state,
+            &self.identity.genesis_hash,
+        )
+    }
+
+    /// Minimum proof-bound lease budget in lamports.
+    pub fn request_charge_cap(&self) -> u128 {
+        u128::from(self.profile.vault.request_charge_cap)
+    }
+
+    pub fn ledger_config(&self) -> SolanaLedgerConfig {
+        SolanaLedgerConfig::from_identity(
+            self.rpc_url.clone(),
+            self.indexer_url.clone(),
+            self.network.clone(),
+            &self.profile,
+            &self.identity,
+        )
+    }
+
+    /// Operator-owned quote pins: the identity's price account, everything
+    /// else Pyth from the profile.
+    pub fn billing_pins(&self) -> BillingPins {
+        let pyth = &self.profile.pyth;
+        BillingPins {
+            chain_id: self.chain_id(),
+            deployment_binding: self.contract_address(),
+            backend: "dagon.solana.groth16.v1".into(),
+            network: self.network.clone(),
+            vault: bs58::encode(self.identity.vault_state).into_string(),
+            feed_id: pyth.feed_id.clone(),
+            feed_account: bs58::encode(self.identity.pyth_price_account).into_string(),
+            receiver_program: pyth.receiver_program.clone(),
+            max_age_seconds: pyth.max_age_seconds,
+            max_confidence_bps: pyth.max_confidence_bps,
         }
-        let lease = self
-            .openrouter_leases
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("native billing requires prompt-private leases"))?;
+    }
+
+    /// Reject incomplete or unsafe configurations before startup opens any
+    /// state or makes any network request.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.profile.validate()?;
         anyhow::ensure!(
-            lease.ttl_seconds > 0,
-            "OpenRouter lease TTL must be positive"
+            self.testnet_password.is_none() || self.network != MAINNET_BETA,
+            "ZKAPI_TESTNET_PASSWORD is not allowed on {MAINNET_BETA}"
         );
-        match &lease.source {
+        anyhow::ensure!(
+            self.identity.vault_state
+                == dagon_zkapi_profile::vault_state_address(
+                    &self.profile.program_id(),
+                    &self.identity.vault_authority
+                ),
+            "identity vault state is not the vault PDA of its authority"
+        );
+        dagon_zkapi_solana_ledger::SolanaCreditLedger::new(self.ledger_config())?;
+        crate::sol_billing::PythBillingOracle::new(self)?;
+        match &self.lease_source {
             OpenRouterLeaseSourceConfig::OpenRouter { management_key, .. } => anyhow::ensure!(
                 !management_key.is_empty(),
                 "OpenRouter management key cannot be empty"
@@ -254,52 +244,23 @@ impl ServerConfig {
                     "OA org URL and shared secret are required"
                 );
                 anyhow::ensure!(
-                    lease.ttl_seconds.is_multiple_of(60),
+                    self.profile.server.lease_ttl_seconds.is_multiple_of(60),
                     "OA org lease TTL must be a whole number of minutes"
                 );
             }
         }
         anyhow::ensure!(
-            self.request_charge_cap > 0
-                && self.request_charge_cap <= crate::native_billing::MAX_SAFE_UNITS,
-            "native request cap must fit browser-safe credit units"
+            self.request_charge_cap() <= crate::billing::MAX_SAFE_UNITS,
+            "request charge cap must fit browser-safe credit units"
         );
         anyhow::ensure!(
             self.root_poll_interval_ms > 0,
             "root poll interval must be positive"
         );
-        check_challenge_timing(lease, self.raise_lead_seconds, self.challenge_period_seconds)?;
+        check_challenge_timing(&self.lease_source, &self.profile)?;
         #[cfg(any(test, feature = "adversary"))]
         crate::adversary::ensure_allowed(self.adversary)?;
         Ok(())
-    }
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            backend: LedgerBackend::Solana,
-            solana: None,
-            protocol_version: 2,
-            chain_id: 1,
-            testnet_password: None,
-            contract_address: Felt252::ZERO,
-            request_charge_cap: 1_000_000,
-            listen_addr: "0.0.0.0:3000".to_string(),
-            db_path: "zkapi_server.db".to_string(),
-            state_seed: Felt252::from_u64(1),
-            clear_seed: Felt252::from_u64(2),
-            initial_root: Felt252::ZERO,
-            indexer_url: None,
-            root_poll_interval_ms: 1_000,
-            openrouter_leases: None,
-            native_billing: None,
-            proof_setup_dir: "protocol/setup/v2".to_string(),
-            challenge_period_seconds: 86_400,
-            raise_lead_seconds: 3_600,
-            #[cfg(any(test, feature = "adversary"))]
-            adversary: None,
-        }
     }
 }
 
@@ -307,22 +268,36 @@ impl Default for ServerConfig {
 mod tests {
     use super::*;
 
-    fn lease(direct: bool, ttl: u64, grace: u64, poll: u64) -> OpenRouterLeaseConfig {
-        OpenRouterLeaseConfig {
-            source: if direct {
-                OpenRouterLeaseSourceConfig::OpenRouter {
-                    management_key: "k".into(),
-                    api_base: "http://127.0.0.1:9".into(),
-                }
-            } else {
-                OpenRouterLeaseSourceConfig::OaOrg {
-                    org_base_url: "http://127.0.0.1:9".into(),
-                    shared_secret: "s".into(),
-                }
-            },
-            ttl_seconds: ttl,
-            settlement_grace_seconds: grace,
-            settlement_poll_seconds: poll,
+    fn source(direct: bool) -> OpenRouterLeaseSourceConfig {
+        if direct {
+            OpenRouterLeaseSourceConfig::OpenRouter {
+                management_key: "k".into(),
+                api_base: "http://127.0.0.1:9".into(),
+            }
+        } else {
+            OpenRouterLeaseSourceConfig::OaOrg {
+                org_base_url: "http://127.0.0.1:9".into(),
+                shared_secret: "s".into(),
+            }
+        }
+    }
+
+    fn profile(ttl: u64, grace: u64, poll: u64, lead: u64, period: u64) -> SharedProfile {
+        let mut profile = SharedProfile::embedded().clone();
+        profile.server.lease_ttl_seconds = ttl;
+        profile.server.settlement_grace_seconds = grace;
+        profile.server.settlement_poll_seconds = poll;
+        profile.server.raise_lead_seconds = lead;
+        profile.vault.challenge_period_seconds = period;
+        profile
+    }
+
+    /// The embedded profile itself satisfies the timing bound for both lease
+    /// sources, so every network runs with a safe challenge period.
+    #[test]
+    fn embedded_profile_timing_is_safe() {
+        for direct in [true, false] {
+            check_challenge_timing(&source(direct), SharedProfile::embedded()).unwrap();
         }
     }
 
@@ -331,16 +306,21 @@ mod tests {
     #[test]
     fn startup_timing_check_bounds_settlement_by_the_challenge_period() {
         let fixed = USAGE_READ_LATENCY_SECONDS + TIMING_MARGIN_SECONDS;
-        assert!(check_challenge_timing(&lease(true, 3_600, 300, 2), 3_600, 86_400).is_ok());
+        assert!(
+            check_challenge_timing(&source(true), &profile(3_600, 300, 2, 3_600, 86_400)).is_ok()
+        );
         // OA: TTL + one grace + two polls.
-        let oa = lease(false, 100, 100, 1);
-        assert!(check_challenge_timing(&oa, 100, 302 + fixed).is_ok());
-        let error = check_challenge_timing(&oa, 101, 302 + fixed)
+        assert!(
+            check_challenge_timing(&source(false), &profile(100, 100, 1, 100, 302 + fixed)).is_ok()
+        );
+        let error = check_challenge_timing(&source(false), &profile(100, 100, 1, 101, 302 + fixed))
             .unwrap_err()
             .to_string();
         assert!(error.contains("challenge timing is unsafe"), "{error}");
-        assert!(check_challenge_timing(&lease(true, 60, 0, 1), 0, 86_400).is_err());
-        assert!(check_challenge_timing(&lease(true, u64::MAX, 1, 1), 1, 86_400).is_err());
+        assert!(check_challenge_timing(&source(true), &profile(60, 0, 1, 0, 86_400)).is_err());
+        assert!(
+            check_challenge_timing(&source(true), &profile(u64::MAX, 1, 1, 1, 86_400)).is_err()
+        );
     }
 
     /// Regression: a directly managed OpenRouter key settles only after a
@@ -350,22 +330,10 @@ mod tests {
     #[test]
     fn startup_timing_counts_the_post_disable_drain_and_settlement_polls() {
         let fixed = USAGE_READ_LATENCY_SECONDS + TIMING_MARGIN_SECONDS;
-        let direct = lease(true, 3_600, 3_600, 60);
         let period = 3_600 + 3_600 + 3_600 + fixed; // TTL + one grace + lead
-        assert!(check_challenge_timing(&direct, 3_600, period).is_err());
-        assert!(check_challenge_timing(&direct, 3_600, period + 3_600 + 120).is_ok());
-        assert!(check_challenge_timing(&direct, 3_600, period + 3_600 + 119).is_err());
-    }
-
-    /// Regression: the configured period must be the vault's own; otherwise
-    /// the timing gate and the O7 deferral window are vacuous.
-    #[test]
-    fn configured_challenge_period_must_equal_the_vaults() {
-        assert!(check_vault_challenge_period(86_400, 86_400).is_ok());
-        let error = check_vault_challenge_period(86_400, 3_600)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("does not match the vault"), "{error}");
-        assert!(check_vault_challenge_period(3_600, 86_400).is_err());
+        let direct = |period| profile(3_600, 3_600, 60, 3_600, period);
+        assert!(check_challenge_timing(&source(true), &direct(period)).is_err());
+        assert!(check_challenge_timing(&source(true), &direct(period + 3_600 + 120)).is_ok());
+        assert!(check_challenge_timing(&source(true), &direct(period + 3_600 + 119)).is_err());
     }
 }

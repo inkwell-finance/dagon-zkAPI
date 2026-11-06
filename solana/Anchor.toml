@@ -8,6 +8,9 @@ skip-lint = false
 [programs.localnet]
 dagon_zkapi_vault = "7NdY5ZVP2He8gSiDHZbkfmNfSgKWV2tkZmZgty2C1d8H"
 
+[programs.mainnet]
+dagon_zkapi_vault = "7NdY5ZVP2He8gSiDHZbkfmNfSgKWV2tkZmZgty2C1d8H"
+
 [provider]
 cluster = "Localnet"
 wallet = "~/.config/solana/id.json"
@@ -16,4 +19,5 @@ wallet = "~/.config/solana/id.json"
 startup_wait = 10000
 
 [scripts]
-test = "cargo test --workspace"
+# Start scripts/localnet/stack.mjs first; Anchor must not launch an unprofiled validator.
+test = "cargo test --release --manifest-path ../Cargo.toml -p dagon-zkapi-solana-ledger --test localnet -- --ignored --nocapture"

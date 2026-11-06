@@ -1,8 +1,8 @@
-//! Chain-neutral price boundary. A price source is not a credit ledger.
+//! Price boundary between Pyth SOL/USD quotes and lamport credits. A price
+//! source is not a credit ledger.
 //!
-//! Existing ETH quote JSON is retained verbatim for the explicit compatibility
-//! backend. SOL quotes carry an explicit source and deployment binding; callers
-//! must authenticate them through `BillingPriceSource::validate` before first
+//! Quotes carry an explicit source and deployment binding; callers must
+//! authenticate them through `BillingPriceSource::validate` before first
 //! acceptance. Settlement only uses the already accepted, proof-bound quote.
 
 use std::{future::Future, pin::Pin};
@@ -10,13 +10,12 @@ use std::{future::Future, pin::Pin};
 use serde::{Deserialize, Serialize};
 use zkapi_types::Felt252;
 
-use super::{NativeBillingQuote, MAX_SAFE_UNITS};
 use crate::error::ServerError;
 
 pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 pub const PYTH_SOURCE: &str = "pyth_solana_receiver";
-pub const SOL_USD_FEED_ID: &str =
-    "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
+/// Largest integer a JavaScript number represents exactly.
+pub const MAX_SAFE_UNITS: u128 = 9_007_199_254_740_991;
 
 pub type BillingFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ServerError>> + Send + 'a>>;
 
@@ -35,80 +34,27 @@ pub trait BillingPriceSource: Send + Sync {
     }
 }
 
-/// The legacy ETH object has no new wrapper/tag, preserving its exact wire
-/// contract. SOL's object is distinguished by asset/source, with unknown fields
-/// rejected by both variants. Syntax alone never authenticates a quote.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum BillingQuote {
-    NativeSol(SolanaBillingQuote),
-    NativeEth(NativeBillingQuote),
-}
-
-impl From<NativeBillingQuote> for BillingQuote {
-    fn from(quote: NativeBillingQuote) -> Self {
-        Self::NativeEth(quote)
-    }
-}
-
-impl BillingQuote {
-    pub fn expires_at(&self) -> u64 {
-        match self {
-            Self::NativeEth(quote) => quote.expires_at,
-            Self::NativeSol(quote) => quote.expires_at,
-        }
-    }
-
-    pub fn assert_fresh(&self, now: u64) -> Result<(), ServerError> {
-        let published = match self {
-            Self::NativeEth(quote) => quote.updated_at,
-            Self::NativeSol(quote) => quote.publish_time,
-        };
-        if published == 0 || published > now {
-            return Err(invalid(
-                "billing price publication time is invalid or in the future",
-            ));
-        }
-        if self.expires_at() <= now {
-            return Err(ServerError::NativeQuoteExpired);
-        }
-        Ok(())
-    }
-
-    pub fn limit_micro_usd(&self, units: u128) -> Result<u128, ServerError> {
-        match self {
-            Self::NativeEth(quote) => quote.limit_micro_usd(units),
-            Self::NativeSol(quote) => quote.limit_micro_usd(units),
-        }
-    }
-
-    pub fn charge_units(&self, micro_usd: u128) -> Result<u128, ServerError> {
-        match self {
-            Self::NativeEth(quote) => quote.charge_units(micro_usd),
-            Self::NativeSol(quote) => quote.charge_units(micro_usd),
-        }
-    }
-}
-
 /// Pins owned by the operator, never supplied by an API caller. The transport
 /// adapter must decode/validate addresses and verify the actual account owner
 /// using the official receiver SDK before constructing an authenticated quote.
 #[derive(Debug, Clone)]
-pub struct SolanaBillingPins {
+pub struct BillingPins {
     pub chain_id: u64,
     pub deployment_binding: Felt252,
     pub backend: String,
     pub network: String,
     pub vault: String,
+    pub feed_id: String,
     pub feed_account: String,
     pub receiver_program: String,
     pub max_age_seconds: u64,
     pub max_confidence_bps: u16,
 }
 
+/// A finalized Pyth SOL/USD price bound to one deployment.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct SolanaBillingQuote {
+pub struct BillingQuote {
     pub asset: String,
     pub source: String,
     pub credit_unit: String,
@@ -131,8 +77,8 @@ pub struct SolanaBillingQuote {
     pub posted_slot: u64,
 }
 
-impl SolanaBillingQuote {
-    pub fn validate_identity(&self, pins: &SolanaBillingPins) -> Result<(), ServerError> {
+impl BillingQuote {
+    pub fn validate_identity(&self, pins: &BillingPins) -> Result<(), ServerError> {
         if self.asset != "native_sol"
             || self.source != PYTH_SOURCE
             || self.credit_unit != "lamports"
@@ -142,12 +88,13 @@ impl SolanaBillingQuote {
             || self.backend != pins.backend
             || self.network != pins.network
             || self.vault != pins.vault
-            || self.feed_id != SOL_USD_FEED_ID
+            || self.feed_id != pins.feed_id
             || self.feed_account != pins.feed_account
             || self.receiver_program != pins.receiver_program
             || pins.backend != "dagon.solana.groth16.v1"
             || pins.network.trim().is_empty()
             || pins.vault.trim().is_empty()
+            || pins.feed_id.is_empty()
             || pins.feed_account.is_empty()
             || pins.receiver_program.is_empty()
             || pins.max_age_seconds == 0
@@ -176,6 +123,18 @@ impl SolanaBillingQuote {
             ));
         }
         self.micro_usd_per_lamport()?;
+        Ok(())
+    }
+
+    pub fn assert_fresh(&self, now: u64) -> Result<(), ServerError> {
+        if self.publish_time == 0 || self.publish_time > now {
+            return Err(invalid(
+                "billing price publication time is invalid or in the future",
+            ));
+        }
+        if self.expires_at <= now {
+            return Err(ServerError::NativeQuoteExpired);
+        }
         Ok(())
     }
 
@@ -298,8 +257,10 @@ fn mul_div(a: u128, b: u128, d: u128) -> Result<(u128, bool), ServerError> {
 mod tests {
     use super::*;
 
-    fn quote(price: &str, exponent: i32) -> SolanaBillingQuote {
-        SolanaBillingQuote {
+    const FEED: &str = "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
+
+    fn quote(price: &str, exponent: i32) -> BillingQuote {
+        BillingQuote {
             asset: "native_sol".into(),
             source: PYTH_SOURCE.into(),
             credit_unit: "lamports".into(),
@@ -309,7 +270,7 @@ mod tests {
             backend: "dagon.solana.groth16.v1".into(),
             network: "localnet".into(),
             vault: "pinned-vault".into(),
-            feed_id: SOL_USD_FEED_ID.into(),
+            feed_id: FEED.into(),
             feed_account: "pinned-price-account".into(),
             receiver_program: "pinned-receiver".into(),
             price: price.into(),
@@ -318,6 +279,21 @@ mod tests {
             publish_time: 100,
             expires_at: 130,
             posted_slot: 90,
+        }
+    }
+
+    fn pins(q: &BillingQuote, max_age_seconds: u64) -> BillingPins {
+        BillingPins {
+            chain_id: 7,
+            deployment_binding: q.deployment_binding,
+            backend: q.backend.clone(),
+            network: q.network.clone(),
+            vault: q.vault.clone(),
+            feed_id: FEED.into(),
+            feed_account: q.feed_account.clone(),
+            receiver_program: q.receiver_program.clone(),
+            max_age_seconds,
+            max_confidence_bps: 100,
         }
     }
 
@@ -363,26 +339,15 @@ mod tests {
     #[test]
     fn identity_is_source_asset_feed_and_deployment_bound() {
         let q = quote("15000000000", -8);
-        let pins = SolanaBillingPins {
-            chain_id: 7,
-            deployment_binding: Felt252::from_u64(8),
-            backend: q.backend.clone(),
-            network: q.network.clone(),
-            vault: q.vault.clone(),
-            feed_account: q.feed_account.clone(),
-            receiver_program: q.receiver_program.clone(),
-            max_age_seconds: 30,
-            max_confidence_bps: 100,
-        };
+        let pins = pins(&q, 30);
         q.validate_identity(&pins).unwrap();
         for mutate in [
-            (|q: &mut SolanaBillingQuote| q.asset = "native_eth".into())
-                as fn(&mut SolanaBillingQuote),
+            (|q: &mut BillingQuote| q.asset = "native_usdc".into()) as fn(&mut BillingQuote),
             |q| q.source = "http_price".into(),
-            |q| q.credit_unit = "gwei".into(),
+            |q| q.credit_unit = "micro_usd".into(),
             |q| q.base_units_per_asset += 1,
             |q| q.chain_id = "8".into(),
-            |q| q.backend = "evm".into(),
+            |q| q.backend = "other.groth16.v1".into(),
             |q| q.network = "other".into(),
             |q| q.vault = "other".into(),
             |q| q.deployment_binding = Felt252::ZERO,
@@ -401,17 +366,7 @@ mod tests {
     #[test]
     fn production_confidence_age_and_exponent_boundaries() {
         let mut q = quote("15000000000", -8);
-        let mut pins = SolanaBillingPins {
-            chain_id: 7,
-            deployment_binding: q.deployment_binding,
-            backend: q.backend.clone(),
-            network: q.network.clone(),
-            vault: q.vault.clone(),
-            feed_account: q.feed_account.clone(),
-            receiver_program: q.receiver_program.clone(),
-            max_age_seconds: 60,
-            max_confidence_bps: 100,
-        };
+        let mut pins = pins(&q, 60);
         q.expires_at = 160;
         q.confidence = "150000000".into();
         q.validate_identity(&pins).unwrap();
@@ -431,12 +386,13 @@ mod tests {
             );
         }
         q.exponent = -8;
-        for field in [0, 1, 2] {
+        for field in [0, 1, 2, 3] {
             let mut empty = pins.clone();
             match field {
                 0 => empty.backend.clear(),
                 1 => empty.network.clear(),
-                _ => empty.vault.clear(),
+                2 => empty.vault.clear(),
+                _ => empty.feed_id.clear(),
             }
             assert!(q.validate_identity(&empty).is_err());
         }
@@ -457,7 +413,7 @@ mod tests {
 
     #[test]
     fn freshness_is_separate_from_frozen_quote_conversion() {
-        let q = BillingQuote::NativeSol(quote("15000000000", -8));
+        let q = quote("15000000000", -8);
         q.assert_fresh(100).unwrap();
         assert!(q.assert_fresh(99).is_err());
         assert!(matches!(
@@ -469,32 +425,15 @@ mod tests {
     }
 
     #[test]
-    fn eth_wire_object_remains_unchanged_and_unknown_fields_fail() {
-        let eth = NativeBillingQuote {
-            asset: "native_eth".into(),
-            units_per_eth: 1_000_000_000,
-            chain_id: 1,
-            feed_address: "0xfeed".into(),
-            round_id: "123".into(),
-            answer: "100000000000".into(),
-            decimals: 8,
-            updated_at: 100,
-            expires_at: 130,
-        };
-        let legacy = serde_json::to_value(&eth).unwrap();
-        let generic = BillingQuote::NativeEth(eth);
-        assert_eq!(serde_json::to_value(&generic).unwrap(), legacy);
+    fn wire_object_round_trips_and_unknown_fields_fail() {
+        let q = quote("15000000000", -8);
+        let encoded = serde_json::to_value(&q).unwrap();
         assert_eq!(
-            serde_json::from_value::<BillingQuote>(legacy.clone()).unwrap(),
-            generic
+            serde_json::from_value::<BillingQuote>(encoded.clone()).unwrap(),
+            q
         );
-        let mut extra = legacy;
-        extra["source"] = "untrusted".into();
+        let mut extra = encoded;
+        extra["untrusted"] = "123".into();
         assert!(serde_json::from_value::<BillingQuote>(extra).is_err());
-        let sol = BillingQuote::NativeSol(quote("15000000000", -8));
-        assert_eq!(
-            serde_json::from_value::<BillingQuote>(serde_json::to_value(&sol).unwrap()).unwrap(),
-            sol
-        );
     }
 }

@@ -1,0 +1,38 @@
+{
+  "schema": "dagon-zkapi.solana-profile.v1",
+  "protocol": {
+    "protocol_version": 2,
+    "circuit_id": "zkapi-v2-concession-v1",
+    "transition_circuit_id": "dagon-zkapi-solana-transition-v1"
+  },
+  "program": {
+    "program_id": "7NdY5ZVP2He8gSiDHZbkfmNfSgKWV2tkZmZgty2C1d8H",
+    "loader": "BPFLoaderUpgradeab1e11111111111111111111111",
+    "upgrade_authority": null,
+    "executable_sha256": "a61192ae477628c499f35069d39be91f2964f5c39df08d22f65b657f4cb67115"
+  },
+  "vault": {
+    "version": 1,
+    "request_charge_cap": 11000000,
+    "note_ttl_seconds": 2592000,
+    "challenge_period_seconds": 86400,
+    "max_pause_seconds": 604800,
+    "pause_cooldown_seconds": 86400
+  },
+  "server": {
+    "lease_ttl_seconds": 300,
+    "settlement_grace_seconds": 5,
+    "settlement_poll_seconds": 2,
+    "raise_lead_seconds": 3600
+  },
+  "pyth": {
+    "receiver_program": "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ",
+    "push_oracle_program": "pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT",
+    "wormhole_program": "HDwcJBJXjL9FpJ7UBsYBtaDjsBUhuLCUYoz3zr8SWWaQ",
+    "feed_id": "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+    "push_shard_id": 0,
+    "max_age_seconds": 30,
+    "max_confidence_bps": 100,
+    "push_interval_seconds": 5
+  }
+}

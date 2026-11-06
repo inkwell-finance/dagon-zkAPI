@@ -19,25 +19,11 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Keccak256};
 use zkapi_proof::compact::RequestVerifier;
 use zkapi_types::wire::Groth16ProofWire;
 use zkapi_types::{Felt252, RequestPublicInputsV2};
 
 use crate::nullifier_store::{NullifierStore, OaProvisioningOutcome, RequestEvidence};
-
-const REQUEST_TUPLE: &str =
-    "(uint16,uint64,address,uint256,uint256,uint256,uint64,uint128,uint256,uint256,uint256,uint256)";
-
-/// `challengeEscapeWithdrawal(uint32,RequestPublicInputs,bytes)`: defeat.
-pub fn defeat_signature() -> String {
-    format!("challengeEscapeWithdrawal(uint32,{REQUEST_TUPLE},bytes)")
-}
-
-/// `raiseEscapeConcession(uint32,RequestPublicInputs,bytes,uint128)`.
-pub fn raise_signature() -> String {
-    format!("raiseEscapeConcession(uint32,{REQUEST_TUPLE},bytes,uint128)")
-}
 
 /// One pending escape as the vault reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,65 +90,10 @@ pub struct ChallengeAction {
     pub proof: Groth16ProofWire,
 }
 
-impl ChallengeAction {
-    /// ABI-encode the EVM vault call with the exact request tuple and proof.
-    pub fn calldata(&self) -> Result<Vec<u8>, String> {
-        let p = &self.request_inputs;
-        if p.protocol_version != 2 {
-            return Err("unsupported evidence protocol version".into());
-        }
-        if p.contract_address.as_bytes()[..12]
-            .iter()
-            .any(|byte| *byte != 0)
-        {
-            return Err("evidence contract address exceeds 20 bytes".into());
-        }
-        let proof = RequestEvidence {
-            nullifier: p.request_nullifier,
-            client_request_id: String::new(),
-            request_inputs: p.clone(),
-            proof: self.proof.clone(),
-            created_at: 0,
-        }
-        .proof_bytes()?;
-        // noteId + static 12-word tuple + bytes offset (+ amount for a raise).
-        let (signature, amount) = match self.kind {
-            ActionKind::Defeat => (defeat_signature(), None),
-            ActionKind::Raise { amount } => (raise_signature(), Some(amount)),
-        };
-        let head_words = 1 + 12 + 1 + usize::from(amount.is_some());
-        let mut data = Keccak256::digest(signature.as_bytes())[..4].to_vec();
-        for value in [
-            Felt252::from_u64(self.note_id as u64),
-            Felt252::from_u64(p.protocol_version as u64),
-            Felt252::from_u64(p.chain_id),
-            p.contract_address,
-            p.active_root,
-            p.state_signing_key_x,
-            p.state_signing_key_y,
-            Felt252::from_u64(p.request_time),
-            Felt252::from_u128(p.solvency_bound),
-            p.request_nullifier,
-            p.authorization_tag,
-            p.anonymous_commitment_x,
-            p.anonymous_commitment_y,
-            Felt252::from_u64((head_words * 32) as u64),
-        ] {
-            data.extend_from_slice(value.as_bytes());
-        }
-        if let Some(amount) = amount {
-            data.extend_from_slice(Felt252::from_u128(amount).as_bytes());
-        }
-        data.extend_from_slice(Felt252::from_u64(proof.len() as u64).as_bytes());
-        data.extend_from_slice(&proof);
-        Ok(data)
-    }
-}
-
 /// What the policy wants done for one pending escape now.
 #[derive(Debug, Clone)]
 pub enum Decision {
-    Act(ChallengeAction),
+    Act(Box<ChallengeAction>),
     /// `Ω(N)` is not final yet; decide again before `deadline − raise_lead`.
     Wait,
     Nothing,
@@ -266,12 +197,12 @@ impl ChallengeWatcher {
     pub fn decide(&self, escape: &PendingEscape, now: u64) -> anyhow::Result<Decision> {
         if escape.next_nullifier != Felt252::ZERO {
             if let Some(evidence) = self.verified_evidence(&escape.next_nullifier)? {
-                return Ok(Decision::Act(ChallengeAction {
+                return Ok(Decision::Act(Box::new(ChallengeAction {
                     note_id: escape.note_id,
                     kind: ActionKind::Defeat,
                     request_inputs: evidence.request_inputs,
                     proof: evidence.proof,
-                }));
+                })));
             }
         }
         let Some(evidence) = self.verified_evidence(&escape.nullifier)? else {
@@ -286,12 +217,12 @@ impl ChallengeWatcher {
         if amount <= escape.conceded {
             return Ok(Decision::Nothing);
         }
-        Ok(Decision::Act(ChallengeAction {
+        Ok(Decision::Act(Box::new(ChallengeAction {
             note_id: escape.note_id,
             kind: ActionKind::Raise { amount },
             request_inputs: evidence.request_inputs,
             proof: evidence.proof,
-        }))
+        })))
     }
 }
 
@@ -488,60 +419,5 @@ pub(crate) mod tests {
         }
         let legacy: ActionKind = serde_json::from_str(r#"{"kind":"raise","amount":120}"#).unwrap();
         assert_eq!(legacy, ActionKind::Raise { amount: 120 });
-    }
-
-    #[test]
-    fn calldata_encodes_defeat_and_raise_with_the_exact_tuple_and_proof() {
-        let request = synthetic_request("k", Felt252::from_u64(11), 300);
-        let proof = base64::engine::general_purpose::STANDARD
-            .decode(&request.proof.proof)
-            .unwrap();
-        let mut action = ChallengeAction {
-            note_id: 4,
-            kind: ActionKind::Defeat,
-            request_inputs: request.public_inputs.clone(),
-            proof: request.proof.clone(),
-        };
-        let defeat = action.calldata().unwrap();
-        assert_eq!(
-            &defeat[..4],
-            &Keccak256::digest(defeat_signature().as_bytes())[..4]
-        );
-        // The defeat selector is unchanged from the pre-concession vault.
-        assert_eq!(&defeat[..4], &[0xda, 0x0c, 0xe4, 0x3d]);
-        assert_eq!(defeat.len(), 4 + (14 + 1 + 8) * 32);
-        assert_eq!(
-            &defeat[4 + 9 * 32..4 + 10 * 32],
-            Felt252::from_u64(11).as_bytes()
-        );
-        assert_eq!(
-            &defeat[4 + 13 * 32..4 + 14 * 32],
-            Felt252::from_u64(14 * 32).as_bytes()
-        );
-        assert_eq!(&defeat[4 + 15 * 32..], proof.as_slice());
-
-        action.kind = ActionKind::Raise { amount: 77 };
-        let raise = action.calldata().unwrap();
-        assert_eq!(
-            &raise[..4],
-            &Keccak256::digest(raise_signature().as_bytes())[..4]
-        );
-        assert_eq!(raise.len(), 4 + (15 + 1 + 8) * 32);
-        assert_eq!(
-            &raise[4 + 13 * 32..4 + 14 * 32],
-            Felt252::from_u64(15 * 32).as_bytes()
-        );
-        assert_eq!(
-            &raise[4 + 14 * 32..4 + 15 * 32],
-            Felt252::from_u128(77).as_bytes()
-        );
-        assert_eq!(
-            &raise[4 + 15 * 32..4 + 16 * 32],
-            Felt252::from_u64(256).as_bytes()
-        );
-        assert_eq!(&raise[4 + 16 * 32..], proof.as_slice());
-
-        action.request_inputs.protocol_version = 1;
-        assert!(action.calldata().is_err());
     }
 }

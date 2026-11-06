@@ -5,8 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use zkapi_types::{Felt252, MERKLE_DEPTH};
 
-use crate::events::VaultEvent;
-use crate::tree_mirror::{TreeMirror, TreeMirrorSnapshot};
+use crate::tree_mirror::TreeMirror;
 
 /// The indexer service wraps a TreeMirror and provides read access.
 pub struct IndexerService {
@@ -15,15 +14,8 @@ pub struct IndexerService {
 }
 
 impl IndexerService {
-    pub fn new(mirror: Arc<RwLock<TreeMirror>>) -> Self {
-        Self {
-            mirror,
-            ready: AtomicBool::new(true),
-        }
-    }
-
-    /// Construct an indexer that must finish its initial replay before serving
-    /// tree data.
+    /// Construct an indexer that serves tree data only after its first
+    /// validated snapshot.
     pub fn new_syncing(mirror: Arc<RwLock<TreeMirror>>) -> Self {
         Self {
             mirror,
@@ -37,15 +29,6 @@ impl IndexerService {
 
     pub fn mark_ready(&self) {
         self.ready.store(true, Ordering::Release);
-    }
-
-    pub fn snapshot(&self) -> TreeMirrorSnapshot {
-        self.mirror.read().unwrap().snapshot()
-    }
-
-    pub fn restore(&self, snapshot: TreeMirrorSnapshot) -> Result<(), String> {
-        *self.mirror.write().unwrap() = TreeMirror::from_snapshot(snapshot)?;
-        Ok(())
     }
 
     /// Atomically publish a fully validated backend snapshot.
@@ -87,11 +70,6 @@ impl IndexerService {
             next_note_id: mirror.next_note_id(),
             leaves: mirror.current_leaves(),
         }
-    }
-
-    /// Apply a decoded contract event to the mirrored tree.
-    pub fn process_event(&self, event: &VaultEvent) {
-        self.mirror.write().unwrap().process_event(event);
     }
 }
 

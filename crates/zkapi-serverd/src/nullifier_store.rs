@@ -79,23 +79,6 @@ pub struct RequestEvidence {
     pub created_at: u64,
 }
 
-impl RequestEvidence {
-    /// The proof as eight 32-byte coordinates (the vault's `bytes proof`).
-    pub fn proof_bytes(&self) -> Result<Vec<u8>, String> {
-        use base64::Engine;
-        if self.proof.backend != ProofBackendWire::Groth16Bn254 {
-            return Err("evidence proof is not Groth16/BN254".into());
-        }
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&self.proof.proof)
-            .map_err(|error| format!("evidence proof is not base64: {error}"))?;
-        if bytes.len() != 256 {
-            return Err("evidence proof must contain eight 32-byte coordinates".into());
-        }
-        Ok(bytes)
-    }
-}
-
 /// Result of recording that a settled request's nullifier is consumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignatureDeferral {

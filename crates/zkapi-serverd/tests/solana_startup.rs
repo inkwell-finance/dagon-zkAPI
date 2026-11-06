@@ -2,6 +2,7 @@
 use anchor_lang::{AccountSerialize, Owner};
 use axum::{extract::State, routing::post, Json, Router};
 use base64::Engine;
+use dagon_zkapi_profile::{executable_sha256, to_hex, vault_state_address, SharedProfile};
 use dagon_zkapi_vault::VaultState;
 use pyth_solana_receiver_sdk::price_update::{PriceFeedMessage, PriceUpdateV2, VerificationLevel};
 use serde_json::{json, Value};
@@ -13,20 +14,22 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 use zkapi_serverd::{
-    config::{
-        LedgerBackend, OpenRouterLeaseConfig, OpenRouterLeaseSourceConfig, ServerConfig,
-        SolanaLedgerConfig, SolanaServerConfig,
-    },
-    native_billing::billing::{BillingQuote, SOL_USD_FEED_ID},
+    billing::BillingPriceSource,
+    config::{OpenRouterLeaseSourceConfig, ResolvedIdentity, ServerConfig},
+    error::ServerError,
     routes::{prepare_solana_backends, run_server},
     signer::ServerSigner,
-    sol_billing::PythBillingConfig,
+    sol_billing::PythBillingOracle,
+    testnet_auth::TestnetPassword,
 };
-use zkapi_types::{solana_chain_id, solana_deployment_binding, Felt252};
+use zkapi_types::Felt252;
+
+/// Deployed program bytes of the fixture; the profile pins their hash.
+const PROGRAM_BYTES: &[u8] = &[1, 2, 3];
 
 struct Fixture {
     config: ServerConfig,
@@ -48,34 +51,73 @@ fn now() -> u64 {
         .as_secs()
 }
 
+fn program_data(upgrade_authority: Option<Pubkey>, code: &[u8]) -> Vec<u8> {
+    let mut data = bincode::serialize(&UpgradeableLoaderState::ProgramData {
+        slot: 1,
+        upgrade_authority_address: upgrade_authority,
+    })
+    .unwrap();
+    data.resize(UpgradeableLoaderState::size_of_programdata_metadata(), 0);
+    data.extend_from_slice(code);
+    // The loader allocates program data beyond the code; the hash ignores it.
+    data.resize(data.len() + 64, 0);
+    data
+}
+
 impl Fixture {
     fn new(db_path: String) -> Self {
+        let mut profile = SharedProfile::embedded().clone();
+        profile.program.executable_sha256 = to_hex(&executable_sha256(PROGRAM_BYTES));
         let program = dagon_zkapi_vault::ID;
+        assert_eq!(program.to_bytes(), profile.program_id());
         let authority = Pubkey::new_from_array([7; 32]);
-        let (vault_key, bump) =
-            Pubkey::find_program_address(&[b"vault", authority.as_ref()], &program);
+        let vault_key = Pubkey::new_from_array(vault_state_address(
+            &program.to_bytes(),
+            &authority.to_bytes(),
+        ));
+        let (_, bump) = Pubkey::find_program_address(&[b"vault", authority.as_ref()], &program);
         let genesis = [3; 32];
-        let chain_id = solana_chain_id(&genesis);
-        let binding =
-            solana_deployment_binding(&program.to_bytes(), &vault_key.to_bytes(), &genesis);
-        let signer = ServerSigner::new(&Felt252::from_u64(1), &Felt252::from_u64(2));
+        let identity = ResolvedIdentity {
+            genesis_hash: genesis,
+            vault_authority: authority.to_bytes(),
+            vault_state: vault_key.to_bytes(),
+            treasury: [9; 32],
+            pyth_price_account: [8; 32],
+        };
+        let config = ServerConfig {
+            profile,
+            db_path,
+            listen_addr: "127.0.0.1:0".into(),
+            ..ServerConfig::new(
+                "localnet".into(),
+                identity,
+                "http://127.0.0.1:9".into(),
+                OpenRouterLeaseSourceConfig::OpenRouter {
+                    management_key: "test-only".into(),
+                    api_base: "http://127.0.0.1:9".into(),
+                },
+                Felt252::from_u64(1),
+                Felt252::from_u64(2),
+            )
+        };
+        let signer = ServerSigner::new(&config.state_seed, &config.clear_seed);
         let state_key = signer.state_public_key();
         let clear_key = signer.clearance_public_key();
-        let price_key = Pubkey::new_from_array([8; 32]);
+        let vault_profile = &config.profile.vault;
         let vault = VaultState {
-            version: 1,
+            version: vault_profile.version,
             bump,
             paused: false,
             authority,
-            treasury: Pubkey::new_from_array([9; 32]),
+            treasury: Pubkey::new_from_array(identity.treasury),
             genesis_hash: genesis,
-            chain_id,
-            protocol_binding: *binding.as_bytes(),
+            chain_id: config.chain_id(),
+            protocol_binding: *config.contract_address().as_bytes(),
             current_root: *Felt252::from_u64(44).as_bytes(),
             next_note_id: 0,
-            note_ttl: 86_400,
-            challenge_period: 86_400,
-            request_charge_cap: 50_000,
+            note_ttl: vault_profile.note_ttl_seconds,
+            challenge_period: vault_profile.challenge_period_seconds,
+            request_charge_cap: vault_profile.request_charge_cap,
             total_credits: 0,
             state_signing_key_x: *state_key.x.as_bytes(),
             state_signing_key_y: *state_key.y.as_bytes(),
@@ -90,78 +132,40 @@ impl Fixture {
             write_authority: authority,
             verification_level: VerificationLevel::Full,
             price_message: PriceFeedMessage {
-                feed_id: hex::decode(&SOL_USD_FEED_ID[2..])
+                feed_id: hex::decode(&config.profile.pyth.feed_id[2..])
                     .unwrap()
                     .try_into()
                     .unwrap(),
                 price: 15_000_000_000,
                 conf: 15_000_000,
                 exponent: -8,
-                publish_time: now() as i64,
-                prev_publish_time: now() as i64 - 1,
+                publish_time: now() as i64 - 2,
+                prev_publish_time: now() as i64 - 3,
                 ema_price: 15_000_000_000,
                 ema_conf: 15_000_000,
             },
             posted_slot: 10,
         };
-        let config = ServerConfig {
-            backend: LedgerBackend::Solana,
-            chain_id,
-            contract_address: binding,
-            request_charge_cap: 50_000,
-            db_path,
-            listen_addr: "127.0.0.1:0".into(),
-            solana: Some(SolanaServerConfig {
-                ledger: SolanaLedgerConfig {
-                    rpc_url: "http://127.0.0.1:9".into(),
-                    indexer_url: None,
-                    network: "localnet".into(),
-                    program_id: program.to_bytes(),
-                    vault_state: vault_key.to_bytes(),
-                    genesis_hash: genesis,
-                },
-                billing: PythBillingConfig {
-                    price_account: price_key.to_string(),
-                    receiver_program: PriceUpdateV2::owner().to_string(),
-                    feed_id: SOL_USD_FEED_ID.into(),
-                    max_age_seconds: 30,
-                    max_confidence_bps: 100,
-                },
-            }),
-            openrouter_leases: Some(OpenRouterLeaseConfig {
-                source: OpenRouterLeaseSourceConfig::OpenRouter {
-                    management_key: "test-only".into(),
-                    api_base: "http://127.0.0.1:9".into(),
-                },
-                ttl_seconds: 60,
-                settlement_grace_seconds: 0,
-                settlement_poll_seconds: 1,
-            }),
-            ..Default::default()
-        };
         let mut accounts = HashMap::new();
-        let program_data = bpf_loader_upgradeable::get_program_data_address(&program);
+        let program_data_address = bpf_loader_upgradeable::get_program_data_address(&program);
         accounts.insert(
             program.to_string(),
             account(
                 bpf_loader_upgradeable::ID,
                 true,
                 bincode::serialize(&UpgradeableLoaderState::Program {
-                    programdata_address: program_data,
+                    programdata_address: program_data_address,
                 })
                 .unwrap(),
             ),
         );
-        let mut data = bincode::serialize(&UpgradeableLoaderState::ProgramData {
-            slot: 1,
-            upgrade_authority_address: None,
-        })
-        .unwrap();
-        data.resize(UpgradeableLoaderState::size_of_programdata_metadata(), 0);
-        data.push(1); // mock deployed code
         accounts.insert(
-            program_data.to_string(),
-            account(bpf_loader_upgradeable::ID, false, data),
+            program_data_address.to_string(),
+            account(
+                bpf_loader_upgradeable::ID,
+                false,
+                program_data(None, PROGRAM_BYTES),
+            ),
         );
         Self {
             config,
@@ -171,27 +175,36 @@ impl Fixture {
             genesis: bs58::encode(genesis).into_string(),
         }
     }
-    fn serialize_accounts(&mut self) {
-        let sol = self.config.solana.as_ref().unwrap();
-        let mut data = Vec::new();
-        self.vault.try_serialize(&mut data).unwrap();
-        self.accounts.insert(
-            bs58::encode(sol.ledger.vault_state).into_string(),
-            account(Pubkey::new_from_array(sol.ledger.program_id), false, data),
-        );
+
+    fn vault_key(&self) -> String {
+        bs58::encode(self.config.identity.vault_state).into_string()
+    }
+
+    fn price_key(&self) -> String {
+        bs58::encode(self.config.identity.pyth_price_account).into_string()
+    }
+
+    fn price_account(&self) -> Value {
         let mut data = Vec::new();
         self.price.try_serialize(&mut data).unwrap();
         data.resize(PriceUpdateV2::LEN, 0);
+        account(PriceUpdateV2::owner(), false, data)
+    }
+
+    fn serialize_accounts(&mut self) {
+        let mut data = Vec::new();
+        self.vault.try_serialize(&mut data).unwrap();
         self.accounts.insert(
-            sol.billing.price_account.clone(),
-            account(PriceUpdateV2::owner(), false, data),
+            self.vault_key(),
+            account(dagon_zkapi_vault::ID, false, data),
         );
+        self.accounts.insert(self.price_key(), self.price_account());
     }
 }
 
 #[derive(Clone)]
 struct Rpc {
-    accounts: Arc<HashMap<String, Value>>,
+    accounts: Arc<Mutex<HashMap<String, Value>>>,
     genesis: String,
     wrong_id: bool,
     unavailable: bool,
@@ -215,6 +228,8 @@ async fn rpc(State(state): State<Rpc>, Json(request): Json<Value>) -> Json<Value
             assert_eq!(request["params"][1]["commitment"], "finalized");
             let value = state
                 .accounts
+                .lock()
+                .unwrap()
                 .get(request["params"][0].as_str().unwrap())
                 .cloned()
                 .unwrap_or(Value::Null);
@@ -224,27 +239,34 @@ async fn rpc(State(state): State<Rpc>, Json(request): Json<Value>) -> Json<Value
     };
     Json(json!({"jsonrpc":"2.0","id":if state.wrong_id {2} else {1},"result":result}))
 }
+
+struct MockRpc {
+    accounts: Arc<Mutex<HashMap<String, Value>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 async fn start_rpc(
     f: &mut Fixture,
     mutate: impl FnOnce(&mut HashMap<String, Value>),
     wrong_id: bool,
     unavailable: bool,
     wrong_price_genesis: bool,
-) -> tokio::task::JoinHandle<()> {
+) -> MockRpc {
     f.serialize_accounts();
     mutate(&mut f.accounts);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    f.config.solana.as_mut().unwrap().ledger.rpc_url =
-        format!("http://{}", listener.local_addr().unwrap());
+    f.config.rpc_url = format!("http://{}", listener.local_addr().unwrap());
+    let accounts = Arc::new(Mutex::new(f.accounts.clone()));
     let router = Router::new().route("/", post(rpc)).with_state(Rpc {
-        accounts: Arc::new(f.accounts.clone()),
+        accounts: accounts.clone(),
         genesis: f.genesis.clone(),
         wrong_id,
         unavailable,
         genesis_reads: Arc::new(AtomicUsize::new(0)),
         wrong_price_genesis,
     });
-    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() })
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    MockRpc { accounts, task }
 }
 
 #[tokio::test]
@@ -252,43 +274,92 @@ async fn complete_finalized_preflight_is_separate_from_database_and_frozen_quote
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("not-opened.db");
     let mut f = Fixture::new(db.to_string_lossy().into_owned());
-    let task = start_rpc(&mut f, |_| {}, false, false, false).await;
+    let rpc = start_rpc(&mut f, |_| {}, false, false, false).await;
     let signer = ServerSigner::new(&f.config.state_seed, &f.config.clear_seed);
     let backends = prepare_solana_backends(&f.config, &signer).await.unwrap();
     assert_eq!(backends.initial_root, Felt252::from_u64(44));
     assert!(!db.exists());
     let quote = backends.billing.quote(now()).await.unwrap();
     backends.billing.validate(&quote, now()).await.unwrap();
-    let BillingQuote::NativeSol(sol) = &quote else {
-        panic!("expected SOL");
-    };
-    assert_eq!(sol.chain_id, f.config.chain_id.to_string());
+    assert_eq!(quote.chain_id, f.config.chain_id().to_string());
+    assert_eq!(quote.feed_account, f.price_key());
     assert_eq!(quote.limit_micro_usd(1_000_000_000).unwrap(), 149_850_000);
     assert_eq!(quote.charge_units(149_850_000).unwrap(), 1_000_000_000);
-    let mut expired = sol.clone();
+    let mut expired = quote.clone();
     expired.publish_time = 1;
     expired.expires_at = 31;
-    assert!(BillingQuote::NativeSol(expired.clone())
-        .assert_fresh(now())
-        .is_err());
+    assert!(expired.assert_fresh(now()).is_err());
     assert_eq!(expired.charge_units(149_850_000).unwrap(), 1_000_000_000);
-    let mut forged = sol.clone();
+    let mut forged = quote.clone();
     forged.price = "16000000000".into();
-    assert!(backends
-        .billing
-        .validate(&BillingQuote::NativeSol(forged), now())
-        .await
-        .is_err());
-    task.abort();
+    assert!(backends.billing.validate(&forged, now()).await.is_err());
+    rpc.task.abort();
+}
+
+/// Mainnet's price account updates faster than a proof is built: a fresh
+/// quote this server read stays acceptable after a newer update, while an
+/// unobserved, mutated or expired quote is still refused.
+#[tokio::test]
+async fn observed_quotes_survive_newer_price_updates() {
+    let mut f = Fixture::new("unused.db".into());
+    let rpc = start_rpc(&mut f, |_| {}, false, false, false).await;
+    let oracle = PythBillingOracle::new(&f.config).unwrap();
+    let older = oracle.quote(now()).await.unwrap();
+
+    // The finalized account moves on to a newer update.
+    f.price.price_message.price = 15_100_000_000;
+    f.price.price_message.publish_time += 1;
+    f.price.posted_slot += 1;
+    rpc.accounts
+        .lock()
+        .unwrap()
+        .insert(f.price_key(), f.price_account());
+    oracle.validate(&older, now()).await.unwrap();
+    let newer = oracle.quote(now()).await.unwrap();
+    assert_ne!(newer, older);
+    oracle.validate(&older, now()).await.unwrap();
+    oracle.validate(&newer, now()).await.unwrap();
+
+    // Never observed: a well-formed quote one second older.
+    let mut unobserved = older.clone();
+    unobserved.publish_time -= 1;
+    unobserved.expires_at -= 1;
+    assert!(matches!(
+        oracle.validate(&unobserved, now()).await,
+        Err(ServerError::NativeQuoteSuperseded)
+    ));
+    let mut mutated = older.clone();
+    mutated.price = "16000000000".into();
+    assert!(matches!(
+        oracle.validate(&mutated, now()).await,
+        Err(ServerError::NativeQuoteSuperseded)
+    ));
+    let mut expired = older.clone();
+    expired.publish_time = 1;
+    expired.expires_at = 1 + f.config.profile.pyth.max_age_seconds;
+    assert!(matches!(
+        oracle.validate(&expired, now()).await,
+        Err(ServerError::NativeQuoteExpired)
+    ));
+
+    // A restarted server has observed nothing: only the current update passes.
+    let restarted = PythBillingOracle::new(&f.config).unwrap();
+    restarted.validate(&newer, now()).await.unwrap();
+    assert!(matches!(
+        restarted.validate(&older, now()).await,
+        Err(ServerError::NativeQuoteSuperseded)
+    ));
+    rpc.task.abort();
 }
 
 #[tokio::test]
 async fn invalid_authoritative_reads_fail_before_database_creation() {
-    for case in 0..36 {
+    for case in 0..41 {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("must-not-exist.db");
         let mut f = Fixture::new(db.to_string_lossy().into_owned());
         match case {
+            // The RPC's cluster is not the identity's.
             0 => f.genesis = bs58::encode([4; 32]).into_string(),
             1 => f.vault.version += 1,
             2 => f.vault.bump ^= 1,
@@ -309,21 +380,18 @@ async fn invalid_authoritative_reads_fail_before_database_creation() {
             17 => f.price.price_message.exponent = i32::MAX,
             18 => f.price.posted_slot = 101,
             33 => f.vault.authority = Pubkey::new_from_array([2; 32]),
-            // Regression: --challenge-period-seconds must be the vault's own.
-            35 => f.vault.challenge_period = 3_600,
+            35 => f.vault.challenge_period -= 1,
+            36 => f.vault.note_ttl -= 1,
+            37 => f.vault.treasury = Pubkey::new_from_array([2; 32]),
+            // The profile pins other program bytes.
+            38 => f.config.profile.program.executable_sha256 = to_hex(&[0x11; 32]),
             _ => {}
         }
-        let vault_key =
-            bs58::encode(f.config.solana.as_ref().unwrap().ledger.vault_state).into_string();
-        let price_key = f
-            .config
-            .solana
-            .as_ref()
-            .unwrap()
-            .billing
-            .price_account
-            .clone();
-        let task = start_rpc(
+        let vault_key = f.vault_key();
+        let price_key = f.price_key();
+        let program_data_key =
+            bpf_loader_upgradeable::get_program_data_address(&dagon_zkapi_vault::ID).to_string();
+        let rpc = start_rpc(
             &mut f,
             |accounts| match case {
                 19 => {
@@ -366,20 +434,23 @@ async fn invalid_authoritative_reads_fail_before_database_creation() {
                 }
                 32 => accounts.get_mut(&price_key).unwrap()["data"][0] = "A".repeat(70_000).into(),
                 34 => {
-                    let address =
-                        bpf_loader_upgradeable::get_program_data_address(&dagon_zkapi_vault::ID)
-                            .to_string();
-                    let mut bytes = bincode::serialize(&UpgradeableLoaderState::ProgramData {
-                        slot: 1,
-                        upgrade_authority_address: Some(Pubkey::new_from_array([7; 32])),
-                    })
-                    .unwrap();
-                    bytes.resize(UpgradeableLoaderState::size_of_programdata_metadata(), 0);
-                    bytes.push(1);
-                    accounts.get_mut(&address).unwrap()["data"][0] =
+                    accounts.get_mut(&program_data_key).unwrap()["data"][0] =
                         base64::engine::general_purpose::STANDARD
-                            .encode(bytes)
+                            .encode(program_data(
+                                Some(Pubkey::new_from_array([7; 32])),
+                                PROGRAM_BYTES,
+                            ))
                             .into();
+                }
+                // Immutable, but not the profile's executable.
+                39 => {
+                    accounts.get_mut(&program_data_key).unwrap()["data"][0] =
+                        base64::engine::general_purpose::STANDARD
+                            .encode(program_data(None, &[1, 2, 4]))
+                            .into();
+                }
+                40 => {
+                    accounts.remove(&program_data_key);
                 }
                 _ => {}
             },
@@ -391,26 +462,33 @@ async fn invalid_authoritative_reads_fail_before_database_creation() {
         let result = run_server(f.config).await;
         assert!(result.is_err(), "case {case} unexpectedly passed");
         assert!(!db.exists(), "case {case} opened state");
-        task.abort();
+        rpc.task.abort();
     }
 }
 
 #[test]
-fn mode_pins_and_oracle_bounds_reject_before_transport() {
+fn identity_profile_and_oracle_bounds_reject_before_transport() {
     let f = Fixture::new("unused.db".into());
-    f.config.validate_native_mode().unwrap();
-    assert_eq!(ServerConfig::default().backend, LedgerBackend::Solana);
-    for case in 0..7 {
+    f.config.validate().unwrap();
+    for case in 0..8 {
         let mut config = f.config.clone();
         match case {
-            0 => config.chain_id += 1,
-            1 => config.contract_address = Felt252::ZERO,
-            2 => config.solana.as_mut().unwrap().billing.max_age_seconds = 61,
-            3 => config.solana.as_mut().unwrap().billing.max_confidence_bps = 101,
-            4 => config.backend = LedgerBackend::Evm,
-            5 => config.initial_root = Felt252::from_u64(1),
-            _ => config.solana.as_mut().unwrap().billing.feed_id = "another-feed".into(),
+            0 => config.identity.vault_state = [1; 32],
+            1 => config.identity.vault_authority = [1; 32],
+            2 => config.profile.pyth.max_age_seconds = 61,
+            3 => config.profile.pyth.max_confidence_bps = 101,
+            4 => config.profile.pyth.feed_id = "another-feed".into(),
+            5 => config.profile.pyth.receiver_program = Pubkey::new_from_array([6; 32]).to_string(),
+            6 => config.profile.vault.challenge_period_seconds = 3_600,
+            _ => {
+                config.network = "mainnet-beta".into();
+                config.testnet_password =
+                    Some(TestnetPassword::new("a-test-only-password-123").unwrap());
+            }
         }
-        assert!(config.validate_native_mode().is_err());
+        assert!(
+            config.validate().is_err(),
+            "case {case} unexpectedly passed"
+        );
     }
 }

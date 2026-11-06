@@ -4,48 +4,66 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 use zkapi_serverd::{
-    config::{LedgerBackend, OpenRouterLeaseConfig, OpenRouterLeaseSourceConfig, ServerConfig},
-    native_billing::NativeBillingConfig,
+    config::{OpenRouterLeaseSourceConfig, ResolvedIdentity, ServerConfig, SharedProfile},
     nullifier_store::NullifierStore,
     processor::RequestProcessor,
     routes::create_router,
     signer::ServerSigner,
-    testnet_auth::{TestnetPassword, SEPOLIA_CHAIN_ID, TESTNET_PASSWORD_HEADER},
+    sol_billing::PythBillingOracle,
+    testnet_auth::{TestnetPassword, TESTNET_PASSWORD_HEADER},
 };
 use zkapi_types::Felt252;
 
 const PASSWORD: &str = "testnet-integration-password";
 
-fn router(protected: bool) -> axum::Router {
-    let config = ServerConfig {
-        backend: LedgerBackend::Evm,
-        chain_id: if protected { SEPOLIA_CHAIN_ID } else { 1 },
-        contract_address: Felt252::from_u64(123),
-        testnet_password: protected.then(|| TestnetPassword::new(PASSWORD).unwrap()),
-        openrouter_leases: Some(OpenRouterLeaseConfig {
-            source: OpenRouterLeaseSourceConfig::OpenRouter {
+fn config(network: &str, password: Option<TestnetPassword>) -> ServerConfig {
+    let vault_authority = [5; 32];
+    let identity = ResolvedIdentity {
+        genesis_hash: [3; 32],
+        vault_authority,
+        vault_state: dagon_zkapi_profile::vault_state_address(
+            &SharedProfile::embedded().program_id(),
+            &vault_authority,
+        ),
+        treasury: [7; 32],
+        pyth_price_account: [8; 32],
+    };
+    ServerConfig {
+        testnet_password: password,
+        proof_setup_dir: format!("{}/../../protocol/setup/v2", env!("CARGO_MANIFEST_DIR")),
+        ..ServerConfig::new(
+            network.into(),
+            identity,
+            "http://127.0.0.1:9".into(),
+            OpenRouterLeaseSourceConfig::OpenRouter {
                 management_key: "test-management-key".into(),
                 api_base: "http://127.0.0.1:9".into(),
             },
-            ttl_seconds: 300,
-            settlement_grace_seconds: 5,
-            settlement_poll_seconds: 5,
-        }),
-        native_billing: Some(NativeBillingConfig {
-            rpc_url: "http://127.0.0.1:9".into(),
-            feed_address: "0x0000000000000000000000000000000000000001".into(),
-            decimals: 8,
-            max_age_seconds: 4500,
-        }),
-        proof_setup_dir: format!("{}/../../protocol/setup/v2", env!("CARGO_MANIFEST_DIR")),
-        ..Default::default()
-    };
+            Felt252::ONE,
+            Felt252::from_u64(2),
+        )
+    }
+}
+
+fn router(protected: bool) -> axum::Router {
+    let config = config(
+        if protected { "devnet" } else { "mainnet-beta" },
+        protected.then(|| TestnetPassword::new(PASSWORD).unwrap()),
+    );
+    // Unreachable RPC: routing and the gate need no chain reads.
+    let ledger = Arc::new(
+        dagon_zkapi_solana_ledger::SolanaCreditLedger::new(config.ledger_config()).unwrap(),
+    );
+    let billing = Arc::new(PythBillingOracle::new(&config).unwrap());
+    let signer = Arc::new(ServerSigner::new(&config.state_seed, &config.clear_seed));
     create_router(Arc::new(
         RequestProcessor::try_new(
             config,
             Arc::new(NullifierStore::in_memory().unwrap()),
-            Arc::new(ServerSigner::new(&Felt252::ONE, &Felt252::from_u64(2))),
+            signer,
             Felt252::ZERO,
+            ledger,
+            billing,
         )
         .unwrap(),
     ))
@@ -171,7 +189,7 @@ async fn health_and_attestation_stay_public_with_no_store_and_browser_preflight_
             serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
         if path != "/v1/attestation" {
             assert_eq!(body["testnet_password_required"], true);
-            assert_eq!(body["chain_id"], SEPOLIA_CHAIN_ID);
+            assert_eq!(body["chain_id"], config("devnet", None).chain_id());
         }
         assert!(!body.to_string().contains(PASSWORD));
     }
@@ -203,7 +221,7 @@ async fn health_and_attestation_stay_public_with_no_store_and_browser_preflight_
 }
 
 #[tokio::test]
-async fn mainnet_remains_ungated_and_rejects_accidental_password_configuration() {
+async fn mainnet_is_ungated_and_rejects_password_configuration() {
     let app = router(false);
     let response = app
         .clone()
@@ -218,7 +236,7 @@ async fn mainnet_remains_ungated_and_rejects_accidental_password_configuration()
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
     assert_eq!(body["testnet_password_required"], false);
-    assert_eq!(body["chain_id"], 1);
+    assert_eq!(body["chain_id"], config("mainnet-beta", None).chain_id());
     let response = app
         .oneshot(
             Request::builder()
@@ -231,9 +249,12 @@ async fn mainnet_remains_ungated_and_rejects_accidental_password_configuration()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let config = ServerConfig {
-        testnet_password: Some(TestnetPassword::new(PASSWORD).unwrap()),
-        ..Default::default()
-    };
-    assert!(config.validate_testnet_auth().is_err());
+    let error = config(
+        "mainnet-beta",
+        Some(TestnetPassword::new(PASSWORD).unwrap()),
+    )
+    .validate()
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("ZKAPI_TESTNET_PASSWORD"), "{error}");
 }
