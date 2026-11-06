@@ -1,105 +1,136 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 
-function shellPath(value) {
-    if (process.platform !== 'win32') return value;
-    return `/mnt/${value[0].toLowerCase()}${value.slice(2).replaceAll('\\', '/')}`;
-}
+const skip = process.platform === 'win32' && 'POSIX launcher test; run under WSL or Linux';
+const script = resolve('docker/aws/run-daemon.sh');
+const binaries = ['dagon-zkapi', 'dagon-zkapi-indexerd', 'dagon-zkapi-challenged', 'dagon-zkapi-pyth-pusher'];
 
-// Exercise both shipped backends through the real launcher with harmless
-// executables. Solana is the default; EVM must be selected explicitly.
-for (const backend of ['solana', 'evm']) {
-    for (const role of ['server', 'challenger']) {
-        for (const override of [null, '/custom/proofs']) {
-            test(`${backend} ${role} launches with ${override ? 'explicit' : 'default'} proof artifacts`, {
-                skip: process.platform === 'win32' && 'POSIX launcher test; exercised under WSL in Windows CI',
-            }, async () => {
-                const bin = await mkdtemp(join(tmpdir(), 'dagon-zkapi-launcher-'));
-                try {
-                    for (const name of ['dagon-zkapi', 'dagon-zkapi-challenged']) {
-                        await writeFile(join(bin, name), `#!/bin/sh\nprintf '%s\\n' "$@"\n`, { mode: 0o755 });
-                    }
-                    const env = {
-                        PATH: process.platform === 'win32'
-                            ? `${shellPath(bin)}:/usr/local/bin:/usr/bin:/bin`
-                            : `${bin}:/usr/local/bin:/usr/bin:/bin`,
-                        LEDGER_BACKEND: backend,
-                        CIRCUIT_ID: 'zkapi-v2-concession-v1',
-                        REQUEST_CHARGE_CAP: '50000',
-                        ZKAPI_STATE_SEED: 'test-state-seed',
-                        ZKAPI_CLEAR_SEED: 'test-clear-seed',
-                        SOLANA_PROGRAM_ID: 'Program1111111111111111111111111111111111',
-                        SOLANA_VAULT_STATE: 'Vault11111111111111111111111111111111111',
-                        SOLANA_GENESIS_HASH: 'Genesis111111111111111111111111111111111',
-                        SOLANA_RPC_URL: 'https://solana.example',
-                        PYTH_PRICE_ACCOUNT: 'Price1111111111111111111111111111111111',
-                        ZKAPI_CHALLENGE_SOLANA_RPC_URL: 'https://solana-challenge.example',
-                        ZKAPI_CHALLENGE_SOLANA_KEYPAIR: '/run/dagon-zkapi/challenge-keypair.json',
-                        CHAIN_ID: '11155111',
-                        VAULT_ADDRESS: '0x0000000000000000000000000000000000000001',
-                        DEPLOY_BLOCK: '1',
-                        ZKAPI_NATIVE_BILLING_RPC_URL: 'https://ethereum.example',
-                        ZKAPI_NATIVE_PRICE_FEED_ADDRESS: '0x0000000000000000000000000000000000000003',
-                        ZKAPI_CHALLENGE_RPC_URL: 'http://signer:8547',
-                        ZKAPI_CHALLENGE_SENDER: '0x0000000000000000000000000000000000000002',
-                    };
-                    if (override) env.ZKAPI_PROOF_SETUP_DIR = override;
-                    const script = shellPath(resolve('docker/aws/run-daemon.sh'));
-                    const result = process.platform === 'win32'
-                        ? spawnSync('C:\\Windows\\System32\\bash.exe', [
-                            '-lc', 'exec env "$@"', 'dagon-launcher-test',
-                            ...Object.entries(env).map(([key, value]) => `${key}=${value}`),
-                            script, role,
-                        ], { encoding: 'utf8', timeout: 5000 })
-                        : spawnSync('/bin/sh', [script, role], { env, encoding: 'utf8', timeout: 5000 });
-                    assert.equal(result.status, 0, `${result.error?.stack ?? ''}\nsignal=${result.signal ?? ''}\n${result.stderr}`);
-                    const args = result.stdout.trim().split('\n');
-                    assert.equal(args[args.indexOf('--ledger') + 1], backend);
-                    const index = args.indexOf('--proof-setup-dir');
-                    assert.ok(index >= 0);
-                    assert.equal(args[index + 1], override || '/srv/zkapi/protocol/setup/v2');
-                    if (role === 'server' && backend === 'solana') {
-                        assert.equal(args[args.indexOf('--solana-program-id') + 1], env.SOLANA_PROGRAM_ID);
-                        assert.equal(args[args.indexOf('--pyth-price-account') + 1], env.PYTH_PRICE_ACCOUNT);
-                        assert.ok(!args.includes('--native-billing-rpc-url'));
-                    }
-                    if (role === 'server' && backend === 'evm') {
-                        assert.equal(args[args.indexOf('--native-billing-rpc-url') + 1], env.ZKAPI_NATIVE_BILLING_RPC_URL);
-                        assert.equal(args[args.indexOf('--native-price-feed-address') + 1], env.ZKAPI_NATIVE_PRICE_FEED_ADDRESS);
-                        assert.ok(!args.includes('--solana-rpc-url'));
-                    }
-                    assert.ok(!result.stdout.includes('test-state-seed'));
-                    assert.ok(!result.stdout.includes('test-clear-seed'));
-                } finally {
-                    await rm(bin, { recursive: true, force: true });
-                }
-            });
+// Run the real launcher against harmless executables that echo their argv.
+async function launch(role, extraEnv = {}) {
+    const dir = await mkdtemp(join(tmpdir(), 'dagon-zkapi-launcher-'));
+    try {
+        for (const name of binaries) {
+            await writeFile(join(dir, name), `#!/bin/sh\nprintf '%s\\n' "$@"\n`, { mode: 0o755 });
         }
+        const identity = join(dir, 'identity.json');
+        await writeFile(identity, '{}\n');
+        const env = {
+            PATH: `${dir}:/usr/local/bin:/usr/bin:/bin`,
+            ZKAPI_SOLANA_IDENTITY: identity,
+            SOLANA_RPC_URL: 'https://solana.example',
+            ZKAPI_STATE_SEED: 'test-state-seed',
+            ZKAPI_CLEAR_SEED: 'test-clear-seed',
+            ZKAPI_CHALLENGE_SOLANA_KEYPAIR: '/run/dagon-zkapi/challenge-keypair.json',
+            ZKAPI_PYTH_PUSHER_KEYPAIR: '/run/dagon-zkapi/pyth-pusher-keypair.json',
+            PYTH_HERMES_API_KEY: 'test-hermes-api-key',
+            ...extraEnv,
+        };
+        for (const [key, value] of Object.entries(env)) if (value === undefined) delete env[key];
+        const result = spawnSync('/bin/sh', [script, role], { env, encoding: 'utf8', timeout: 5000 });
+        return { result, identity, env };
+    } finally {
+        await rm(dir, { recursive: true, force: true });
     }
 }
 
-// The launcher's circuit pin is the migration gate: an environment written for
-// the legacy note-bound vault must not start concession-exit images against it.
-for (const circuit of ['zkapi-v2-note-bound-v1', 'legacy-unbound']) {
-    test(`launcher refuses the ${circuit} circuit pin`, {
-        skip: process.platform === 'win32' && 'POSIX launcher test; exercised under WSL in Windows CI',
-    }, () => {
-        const env = {
-            PATH: '/usr/local/bin:/usr/bin:/bin',
-            LEDGER_BACKEND: 'evm',
-            CIRCUIT_ID: circuit,
-            CHAIN_ID: '11155111',
-            VAULT_ADDRESS: '0x0000000000000000000000000000000000000001',
-            DEPLOY_BLOCK: '1',
-        };
-        const result = spawnSync('/bin/sh', [resolve('docker/aws/run-daemon.sh'), 'indexer'],
-            { env, encoding: 'utf8', timeout: 5000 });
+// Shared parameters are compiled in, so each daemon receives exactly the
+// identity file, RPC URL, fixed service paths and (server) optional OA org;
+// secrets (seeds, the Hermes API key) never reach argv.
+function expectedArgs(role, identity, proofs) {
+    switch (role) {
+        case 'server':
+            return ['--proof-setup-dir', proofs, 'serverd', '--solana-identity', identity,
+                '--solana-rpc-url', 'https://solana.example', '--listen', '0.0.0.0:3000',
+                '--indexer-url', 'http://indexer:3001', '--db-path', '/data/server.db'];
+        case 'indexer':
+            return ['--solana-identity', identity, '--rpc-url', 'https://solana.example',
+                '--listen', '0.0.0.0:3001'];
+        case 'challenger':
+            return ['--solana-identity', identity, '--solana-rpc-url', 'https://solana.example',
+                '--solana-keypair', '/run/dagon-zkapi/challenge-keypair.json',
+                '--db-path', '/data/server.db', '--checkpoint', '/data/challenges.json',
+                '--proof-setup-dir', proofs];
+        case 'pyth-pusher':
+            return ['--solana-identity', identity, '--solana-rpc-url', 'https://solana.example',
+                '--payer-keypair', '/run/dagon-zkapi/pyth-pusher-keypair.json', '--listen', '0.0.0.0:3002'];
+    }
+}
+
+for (const role of ['server', 'indexer', 'challenger', 'pyth-pusher']) {
+    for (const override of [null, '/custom/proofs']) {
+        test(`${role} launches from identity file with ${override ? 'explicit' : 'default'} proof artifacts`, { skip }, async () => {
+            const { result, identity } = await launch(role, override ? { ZKAPI_PROOF_SETUP_DIR: override } : {});
+            assert.equal(result.status, 0, `${result.error?.stack ?? ''}\n${result.stderr}`);
+            const args = result.stdout.trim().split('\n');
+            assert.deepEqual(args, expectedArgs(role, identity, override || '/srv/zkapi/protocol/setup/v2'));
+            assert.ok(!result.stdout.includes('test-state-seed'));
+            assert.ok(!result.stdout.includes('test-clear-seed'));
+            assert.ok(!result.stdout.includes('test-hermes-api-key'));
+        });
+    }
+}
+
+test('server refuses the development signing seeds', { skip }, async () => {
+    const { result } = await launch('server', { ZKAPI_STATE_SEED: '0x1' });
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /development signing seeds/);
+});
+
+test('launcher refuses a missing identity file', { skip }, async () => {
+    const { result } = await launch('indexer', { ZKAPI_SOLANA_IDENTITY: '/nonexistent/identity.json' });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /identity file is not readable/);
+});
+
+test('launcher requires the Solana RPC URL', { skip }, async () => {
+    const { result } = await launch('server', { SOLANA_RPC_URL: undefined });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Missing required environment variable: SOLANA_RPC_URL/);
+});
+
+test('server passes the OA org URL when configured', { skip }, async () => {
+    const { result, identity } = await launch('server', { OA_ORG_URL: 'https://org.example' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(result.stdout.trim().split('\n'), [
+        ...expectedArgs('server', identity, '/srv/zkapi/protocol/setup/v2'), '--oa-org-url', 'https://org.example',
+    ]);
+});
+
+test('pyth-pusher requires the payer keypair and the Hermes API key', { skip }, async () => {
+    for (const name of ['ZKAPI_PYTH_PUSHER_KEYPAIR', 'PYTH_HERMES_API_KEY']) {
+        const { result } = await launch('pyth-pusher', { [name]: undefined });
         assert.equal(result.status, 1);
         assert.equal(result.stdout, '');
-        assert.match(result.stderr, /requires the zkapi-v2-concession-v1 circuit and a fresh vault/);
-    });
-}
+        assert.match(result.stderr, new RegExp(`Missing required environment variable: ${name}`));
+    }
+});
+
+test('pyth-pusher passes the optional Hermes URL, priority fee and balance alarm', { skip }, async () => {
+    const { result, identity } = await launch('pyth-pusher', { PYTH_HERMES_URL: 'https://hermes.example',
+        ZKAPI_PYTH_PUSHER_PRIORITY_FEE_MICRO_LAMPORTS: '20000', ZKAPI_PYTH_PUSHER_MIN_BALANCE_LAMPORTS: '5000000000' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(result.stdout.trim().split('\n'), [
+        ...expectedArgs('pyth-pusher', identity, ''), '--hermes-url', 'https://hermes.example',
+        '--priority-fee-micro-lamports', '20000', '--min-balance-lamports', '5000000000',
+    ]);
+    assert.ok(!result.stdout.includes('test-hermes-api-key'));
+});
+
+test('compose keeps sponsor fallback independent and isolates the pusher secret mount', async () => {
+    const compose = await readFile(resolve('docker/aws/compose.yml'), 'utf8');
+    const section = name => compose.match(new RegExp(`^  ${name}:\\r?\\n([\\s\\S]*?)(?=^  [a-z][\\w-]*:|^networks:)`, 'm'))?.[1];
+    const server = section('server');
+    const pusher = section('pyth-pusher');
+    assert.ok(server && pusher);
+    assert.doesNotMatch(server, /pyth-pusher/);
+    assert.match(pusher, /source: .*\/pyth-pusher-keypair\.json/);
+    assert.match(pusher, /target: \/run\/dagon-zkapi\/pyth-pusher-keypair\.json/);
+    assert.match(pusher, /create_host_path: false/);
+    assert.doesNotMatch(pusher, /:\/run\/dagon-zkapi:ro/);
+    assert.doesNotMatch(pusher, /server\.env|challenge\.env/);
+});
