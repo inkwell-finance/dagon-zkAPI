@@ -1,15 +1,13 @@
 import { browserSdkOptions, beginBrowserSdkInitialization, browserSdkTransport } from '../configure.js';
-import { assertNativeVault, isNativeSolFunding, validateNativeFunding, validateNativeQuote, readNativeQuote, nativeUnitsForUsd, nativeUsdMicros, sameNativeQuote, requestBillingQuote, readFinalizedChainTime } from './zkapiNativeBilling.mjs';
 import { CHAT_SPENDING_TIER_USD } from './zkapiRequestCompat.mjs';
-import { TestnetPasswordAuth, testnetPasswordRequired } from './testnetPasswordAuth.mjs';
 import { sameFelt, waitForExpectedActiveRoot } from './zkapiActiveRoot.mjs';
 import { chooseEscapeConcession, exitProofLive, exitProofLiveUntil, exitProofValidUntil, reusableExitProof }
     from './zkapiExitPolicy.mjs';
-import { isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
-import { canonicalChainId, losslessChainId, sameChainId } from './zkapiLedgerIdentity.mjs';
-import { confirmFinalizedSolanaTransaction, readFinalizedSolanaOperationState,
-    sendSignedSolanaTransaction }
-    from './zkapiNativeSol.mjs';
+import { canonicalChainId, sameChainId } from './zkapiLedgerIdentity.mjs';
+import { assertSolanaVault, confirmFinalizedSolanaTransaction, isNativeSolFunding,
+    readFinalizedSolanaOperationState, readFinalizedSolanaTime, requestBillingQuote, sameSolanaQuote,
+    sendSignedSolanaTransaction, solanaUnitsForUsd, solanaUsdMicros, validateSolanaFunding,
+    validateSolanaQuote } from './zkapiNativeSol.mjs';
 import { base58Decode, base58Encode, submitPreparedSolanaOperation }
     from './zkapiSolanaTransport.mjs';
 import { prepareLocalSolanaExit } from './zkapiSolanaExit.mjs';
@@ -22,40 +20,13 @@ import {
     resumeSolanaOperationJournal
 } from './zkapiSolanaJournal.mjs';
 import {
-    archiveBrowserWallet,
-    assertBrowserBackgroundWithdrawalAvailable,
-    authorizeBrowserWithdrawalFinalizationRetry,
-    claimBrowserWithdrawalStartReplacement,
-    claimBrowserBackgroundWithdrawalSubmission,
-    claimBrowserWithdrawalFinalization,
-    claimBrowserWithdrawalFinalizationReplacement,
     createWalletChannel,
     detachBrowserClosedWithdrawal,
     detachBrowserEscapeWithdrawal,
     listBrowserWithdrawals,
-    isBrowserBackgroundWithdrawalPreparationCancelable,
-    markBrowserWithdrawalFinalizationAmbiguous,
-    markBrowserBackgroundWithdrawalAmbiguous,
-    markBrowserWithdrawalFinalizationMissingReceipts,
-    parkBrowserWithdrawal,
     projectBrowserDeposits,
     readBrowserWalletSnapshot,
-    recordBrowserExpiryClaims,
-    releaseBrowserWithdrawalFinalization,
-    releaseBrowserWithdrawalFinalizationReplacementClaim,
-    releaseBrowserWithdrawalStartSubmission,
-    releaseBrowserBackgroundWithdrawalSubmission,
-    rememberBrowserBackgroundWithdrawalMetadata,
-    rememberBrowserBackgroundWithdrawalTransaction,
-    rememberBrowserWithdrawalFinalization,
-    rememberBrowserWithdrawalFinalizationSubmissionMetadata,
     requestPersistentStorage,
-    repairBrowserUnsubmittedBackgroundWithdrawal,
-    resolveBrowserBackgroundWithdrawalForRetry,
-    resolveBrowserChallengedFinalization,
-    restoreBrowserWithdrawal,
-    saveBrowserBackgroundWithdrawalPlan,
-    transferBrowserLateWithdrawalAttempt,
     updateBrowserWithdrawal,
     withBrowserWalletLock,
     writeBrowserWallet
@@ -81,15 +52,6 @@ const LEASE_ISSUE_MAX_RETRY_MS = 30_000;
 // window transparently closes the old key and obtains a fresh key at the selected model tier.
 const MIN_REQUEST_LEASE_REMAINING_SECONDS = 90;
 const TAB_OWNER_STORAGE_KEY = 'zkapi-browser-tab-owner-v1';
-const LATE_WITHDRAWAL_TERMINAL_STATUSES = new Set([
-    'closed',
-    'detached',
-    'reverted',
-    'challenged',
-    'superseded',
-    'quarantined'
-]);
-const LATE_DEPOSIT_TERMINAL_STATUSES = new Set(['confirmed', 'reverted', 'superseded']);
 
 class BrowserWalletHttpError extends Error {
     constructor(message, status, code, data = null) {
@@ -235,22 +197,6 @@ function browserTabOwnerId() {
     } catch {
         return uuid();
     }
-}
-
-function retainAttemptHistory(attempts, terminalStatuses, terminalLimit = 32) {
-    const unresolved = attempts.filter(attempt => !terminalStatuses.has(attempt.status));
-    const terminal = attempts
-        .filter(attempt => terminalStatuses.has(attempt.status))
-        .slice(-terminalLimit);
-    // An unresolved transaction is a recovery capability, not log history. It
-    // must never be evicted merely because more wallet attempts were made.
-    return [...terminal, ...unresolved];
-}
-
-function unresolvedLateWithdrawalForNote(runtime, noteId) {
-    return (runtime?.lateWithdrawalAttempts || []).find(attempt =>
-        Number(attempt.noteId) === Number(noteId)
-        && !LATE_WITHDRAWAL_TERMINAL_STATUSES.has(attempt.status)) || null;
 }
 
 // The concession terms an escape proof fixed: the state balance B = f + c,
@@ -406,12 +352,9 @@ class BrowserWalletRuntime extends EventTarget {
         this.manifest = await this.loadDeploymentManifest(manifestUrl);
         localStorage.setItem('zkapi-browser-deployment', manifestUrl);
         this.config = this.buildClientConfig(this.manifest, this.browserConfig);
-        this.testnetAuth = new TestnetPasswordAuth({
-            funding: this.config.funding,
-            fetch: (url, init) => this.remoteFetchRaw(url, init),
-            requestPassword: browserSdkOptions().requestTestnetPassword
-        });
-        await assertNativeVault(this.config.funding);
+        // The finalized vault pins the deployment identity; its challenge
+        // period sizes the escape window shown to the user.
+        this.vaultState = await assertSolanaVault(this.config.funding);
         this.worker = new WorkerBridge();
         // Initialization participates in the same global lock as every later
         // mutation. This prevents two same-origin deployment tabs from both
@@ -422,7 +365,7 @@ class BrowserWalletRuntime extends EventTarget {
                 this.runtime = await writeBrowserWallet({
                     ...this.runtime,
                     deploymentId: this.manifest.deployment_id,
-                    billingAsset: this.manifest.billing_asset || 'native_eth'
+                    billingAsset: this.manifest.billing_asset
                 });
             }
             await this.recoverPendingLocked({ retireLostKey: true, quiet: true });
@@ -535,12 +478,7 @@ class BrowserWalletRuntime extends EventTarget {
         for (const field of ['deployment_id', 'contract_address', 'protocol_server_url', 'indexer_url']) {
             if (!manifest[field]) throw new Error(`The deployment manifest omitted ${field}.`);
         }
-        const solana = isNativeSolFunding(manifest);
-        if (solana ? !/^0x[0-9a-fA-F]{64}$/.test(manifest.contract_address)
-            : !/^0x[0-9a-fA-F]{40}$/.test(manifest.contract_address)) {
-            throw new Error(`The deployment manifest contains an invalid ${solana ? 'protocol binding' : 'contract address'}.`);
-        }
-        validateNativeFunding(manifest);
+        validateSolanaFunding(manifest);
         for (const field of ['protocol_server_url', 'indexer_url']) {
             const url = new URL(manifest[field]);
             if (url.protocol !== 'https:' && !['127.0.0.1', 'localhost'].includes(url.hostname)) {
@@ -556,9 +494,6 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     validateManifestTrust(manifest) {
-        if (this.browserConfig.deployment_status === 'migration_required') {
-            throw new Error('This application still pins a legacy vault. Configure a newly deployed note-bound vault before funding.');
-        }
         const trusted = this.browserConfig.trusted_deployment;
         if (!trusted) {
             throw new Error('browser-config.json omitted its trusted deployment pins.');
@@ -573,34 +508,26 @@ class BrowserWalletRuntime extends EventTarget {
         requireEqual(manifest.proof_setup?.circuit_id, trusted.circuit_id, 'proof circuit');
         requireEqual(manifest.deployment_id, trusted.deployment_id, 'deployment id');
         requireEqual(manifest.chain_id, trusted.chain_id, 'chain id', canonicalChainId);
-        requireEqual(manifest.contract_address, trusted.contract_address,
-            isNativeSolFunding(manifest) ? 'deployment binding' : 'vault address', lowercase);
-        validateNativeFunding(manifest);
-        validateNativeFunding(trusted);
-        requireEqual(manifest.billing_asset, trusted.billing_asset, 'billing asset');
-        requireEqual(manifest.billing_unit, trusted.billing_unit, 'billing unit');
-        if (isNativeSolFunding(manifest)) {
-            for (const [field, label, normalize] of [
-                ['ledger_backend', 'ledger backend', String],
-                ['network', 'Solana network', String],
-                ['program_id', 'Solana program', String],
-                ['vault_state', 'Solana vault state', String],
-                ['genesis_hash', 'Solana genesis hash', String],
-                ['wallet_standard_chain', 'wallet-standard chain', String],
-                ['base_units_per_asset', 'SOL asset scale', String],
-                ['pyth_receiver_program', 'Pyth receiver program', String],
-                ['pyth_price_account', 'Pyth price account', String],
-                ['pyth_feed_id', 'Pyth feed', lowercase],
-                ['pyth_max_age_seconds', 'Pyth freshness', Number],
-                ['pyth_max_confidence_bps', 'Pyth confidence bound', Number]
-            ]) requireEqual(manifest[field], trusted[field], label, normalize);
-        } else {
-            requireEqual(manifest.native_asset_wei_per_unit, trusted.native_asset_wei_per_unit, 'native asset scale');
-            requireEqual(manifest.native_price_feed_address, trusted.native_price_feed_address, 'ETH price feed', lowercase);
-            requireEqual(manifest.native_price_feed_decimals, trusted.native_price_feed_decimals, 'ETH price decimals', Number);
-            requireEqual(manifest.native_price_max_age_seconds, trusted.native_price_max_age_seconds, 'ETH price freshness', Number);
-        }
-        requireEqual(manifest.rpc_url, trusted.rpc_url, 'native asset RPC', normalizedUrl);
+        requireEqual(manifest.contract_address, trusted.contract_address, 'deployment binding', lowercase);
+        validateSolanaFunding(manifest);
+        validateSolanaFunding(trusted);
+        for (const [field, label, normalize] of [
+            ['billing_asset', 'billing asset', String],
+            ['billing_unit', 'billing unit', String],
+            ['ledger_backend', 'ledger backend', String],
+            ['network', 'Solana network', String],
+            ['program_id', 'Solana program', String],
+            ['vault_state', 'Solana vault state', String],
+            ['genesis_hash', 'Solana genesis hash', String],
+            ['wallet_standard_chain', 'wallet-standard chain', String],
+            ['base_units_per_asset', 'SOL asset scale', String],
+            ['pyth_receiver_program', 'Pyth receiver program', String],
+            ['pyth_price_account', 'Pyth price account', String],
+            ['pyth_feed_id', 'Pyth feed', lowercase],
+            ['pyth_max_age_seconds', 'Pyth freshness', Number],
+            ['pyth_max_confidence_bps', 'Pyth confidence bound', Number]
+        ]) requireEqual(manifest[field], trusted[field], label, normalize);
+        requireEqual(manifest.rpc_url, trusted.rpc_url, 'Solana RPC', normalizedUrl);
         requireEqual(manifest.protocol_server_url, trusted.protocol_server_url, 'protocol server', normalizedUrl);
         requireEqual(manifest.indexer_url, trusted.indexer_url, 'indexer', normalizedUrl);
         requireEqual(manifest.request_charge_cap, trusted.request_charge_cap, 'request charge cap', Number);
@@ -632,12 +559,16 @@ class BrowserWalletRuntime extends EventTarget {
             'OpenRouter origin',
             normalizedUrl
         );
-        requireEqual(
-            manifest.privacy_mode?.verifier_url,
-            trusted.verifier_url,
-            'OA verifier',
-            normalizedUrl
-        );
+        // An operator that mints keys itself (no OA verifier) pins null here;
+        // a manifest may then not introduce a verifier, and vice versa.
+        if ((manifest.privacy_mode?.verifier_url ?? null) !== null || trusted.verifier_url != null) {
+            requireEqual(
+                manifest.privacy_mode?.verifier_url,
+                trusted.verifier_url,
+                'OA verifier',
+                normalizedUrl
+            );
+        }
     }
 
     buildClientConfig(manifest, browserConfig) {
@@ -645,7 +576,11 @@ class BrowserWalletRuntime extends EventTarget {
         const requestKey = new URL('request.pk', keyBase).href;
         const withdrawalKey = new URL('withdrawal.pk', keyBase).href;
         const requestCap = Number(manifest.request_charge_cap);
-        validateNativeFunding(manifest);
+        validateSolanaFunding(manifest);
+        const verifierUrl = manifest.privacy_mode.verifier_url ? normalizeUrl(manifest.privacy_mode.verifier_url) : null;
+        if (browserConfig.require_oa_key_source === true && !verifierUrl) {
+            throw new Error('browser-config.json requires OA-verified keys but pins no OA verifier.');
+        }
         return {
             ux_proposal: String(browserConfig.ux_proposal || 'quiet'),
             credits_per_usd: null,
@@ -661,8 +596,7 @@ class BrowserWalletRuntime extends EventTarget {
             prepared_withdrawal: null,
             wallet_core: {
                 protocol_version: Number(manifest.protocol_version),
-                ledger_backend: manifest.ledger_backend || 'evm.groth16.v1',
-                chain_id: losslessChainId(manifest.chain_id),
+                chain_id: canonicalChainId(manifest.chain_id),
                 contract_address: manifest.contract_address,
                 request_charge_cap: requestCap,
                 policy_charge_cap: Number(manifest.policy_charge_cap || requestCap),
@@ -682,26 +616,22 @@ class BrowserWalletRuntime extends EventTarget {
             },
             openrouter: {
                 inference_base: normalizeUrl(manifest.privacy_mode.openrouter_inference_base),
-                verifier_url: normalizeUrl(manifest.privacy_mode.verifier_url),
-                require_oa_key_source: browserConfig.require_oa_key_source !== false
+                verifier_url: verifierUrl,
+                require_oa_key_source: browserConfig.require_oa_key_source === true
             },
             funding: {
-                ledger_backend: manifest.ledger_backend || 'evm.groth16.v1',
+                ledger_backend: manifest.ledger_backend,
                 contract_address: manifest.contract_address,
-                chain_id: losslessChainId(manifest.chain_id),
+                chain_id: canonicalChainId(manifest.chain_id),
                 indexer_url: normalizeUrl(manifest.indexer_url),
                 protocol_server_url: normalizeUrl(manifest.protocol_server_url),
                 models: manifest.models || [],
                 suggested_deposit_amount: Number(browserConfig.suggested_deposit_amount || requestCap * 100),
-                demo_rpc_url: manifest.rpc_url || null,
-                billing_token_symbol: isNativeSolFunding(manifest) ? 'SOL' : 'ETH',
+                rpc_url: manifest.rpc_url,
+                billing_token_symbol: 'SOL',
                 billing_token_decimals: 9,
                 billing_asset: manifest.billing_asset,
                 billing_unit: manifest.billing_unit,
-                native_asset_wei_per_unit: manifest.native_asset_wei_per_unit,
-                native_price_feed_address: manifest.native_price_feed_address,
-                native_price_feed_decimals: manifest.native_price_feed_decimals,
-                native_price_max_age_seconds: manifest.native_price_max_age_seconds,
                 base_units_per_asset: manifest.base_units_per_asset,
                 network: manifest.network,
                 program_id: manifest.program_id,
@@ -713,7 +643,7 @@ class BrowserWalletRuntime extends EventTarget {
                 pyth_feed_id: manifest.pyth_feed_id,
                 pyth_max_age_seconds: manifest.pyth_max_age_seconds,
                 pyth_max_confidence_bps: manifest.pyth_max_confidence_bps,
-                demo_note_ttl_seconds: Number(manifest.note_ttl_seconds || 0) || null
+                note_ttl_seconds: Number(manifest.note_ttl_seconds || 0) || null
             }
         };
     }
@@ -731,79 +661,30 @@ class BrowserWalletRuntime extends EventTarget {
             : null;
         const prepared = this.runtime?.preparedWithdrawal;
         const pendingDeposit = this.runtime?.pendingDeposit;
-        const preparedHashes = new Set((Array.isArray(prepared?.transactionHashes)
-            ? prepared.transactionHashes
-            : prepared?.transactionHash ? [prepared.transactionHash] : [])
-            .map(hash => String(hash).toLowerCase()));
-        const replacementIdentities = new Set((prepared?.transactionAttempts || [])
-            .filter(attempt => preparedHashes.has(String(attempt.hash || '').toLowerCase())
-                && /^0x[0-9a-fA-F]{40}$/.test(attempt.from || '')
-                && Number.isSafeInteger(Number(attempt.nonce))
-                && Number(attempt.nonce) >= 0)
-            .map(attempt => `${attempt.from.toLowerCase()}:${Number(attempt.nonce)}`));
-        const pendingDepositHashes = new Set((Array.isArray(pendingDeposit?.transactionHashes)
-            ? pendingDeposit.transactionHashes
-            : pendingDeposit?.transactionHash ? [pendingDeposit.transactionHash] : [])
-            .map(hash => String(hash).toLowerCase()));
-        const depositReplacementIdentities = new Set((pendingDeposit?.transactionAttempts || [])
-            .filter(attempt => pendingDepositHashes.has(String(attempt.hash || '').toLowerCase())
-                && /^0x[0-9a-fA-F]{40}$/.test(attempt.from || '')
-                && Number.isSafeInteger(Number(attempt.nonce))
-                && Number(attempt.nonce) >= 0)
-            .map(attempt => `${attempt.from.toLowerCase()}:${Number(attempt.nonce)}`));
         const config = this.config ? {
             exit_only: this.exitOnly === true,
             ...this.config,
             active_lease: active,
-            late_withdrawal_attempts: (this.runtime?.lateWithdrawalAttempts || [])
-                .filter(attempt => !LATE_WITHDRAWAL_TERMINAL_STATUSES.has(attempt.status))
-                .map(attempt => ({
-                    operation_id: attempt.operationId,
-                    note_id: Number(attempt.noteId),
-                    mode: attempt.mode,
-                    destination: attempt.destination,
-                    transaction_hash: attempt.transactionHash,
-                    status: attempt.status,
-                    error: attempt.error || null
-                })),
-            late_deposit_attempts: (this.runtime?.lateDepositAttempts || [])
-                .filter(attempt => !LATE_DEPOSIT_TERMINAL_STATUSES.has(attempt.status))
-                .map(attempt => ({
-                    operation_id: attempt.operationId,
-                    note_id: Number(attempt.noteId),
-                    amount: Number(attempt.amount),
-                    transaction_hash: attempt.transactionHash,
-                    status: attempt.status
-                })),
             pending_deposit: pendingDeposit ? {
                 operation_id: pendingDeposit.operationId || null,
-                phase: pendingDeposit.phase || (pendingDeposit.transactionHash ? 'submitted' : 'ambiguous'),
+                // A saved Solana journal means signed transactions may exist:
+                // the deposit can only be resumed, never re-quoted.
+                phase: pendingDeposit.solanaJournal ? 'submitting' : (pendingDeposit.phase || 'prepared'),
                 amount: Number(pendingDeposit.amount),
                 funding_quote_available: Boolean(this.config?.funding)
                     && this.canQuotePendingDeposit(pendingDeposit),
-                next_note_id: Number(pendingDeposit.next_note_id),
-                transaction_hash: pendingDeposit.transactionHash || null,
-                transaction_hashes: Array.isArray(pendingDeposit.transactionHashes)
-                    ? [...pendingDeposit.transactionHashes]
-                    : pendingDeposit.transactionHash ? [pendingDeposit.transactionHash] : [],
-                replacement_available: pendingDeposit.phase === 'dropped_or_pending'
-                    && depositReplacementIdentities.size === 1
+                next_note_id: Number(pendingDeposit.next_note_id)
             } : null,
             prepared_withdrawal: prepared ? {
                 mode: prepared.mode,
-                phase: prepared.phase || (prepared.transactionHash ? 'submitted' : 'prepared'),
+                phase: prepared.solanaJournal ? 'submitting' : (prepared.phase || 'prepared'),
                 note_id: prepared.public_inputs?.note_id ?? prepared.noteId ?? prepared.note_id,
-                destination: Array.isArray(prepared.public_inputs?.destination)
-                    ? `0x${prepared.public_inputs.destination.map(byte => Number(byte).toString(16).padStart(2, '0')).join('')}`
-                    : prepared.destination,
-                transaction_hash: prepared.transactionHash || null,
+                destination: prepared.destination,
                 clearance_reserved: prepared.clearanceReserved === true || prepared.mode === 'mutual',
                 conceded: prepared.public_inputs?.conceded != null ? String(prepared.public_inputs.conceded) : null,
                 concession_rule: prepared.concessionRule || null,
                 valid_until: prepared.public_inputs?.valid_until != null ? Number(prepared.public_inputs.valid_until) : null,
-                exit_proof_live_until: exitProofLiveUntil(prepared.releasedValidUntil ?? null),
-                replacement_available: prepared.phase === 'dropped_or_pending'
-                    && replacementIdentities.size === 1
+                exit_proof_live_until: exitProofLiveUntil(prepared.releasedValidUntil ?? null)
             } : null,
             // The last request's successor was withheld or failed the S3-S5
             // checks: the balance is frozen for requests and should escape.
@@ -814,8 +695,7 @@ class BrowserWalletRuntime extends EventTarget {
             config,
             runtime: this.runtime,
             activeLease: active,
-            deposits: this.deposits.map(record => ({ ...record,
-                ...(record.expiryClaim ? { expiryClaim: { ...record.expiryClaim } } : {}) })),
+            deposits: this.deposits.map(record => ({ ...record })),
             withdrawals: this.withdrawals.map(record => {
                 const {
                     state: _state,
@@ -823,14 +703,10 @@ class BrowserWalletRuntime extends EventTarget {
                     proof: _proof,
                     withdrawalNullifier: _nullifier,
                     inFlightJournal: _journal,
+                    solanaFinalizationJournal: _finalization,
                     ...summary
                 } = record;
-                return { ...summary, backgroundWithdrawalReady: isUnsubmittedParkedMutualWithdrawal(
-                    record, this.runtime?.lateWithdrawalAttempts || []
-                ), backgroundPreparationCancelable: Boolean(this.config && this.manifest)
-                    && isBrowserBackgroundWithdrawalPreparationCancelable(
-                        record, this.runtime, this.backgroundWithdrawalIdentity(record)
-                    ) };
+                return summary;
             })
         };
     }
@@ -846,19 +722,12 @@ class BrowserWalletRuntime extends EventTarget {
             || storedRuntime.depositQuote
             || storedRuntime.preparedWithdrawal
             || storedRuntime.lease
-            || (Array.isArray(storedRuntime.lateWithdrawalAttempts)
-                && storedRuntime.lateWithdrawalAttempts.some(attempt =>
-                    !LATE_WITHDRAWAL_TERMINAL_STATUSES.has(attempt.status)))
-            || (Array.isArray(storedRuntime.lateDepositAttempts)
-                && storedRuntime.lateDepositAttempts.some(attempt =>
-                    !LATE_DEPOSIT_TERMINAL_STATUSES.has(attempt.status)))
         );
         if (this.manifest && hasDurableState
             && (!storedRuntime.deploymentId || storedRuntime.deploymentId !== this.manifest.deployment_id
                 || (storedRuntime.billingAsset != null
-                    && storedRuntime.billingAsset
-                        !== (this.manifest.billing_asset || 'native_eth')))) {
-            throw new Error(`This browser contains a wallet for ${storedRuntime.deploymentId || 'an unidentified legacy deployment'}. Switch back to that deployment before using or withdrawing it.`);
+                    && storedRuntime.billingAsset !== this.manifest.billing_asset))) {
+            throw new Error(`This browser contains a wallet for ${storedRuntime.deploymentId || 'an unidentified deployment'}. Switch back to that deployment before using or withdrawing it.`);
         }
         this.runtime = storedRuntime.deploymentId
             && this.manifest
@@ -879,7 +748,7 @@ class BrowserWalletRuntime extends EventTarget {
         this.runtime = await writeBrowserWallet({
             ...next,
             deploymentId: this.manifest.deployment_id,
-            billingAsset: this.manifest.billing_asset || 'native_eth'
+            billingAsset: this.manifest.billing_asset
         }, options);
         this.deposits = projectBrowserDeposits(this.runtime, this.deposits,
             this.manifest.deployment_id, options.depositConfirmation);
@@ -892,17 +761,6 @@ class BrowserWalletRuntime extends EventTarget {
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             return this.snapshot().deposits;
-        });
-    }
-
-    async rememberExpiryClaims(claims) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const updated = await recordBrowserExpiryClaims(this.manifest.deployment_id, claims);
-            await this.reload();
-            if (updated.length) this.notify();
-            return updated;
         });
     }
 
@@ -954,10 +812,6 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     async remoteFetch(url, init = {}) {
-        return this.testnetAuth ? this.testnetAuth.fetch(url, init) : this.remoteFetchRaw(url, init);
-    }
-
-    async remoteFetchRaw(url, init = {}) {
         const proxyUrl = this.deploymentProxyUrl(url);
         if (proxyUrl) {
             try {
@@ -977,7 +831,6 @@ class BrowserWalletRuntime extends EventTarget {
 
     async remoteJson(url, init = {}) {
         const response = await this.remoteFetch(url, init);
-        if (response.status === 401 && this.testnetAuth?.protects(url)) throw testnetPasswordRequired();
         let payload = await responsePayload(response);
         if (!response.ok) {
             const retryAfterHeader = response.headers.get('retry-after');
@@ -1321,7 +1174,7 @@ class BrowserWalletRuntime extends EventTarget {
             || BigInt(note.amount) !== BigInt(plan.amount)) {
             throw new Error('The finalized Solana note does not match this browser’s deposit.');
         }
-        const vault = await assertNativeVault(funding);
+        const vault = await assertSolanaVault(funding);
         if (!vault || Number(vault.nextNoteId) <= Number(plan.next_note_id)) {
             throw new Error('The finalized Solana vault has not recorded this deposit.');
         }
@@ -1335,7 +1188,8 @@ class BrowserWalletRuntime extends EventTarget {
             note_id: Number(plan.next_note_id),
             amount: Number(plan.amount),
             commitment: plan.commitment,
-            expiry_ts: expiry
+            expiry_ts: expiry,
+            transactionHash: journal.stages.at(-1)?.signature || null
         });
     }
 
@@ -1586,21 +1440,11 @@ class BrowserWalletRuntime extends EventTarget {
         }, expectedActiveRoot, { sleep: milliseconds => delay(milliseconds) });
     }
 
+    // Only a never-journaled plan can be re-quoted: once a Solana journal is
+    // saved, its signed transactions may already be on the network.
     canQuotePendingDeposit(pending = this.runtime?.pendingDeposit) {
-        const noActiveAttempt = pending && typeof pending.operationId === 'string' && pending.operationId
-            && !pending.submissionId && !pending.transactionHash
-            && !pending.transactionHashes?.length && !pending.transactionAttempts?.length
-            && !pending.submissionFrom && pending.submissionNonce == null
-            && !(this.runtime?.lateDepositAttempts || []).some(attempt =>
-                attempt.operationId === pending.operationId
-                && !LATE_DEPOSIT_TERMINAL_STATUSES.has(attempt.status));
-        if (!noActiveAttempt) return false;
-        if (pending.phase === 'retry_exact') {
-            return pending.fundingQuoteRetryAuthorized === true && Boolean(pending.ambiguousSubmissions?.length);
-        }
-        return pending.phase === 'prepared' && !pending.legacyRecovery
-            && !(pending.ambiguousSubmissions || []).some(attempt =>
-                !(pending.resolvedAmbiguousSubmissionIds || []).includes(attempt.submissionId));
+        return Boolean(pending && typeof pending.operationId === 'string' && pending.operationId
+            && !pending.solanaJournal && (pending.phase || 'prepared') === 'prepared');
     }
 
     async prepareDepositQuote(amount, expectedActiveRoot) {
@@ -1615,12 +1459,6 @@ class BrowserWalletRuntime extends EventTarget {
             if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('Invalid deposit amount.');
             if (pending && pending.amount !== amount) {
                 throw new Error('The prepared deposit amount is fixed. Refresh its existing funding quote.');
-            }
-            if (pending?.phase === 'retry_exact') {
-                // An explicit retry may coexist with an unknown old send. Its
-                // exact calldata must remain fixed until chain recovery proves
-                // the old slot cannot execute; quoting never rebases it.
-                return { ...pending };
             }
             const previous = pending || this.runtime.depositQuote;
             const params = previous?.amount === amount ? previous
@@ -1670,28 +1508,13 @@ class BrowserWalletRuntime extends EventTarget {
                 return promoted;
             }
             if (this.runtime.pendingDeposit) {
-                let pending = this.runtime.pendingDeposit;
-                if (!pending.operationId || !pending.phase) {
-                    // Legacy clients opened MetaMask without a durable claim.
-                    // A missing hash is not proof that nothing was broadcast.
-                    pending = {
-                        ...pending,
-                        operationId: pending.operationId || uuid(),
-                        phase: pending.transactionHash ? 'submitted' : 'ambiguous',
-                        legacyRecovery: true
-                    };
-                    await this.commit({ ...this.runtime, pendingDeposit: pending });
+                const pending = this.runtime.pendingDeposit;
+                if (Number(pending.amount) === Number(amount)) return pending;
+                if (!this.canQuotePendingDeposit(pending)) {
+                    throw new Error('A previous Solana deposit is unfinished. Recover it before changing the amount.');
                 }
-                if (Number(pending.amount) !== Number(amount)) {
-                    if (pending.phase !== 'prepared' || pending.submissionId
-                        || pending.transactionHash || pending.transactionHashes?.length) {
-                        throw new Error('A previous deposit may already be in MetaMask. Recover it before changing the amount.');
-                    }
-                    await this.commit({ ...this.runtime, pendingDeposit: null });
-                    await this.reload();
-                } else {
-                    return pending;
-                }
+                await this.commit({ ...this.runtime, pendingDeposit: null });
+                await this.reload();
             }
             const params = await this.worker.call('generateDeposit');
             const path = await this.nextDepositPath();
@@ -1706,14 +1529,14 @@ class BrowserWalletRuntime extends EventTarget {
                 active_root: path.active_root,
                 zero_path: path.siblings
             };
-            // Persist the note secret before MetaMask is opened. If the tab is
-            // closed after the transaction is submitted, the deposit can still
-            // be confirmed from its on-chain receipt without losing funds.
+            // Persist the note secret before any wallet prompt. If the tab is
+            // closed after the transactions are signed, the deposit can still
+            // be resumed from its journal and confirmed from finalized state.
             await this.commit({ ...this.runtime, depositQuote: null, pendingDeposit: plan });
             return plan;
         });
         // Start only after deposit preparation's small WASM calls have left the
-        // worker. MetaMask/on-chain confirmation normally outlasts the decode,
+        // worker. Wallet signing and Solana finality normally outlast the decode,
         // hiding it without creating a lease or disposable inference request.
         void this.prewarmRequestProver();
         return plan;
@@ -1732,11 +1555,8 @@ class BrowserWalletRuntime extends EventTarget {
             if (Number(pending.amount) !== Number(amount)) {
                 throw new Error('The prepared private note has a different deposit amount.');
             }
-            const hashes = Array.isArray(pending.transactionHashes)
-                ? pending.transactionHashes
-                : pending.transactionHash ? [pending.transactionHash] : [];
-            if (pending.phase !== 'prepared' || pending.submissionId || hashes.length) {
-                throw new Error('This deposit already has a wallet attempt. Check it before refreshing the vault path.');
+            if (!this.canQuotePendingDeposit(pending)) {
+                throw new Error('This deposit already has signed Solana transactions. Resume it before refreshing the vault path.');
             }
             const path = await this.nextDepositPath(expectedActiveRoot);
             const refreshed = {
@@ -1757,532 +1577,6 @@ class BrowserWalletRuntime extends EventTarget {
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             return this.runtime.pendingDeposit ? { ...this.runtime.pendingDeposit } : null;
-        });
-    }
-
-    async claimPendingDepositSubmission(expectedOperationId = null) {
-        await this.init();
-        this.requireOnlineDeployment();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const pending = this.runtime.pendingDeposit;
-            if (!pending) throw new Error('The durable pending deposit is missing.');
-            if (expectedOperationId && pending.operationId !== expectedOperationId) {
-                throw new Error('The pending deposit changed in another tab. Check its status before continuing.');
-            }
-            const hashes = Array.isArray(pending.transactionHashes)
-                ? pending.transactionHashes
-                : pending.transactionHash ? [pending.transactionHash] : [];
-            if (hashes.length) {
-                return {
-                    status: 'submitted',
-                    transactionHash: hashes[0],
-                    operationId: pending.operationId,
-                    submissionId: pending.submissionId || null,
-                    noteId: Number(pending.next_note_id),
-                    amount: Number(pending.amount),
-                    commitment: pending.commitment,
-                    secret: pending.secret,
-                    deploymentId: this.manifest.deployment_id,
-                    chainId: losslessChainId(this.config.funding.chain_id),
-                    contractAddress: this.config.funding.contract_address
-                };
-            }
-            if (pending.phase === 'ambiguous') {
-                throw new BrowserWalletHttpError(
-                    'The previous deposit has an unknown result. Check it before explicitly retrying.',
-                    409,
-                    'deposit_submission_ambiguous'
-                );
-            }
-            if (pending.submissionId) {
-                throw new BrowserWalletHttpError(
-                    'This deposit is already awaiting MetaMask in this or another tab.',
-                    409,
-                    'deposit_wallet_pending'
-                );
-            }
-            if (!['prepared', 'retry_exact'].includes(pending.phase)) {
-                throw new Error('This deposit is not ready for a wallet request.');
-            }
-            const submissionId = uuid();
-            const next = {
-                ...pending,
-                phase: 'awaiting_wallet',
-                submissionId,
-                submissionOwner: this.ownerId,
-                submissionStartedAt: Date.now()
-            };
-            await this.commit({ ...this.runtime, pendingDeposit: next });
-            return {
-                status: 'claimed',
-                plan: { ...next },
-                transactionHash: null,
-                operationId: next.operationId,
-                submissionId,
-                noteId: Number(next.next_note_id),
-                amount: Number(next.amount),
-                commitment: next.commitment,
-                secret: next.secret,
-                deploymentId: this.manifest.deployment_id,
-                chainId: losslessChainId(this.config.funding.chain_id),
-                contractAddress: this.config.funding.contract_address
-            };
-        });
-    }
-
-    async claimPendingDepositReplacement(expectedFrom) {
-        await this.init();
-        this.requireOnlineDeployment();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const pending = this.runtime.pendingDeposit;
-            if (!pending || pending.phase !== 'dropped_or_pending') {
-                throw new Error('Check the submitted deposit before replacing it.');
-            }
-            if (pending.submissionId) {
-                throw new Error('A deposit replacement request is already open in MetaMask.');
-            }
-            const hashes = Array.isArray(pending.transactionHashes)
-                ? pending.transactionHashes
-                : pending.transactionHash ? [pending.transactionHash] : [];
-            const hashSet = new Set(hashes.map(hash => String(hash).toLowerCase()));
-            const identities = [...new Map((pending.transactionAttempts || [])
-                .filter(attempt => hashSet.has(String(attempt.hash || '').toLowerCase())
-                    && /^0x[0-9a-fA-F]{40}$/.test(attempt.from || '')
-                    && Number.isSafeInteger(Number(attempt.nonce))
-                    && Number(attempt.nonce) >= 0)
-                .map(attempt => {
-                    const identity = {
-                        from: attempt.from.toLowerCase(),
-                        nonce: Number(attempt.nonce)
-                    };
-                    return [`${identity.from}:${identity.nonce}`, identity];
-                })).values()];
-            if (identities.length !== 1) {
-                throw new Error(identities.length
-                    ? 'The saved deposit has more than one wallet nonce. Use MetaMask to cancel or speed up the pending transactions, then check again.'
-                    : 'The saved deposit has no replacement nonce. Use MetaMask to cancel or speed up the pending transaction, then check again.');
-            }
-            const [{ from, nonce }] = identities;
-            if (!/^0x[0-9a-fA-F]{40}$/.test(expectedFrom || '')
-                || from !== expectedFrom.toLowerCase()) {
-                throw new Error(`Connect the MetaMask account ${from} that submitted this deposit.`);
-            }
-            const submissionId = uuid();
-            const next = {
-                ...pending,
-                phase: 'awaiting_wallet',
-                submissionOutcome: 'replacement_awaiting_wallet',
-                submissionId,
-                submissionOwner: this.ownerId,
-                submissionStartedAt: Date.now(),
-                submissionFrom: from,
-                submissionNonce: nonce,
-                replacementOf: [...hashSet]
-            };
-            await this.commit({ ...this.runtime, pendingDeposit: next });
-            return {
-                status: 'claimed',
-                submissionId,
-                transactionHash: null,
-                operationId: next.operationId,
-                noteId: Number(next.next_note_id),
-                amount: Number(next.amount),
-                commitment: next.commitment,
-                secret: next.secret,
-                deploymentId: this.manifest.deployment_id,
-                chainId: losslessChainId(this.config.funding.chain_id),
-                contractAddress: this.config.funding.contract_address,
-                replacementFrom: from,
-                replacementNonce: nonce,
-                plan: structuredClone(next)
-            };
-        });
-    }
-
-    async rememberPendingDepositSubmissionMetadata(submission, metadata) {
-        await this.init();
-        const from = metadata?.from;
-        const nonce = Number(metadata?.nonce);
-        if (!/^0x[0-9a-fA-F]{40}$/.test(from || '')
-            || !Number.isSafeInteger(nonce) || nonce < 0) {
-            throw new Error('The deposit transaction metadata is invalid.');
-        }
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const pending = this.runtime.pendingDeposit;
-            if (!this.depositSubmissionMatches(pending, submission)
-                || pending.submissionId !== submission.submissionId) {
-                throw new Error('The deposit wallet claim changed before its nonce was saved.');
-            }
-            const next = {
-                ...pending,
-                submissionFrom: from.toLowerCase(),
-                submissionNonce: nonce
-            };
-            await this.commit({ ...this.runtime, pendingDeposit: next });
-            return next;
-        });
-    }
-
-    depositSubmissionMatches(pending, reference) {
-        return Boolean(reference?.operationId && reference?.submissionId
-            && pending?.operationId === reference.operationId
-            && Number(pending.next_note_id) === Number(reference.noteId)
-            && Number(pending.amount) === Number(reference.amount)
-            && sameFelt(pending.commitment, reference.commitment)
-            && reference.deploymentId === this.manifest.deployment_id
-            && sameChainId(reference.chainId, this.config.funding.chain_id)
-            && String(reference.contractAddress || '').toLowerCase()
-                === String(this.config.funding.contract_address || '').toLowerCase());
-    }
-
-    async rememberPendingDepositTransaction(
-        transactionHash,
-        submission,
-        transactionMetadata = null
-    ) {
-        await this.init();
-        if (!/^0x[0-9a-fA-F]{64}$/.test(transactionHash || '')) {
-            throw new Error('MetaMask returned an invalid deposit transaction hash.');
-        }
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const pending = this.runtime.pendingDeposit;
-            if (!pending) {
-                throw new Error('The durable pending deposit is missing.');
-            }
-            if (!this.depositSubmissionMatches(pending, submission)) {
-                const attempts = Array.isArray(this.runtime.lateDepositAttempts)
-                    ? this.runtime.lateDepositAttempts
-                    : [];
-                const lateAttempt = {
-                    operationId: submission?.operationId || null,
-                    submissionId: submission?.submissionId || null,
-                    noteId: Number(submission?.noteId),
-                    amount: Number(submission?.amount),
-                    commitment: submission?.commitment || null,
-                    secret: submission?.secret || null,
-                    deploymentId: submission?.deploymentId || null,
-                    chainId: losslessChainId(submission?.chainId),
-                    contractAddress: submission?.contractAddress || null,
-                    transactionHash: transactionHash.toLowerCase(),
-                    from: /^0x[0-9a-fA-F]{40}$/.test(transactionMetadata?.from || '')
-                        ? transactionMetadata.from.toLowerCase()
-                        : null,
-                    nonce: Number.isSafeInteger(Number(transactionMetadata?.nonce))
-                        ? Number(transactionMetadata.nonce)
-                        : null,
-                    status: 'submitted_late',
-                    observedAt: Date.now()
-                };
-                await this.commit({
-                    ...this.runtime,
-                    lateDepositAttempts: retainAttemptHistory([...attempts.filter(attempt => !(
-                        attempt.operationId === lateAttempt.operationId
-                        && attempt.transactionHash === lateAttempt.transactionHash
-                    )), lateAttempt], new Set(['confirmed', 'reverted', 'superseded']))
-                });
-                return { late: true, ...lateAttempt };
-            }
-            const normalizedHash = transactionHash.toLowerCase();
-            const hashes = [...new Set([
-                ...(Array.isArray(pending.transactionHashes)
-                    ? pending.transactionHashes
-                    : pending.transactionHash ? [pending.transactionHash] : []),
-                normalizedHash
-            ].map(value => value.toLowerCase()))];
-            const pendingDeposit = {
-                ...pending,
-                phase: 'submitted',
-                transactionHash: hashes[0],
-                transactionHashes: hashes,
-                transactionAttempts: [
-                    ...(Array.isArray(pending.transactionAttempts)
-                        ? pending.transactionAttempts.filter(attempt => attempt.hash !== normalizedHash)
-                        : []),
-                    {
-                        hash: normalizedHash,
-                        submissionId: submission.submissionId,
-                        operationId: submission.operationId,
-                        from: /^0x[0-9a-fA-F]{40}$/.test(
-                            transactionMetadata?.from || pending.submissionFrom || ''
-                        )
-                            ? (transactionMetadata?.from || pending.submissionFrom).toLowerCase()
-                            : null,
-                        nonce: Number.isSafeInteger(Number(
-                            transactionMetadata?.nonce ?? pending.submissionNonce
-                        ))
-                            ? Number(transactionMetadata?.nonce ?? pending.submissionNonce)
-                            : null,
-                        observedAt: Date.now()
-                    }
-                ]
-            };
-            if (pending.submissionId === submission.submissionId) {
-                delete pendingDeposit.submissionId;
-                delete pendingDeposit.submissionOwner;
-                delete pendingDeposit.submissionStartedAt;
-                delete pendingDeposit.submissionFrom;
-                delete pendingDeposit.submissionNonce;
-            }
-            await this.commit({ ...this.runtime, pendingDeposit });
-            return { ...pendingDeposit };
-        });
-    }
-
-    async markPendingDepositRetryable(expectedTransactionHash = null, submission = null) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const pending = this.runtime.pendingDeposit;
-            if (!pending) return null;
-            if (!expectedTransactionHash && !this.depositSubmissionMatches(pending, submission)) {
-                throw new Error('The deposit operation changed while MetaMask was open.');
-            }
-            const hashes = Array.isArray(pending.transactionHashes)
-                ? pending.transactionHashes
-                : pending.transactionHash ? [pending.transactionHash] : [];
-            if (expectedTransactionHash
-                && !hashes.some(hash => hash.toLowerCase() === expectedTransactionHash.toLowerCase())) {
-                throw new Error('The deposit transaction changed while its receipt was checked.');
-            }
-            const remaining = expectedTransactionHash
-                ? hashes.filter(hash => hash.toLowerCase() !== expectedTransactionHash.toLowerCase())
-                : hashes;
-            const releasesClaim = !expectedTransactionHash
-                && pending.submissionId === submission?.submissionId;
-            const next = {
-                ...pending,
-                phase: remaining.length
-                    ? 'submitted'
-                    : pending.submissionId && !releasesClaim
-                        ? (pending.phase === 'ambiguous' ? 'ambiguous' : 'awaiting_wallet')
-                        : pending.fundingQuoteRetryAuthorized === true && pending.ambiguousSubmissions?.length
-                            ? 'retry_exact' : 'prepared',
-                transactionHashes: remaining,
-                transactionAttempts: Array.isArray(pending.transactionAttempts)
-                    ? pending.transactionAttempts.filter(attempt => !expectedTransactionHash
-                        || attempt.hash.toLowerCase() !== expectedTransactionHash.toLowerCase())
-                    : []
-            };
-            if (remaining.length) next.transactionHash = remaining[0];
-            else {
-                delete next.transactionHash;
-                delete next.transactionHashes;
-            }
-            if (releasesClaim) {
-                delete next.submissionId;
-                delete next.submissionOwner;
-                delete next.submissionStartedAt;
-                delete next.submissionFrom;
-                delete next.submissionNonce;
-            }
-            await this.commit({ ...this.runtime, pendingDeposit: next });
-            return next;
-        });
-    }
-
-    async markPendingDepositMissingReceipts(expectedTransactionHashes) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const pending = this.runtime.pendingDeposit;
-            if (!pending) return null;
-            const normalize = values => [...values]
-                .map(value => String(value).toLowerCase())
-                .sort();
-            const hashes = Array.isArray(pending.transactionHashes)
-                ? pending.transactionHashes
-                : pending.transactionHash ? [pending.transactionHash] : [];
-            if (JSON.stringify(normalize(hashes))
-                !== JSON.stringify(normalize(expectedTransactionHashes || []))) {
-                throw new Error('The deposit transactions changed while their receipts were checked.');
-            }
-            if (pending.submissionId) return pending;
-            if (pending.phase === 'dropped_or_pending') return pending;
-            const next = {
-                ...pending,
-                phase: 'dropped_or_pending',
-                submissionOutcome: 'receipt_missing',
-                missingReceiptCheckedAt: Date.now()
-            };
-            await this.commit({ ...this.runtime, pendingDeposit: next });
-            return next;
-        });
-    }
-
-    async releasePendingDepositReplacementClaim(submission, message = null) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const pending = this.runtime.pendingDeposit;
-            if (!pending || pending.submissionId !== submission?.submissionId
-                || pending.operationId !== submission?.operationId
-                || !Number.isSafeInteger(Number(submission?.replacementNonce))) {
-                throw new Error('The deposit replacement request changed before it could be released.');
-            }
-            const history = Array.isArray(pending.ambiguousReplacements)
-                ? pending.ambiguousReplacements
-                : [];
-            const next = {
-                ...pending,
-                phase: 'dropped_or_pending',
-                submissionOutcome: 'replacement_result_unknown',
-                ambiguousReplacements: [...history, {
-                    submissionId: pending.submissionId,
-                    nonce: Number(submission.replacementNonce),
-                    startedAt: pending.submissionStartedAt,
-                    releasedAt: Date.now(),
-                    message: message || 'The wallet did not return a deposit replacement transaction ID.'
-                }].slice(-8),
-                missingReceiptCheckedAt: Date.now()
-            };
-            delete next.submissionId;
-            delete next.submissionOwner;
-            delete next.submissionStartedAt;
-            delete next.submissionFrom;
-            delete next.submissionNonce;
-            delete next.submissionError;
-            await this.commit({ ...this.runtime, pendingDeposit: next });
-            return next;
-        });
-    }
-
-    async markPendingDepositAmbiguous(submission, message = null) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const pending = this.runtime.pendingDeposit;
-            if (!this.depositSubmissionMatches(pending, submission)
-                || pending.submissionId !== submission.submissionId) {
-                throw new Error('The deposit operation changed before its unknown result could be saved.');
-            }
-            const next = {
-                ...pending,
-                phase: 'ambiguous',
-                submissionError: message || 'MetaMask did not return a transaction ID.',
-                ambiguousAt: Date.now()
-            };
-            await this.commit({ ...this.runtime, pendingDeposit: next });
-            return next;
-        });
-    }
-
-    async markPendingDepositUnknown() {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const pending = this.runtime.pendingDeposit;
-            if (!pending?.submissionId) throw new Error('There is no deposit wallet prompt to recover.');
-            if (pending.phase === 'ambiguous') return pending;
-            const next = {
-                ...pending,
-                phase: 'ambiguous',
-                submissionError: 'The wallet prompt was closed before a transaction ID was saved.',
-                ambiguousAt: Date.now()
-            };
-            await this.commit({ ...this.runtime, pendingDeposit: next });
-            return next;
-        });
-    }
-
-    async authorizePendingDepositRetry({ forFundingQuote = false } = {}) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const pending = this.runtime.pendingDeposit;
-            const hashes = Array.isArray(pending?.transactionHashes)
-                ? pending.transactionHashes
-                : pending?.transactionHash ? [pending.transactionHash] : [];
-            if (forFundingQuote && pending?.phase === 'retry_exact' && !pending.submissionId
-                && !hashes.length && !pending.transactionAttempts?.length && pending.ambiguousSubmissions?.length) {
-                const authorized = { ...pending, fundingQuoteRetryAuthorized: true };
-                if (!this.canQuotePendingDeposit(authorized)) {
-                    throw new Error('Check the unresolved deposit transaction before reviewing retry fees.');
-                }
-                await this.commit({ ...this.runtime, pendingDeposit: authorized });
-                return authorized;
-            }
-            if (!pending || pending.phase !== 'ambiguous' || !pending.submissionId || hashes.length) {
-                throw new Error('There is no unknown deposit request to retry.');
-            }
-            const history = Array.isArray(pending.ambiguousSubmissions)
-                ? pending.ambiguousSubmissions
-                : [];
-            const next = {
-                ...pending,
-                phase: 'retry_exact',
-                fundingQuoteRetryAuthorized: forFundingQuote,
-                ambiguousSubmissions: [...history, {
-                    submissionId: pending.submissionId,
-                    startedAt: pending.submissionStartedAt,
-                    authorizedAt: Date.now()
-                }].slice(-8)
-            };
-            delete next.submissionId;
-            delete next.submissionOwner;
-            delete next.submissionStartedAt;
-            delete next.submissionFrom;
-            delete next.submissionNonce;
-            delete next.submissionError;
-            if (forFundingQuote && !this.canQuotePendingDeposit(next)) {
-                throw new Error('Check the unresolved deposit transaction before reviewing retry fees.');
-            }
-            await this.commit({ ...this.runtime, pendingDeposit: next });
-            return next;
-        });
-    }
-
-    async resolvePendingDepositSlotConflict(expected) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const pending = this.runtime.pendingDeposit;
-            if (!pending) return null;
-            const normalizeHashes = value => [...new Set((Array.isArray(value)
-                ? value
-                : value ? [value] : [])
-                .map(hash => String(hash).toLowerCase()))].sort();
-            const pendingHashes = normalizeHashes(
-                pending.transactionHashes || pending.transactionHash
-            );
-            const expectedHashes = normalizeHashes(
-                expected?.transactionHashes || expected?.transactionHash
-            );
-            if (!expected?.operationId
-                || pending.operationId !== expected.operationId
-                || Number(pending.next_note_id) !== Number(expected.noteId)
-                || Number(pending.amount) !== Number(expected.amount)
-                || !sameFelt(pending.commitment, expected.commitment)
-                || (pending.phase || null) !== (expected.phase || null)
-                || (pending.submissionId || null) !== (expected.submissionId || null)
-                || JSON.stringify(pendingHashes) !== JSON.stringify(expectedHashes)) {
-                throw new Error('The pending deposit changed while its vault slot was being checked. Check it again before retrying.');
-            }
-            const next = {
-                ...pending,
-                phase: 'prepared',
-                previousSlot: Number(pending.next_note_id),
-                // Finalized occupation by another commitment proves every old
-                // ambiguous call for this append slot can no longer succeed.
-                // Retain those claims for late recovery, while recording exactly
-                // which ambiguity was resolved before allowing a fresh quote.
-                resolvedAmbiguousSubmissionIds: (pending.ambiguousSubmissions || []).map(attempt => attempt.submissionId),
-                legacyRecovery: false,
-                fundingQuoteRetryAuthorized: false
-            };
-            delete next.submissionId;
-            delete next.submissionOwner;
-            delete next.submissionStartedAt;
-            delete next.submissionFrom;
-            delete next.submissionNonce;
-            delete next.transactionHash;
-            delete next.transactionHashes;
-            delete next.transactionAttempts;
-            await this.commit({ ...this.runtime, pendingDeposit: next });
-            return next;
         });
     }
 
@@ -2317,13 +1611,9 @@ class BrowserWalletRuntime extends EventTarget {
             }, {
                 depositConfirmation: {
                     operationId: pending.operationId,
-                    createdAt: pending.createdAt || pending.submissionStartedAt || null,
+                    createdAt: pending.createdAt || null,
                     confirmedAt: Date.now(),
-                    // A saved attempt may have been replaced. Only the receipt
-                    // caller identifies the actual mined transaction; recovery
-                    // from the vault alone intentionally leaves it unknown.
-                    transactionHash: args.transactionHash || null,
-                    ...(args.receiptMetadata || {})
+                    transactionHash: args.transactionHash || null
                 }
             });
             // The atomic note/history write is the confirmation boundary.
@@ -2341,20 +1631,21 @@ class BrowserWalletRuntime extends EventTarget {
 
     async nativeBillingQuote(signal) {
         const funding = this.config.funding;
-        const quoted = await this.remoteJson(`${funding.protocol_server_url}/v2/billing/quote`, { signal });
-        validateNativeQuote(quoted, funding);
-        const verified = await readNativeQuote(funding, { expected: quoted, signal });
-        this.ethUsdQuote = verified;
-        return verified;
+        const quote = validateSolanaQuote(
+            await this.remoteJson(`${funding.protocol_server_url}/v2/billing/quote`, { signal }),
+            funding
+        );
+        this.solUsdQuote = quote;
+        return quote;
     }
 
     leaseBudget(spendingLimitUsd, quote = null, { checkBalance = false } = {}) {
         if (!CHAT_SPENDING_TIER_USD.includes(Number(spendingLimitUsd))) throw new Error('Invalid private-balance model budget configuration.');
-        validateNativeQuote(quote, this.config.funding, { allowExpired: true });
-        const amount = Number(nativeUnitsForUsd(spendingLimitUsd, quote));
+        validateSolanaQuote(quote, this.config.funding, { allowExpired: true });
+        const amount = Number(solanaUnitsForUsd(spendingLimitUsd, quote));
         if (checkBalance) {
             const balance = Number(this.runtime.state.current_balance);
-            if (!Number.isSafeInteger(balance) || balance < 0) throw new Error('Invalid native ETH wallet balance.');
+            if (!Number.isSafeInteger(balance) || balance < 0) throw new Error('Invalid private SOL balance.');
             if (amount < Number(this.config.request_charge_cap)) throw new Error('This model budget is below the deployment’s minimum private-chat budget.');
             if (balance < amount) {
                 const error = new Error(`This model requires at least $${Number(spendingLimitUsd).toFixed(2)} in private balance for a new key. Choose a lower-cap model, or fund a larger balance.`);
@@ -2371,13 +1662,6 @@ class BrowserWalletRuntime extends EventTarget {
         this.requireOnlineDeployment();
         throwIfAborted(signal);
         if (!this.runtime.state) throw new Error('Fund a private balance before starting a chat.');
-        if (unresolvedLateWithdrawalForNote(this.runtime, this.runtime.state.note_id)) {
-            throw new BrowserWalletHttpError(
-                'A withdrawal from another tab may already be on-chain. Check its status before using this balance.',
-                409,
-                'late_withdrawal_pending'
-            );
-        }
         // C3: no request (new or re-sent) while an exit is prepared at this state.
         if (this.runtime.preparedWithdrawal) throw new Error('Finish the prepared withdrawal before sending another message.');
         const journal = this.runtime.journal;
@@ -2443,10 +1727,10 @@ class BrowserWalletRuntime extends EventTarget {
             || Number(lease.expires_at) <= Math.floor(Date.now() / 1000)) {
             throw new Error('The zkAPI server returned an unusable OpenRouter lease.');
         }
-        validateNativeQuote(expectedQuote, this.config.funding, { allowExpired: true });
-        if (!sameNativeQuote(lease.billing_quote, expectedQuote)
-            || Number(lease.spending_limit_usd) !== Number(nativeUsdMicros(expectedLimitCredits, expectedQuote)) / 1_000_000) {
-            throw new Error('The zkAPI server returned a child key with the wrong native ETH spending cap or quote.');
+        validateSolanaQuote(expectedQuote, this.config.funding, { allowExpired: true });
+        if (!sameSolanaQuote(lease.billing_quote, expectedQuote)
+            || Number(lease.spending_limit_usd) !== Number(solanaUsdMicros(expectedLimitCredits, expectedQuote)) / 1_000_000) {
+            throw new Error('The zkAPI server returned a child key with the wrong SOL spending cap or quote.');
         }
         exactTrustedUrl(lease.openrouter_api_base, this.config.openrouter.inference_base, 'OpenRouter inference origin');
         if (this.config.openrouter.require_oa_key_source && lease.key_source !== 'oa_org') {
@@ -2994,7 +2278,7 @@ class BrowserWalletRuntime extends EventTarget {
 
     /** Finalized block time from the host-pinned RPC (never the operator), for the exit freeze. */
     readFinalizedChainTime() {
-        return readFinalizedChainTime(this.config.funding);
+        return readFinalizedSolanaTime(this.config.funding);
     }
 
     /**
@@ -3019,10 +2303,10 @@ class BrowserWalletRuntime extends EventTarget {
         if (await exitProofStillLive(this.runtime.preparedWithdrawal?.releasedValidUntil ?? null,
             () => this.readFinalizedChainTime())) return false;
         const quote = requestBillingQuote(this.runtime.journal?.prepared_request);
-        validateNativeQuote(quote, this.config.funding, { allowExpired: true });
+        validateSolanaQuote(quote, this.config.funding, { allowExpired: true });
         let payload;
         try { payload = JSON.parse(recovery.request_response.response_payload); } catch { /* Reject below. */ }
-        if (!sameNativeQuote(payload?.billing_quote, quote)) throw new Error('The settlement receipt changed the authorized ETH/USD quote.');
+        if (!sameSolanaQuote(payload?.billing_quote, quote)) throw new Error('The settlement receipt changed the authorized SOL/USD quote.');
         let state;
         try {
             state = await this.worker.call('completeResponse', {
@@ -3075,7 +2359,7 @@ class BrowserWalletRuntime extends EventTarget {
             || request.public_inputs?.request_nullifier == null
             || !sameFelt(journal?.nullifier, request.public_inputs.request_nullifier)
             || body !== JSON.stringify(journal?.prepared_request)) return false;
-        validateNativeQuote(requestBillingQuote(request), this.config.funding, { allowExpired: true });
+        validateSolanaQuote(requestBillingQuote(request), this.config.funding, { allowExpired: true });
         // This endpoint only observes quote validity and acceptance under the server's
         // issuance lock. Neither local time nor an unknown nullifier proves an
         // older in-flight request can no longer reserve the note.
@@ -3222,32 +2506,21 @@ class BrowserWalletRuntime extends EventTarget {
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             if (!this.runtime.state) throw new Error('There is no active private note to withdraw.');
-            if (unresolvedLateWithdrawalForNote(this.runtime, this.runtime.state.note_id)) {
-                throw new BrowserWalletHttpError(
-                    'A withdrawal from another tab may already be on-chain. Check its status before starting another withdrawal.',
-                    409,
-                    'late_withdrawal_pending'
-                );
-            }
             const validateExisting = (prepared) => {
                 if (!prepared) return;
                 if (Number(prepared.noteId ?? prepared.note_id ?? prepared.public_inputs?.note_id)
                     !== Number(this.runtime.state.note_id)) {
                     throw new Error('The prepared withdrawal belongs to a different private balance.');
                 }
-                const existingDestination = prepared.destination?.toLowerCase();
-                const existingHashes = Array.isArray(prepared.transactionHashes)
-                    ? prepared.transactionHashes
-                    : prepared.transactionHash ? [prepared.transactionHash] : [];
-                const hasSubmission = Boolean(prepared.submissionId || existingHashes.length);
-                const safeModeSwitch = !hasSubmission && (
+                const existingDestination = prepared.destination;
+                const safeModeSwitch = !prepared.solanaJournal && (
                     (prepared.mode === 'mutual' && mode === 'escape')
                     || (prepared.mode === 'escape' && mode === 'mutual'
                         && prepared.clearanceReserved === true)
                 );
                 if (existingDestination
-                    && (prepared.mode !== mode || existingDestination !== destination.toLowerCase())
-                    && !(safeModeSwitch && existingDestination === destination.toLowerCase())) {
+                    && (prepared.mode !== mode || existingDestination !== destination)
+                    && !(safeModeSwitch && existingDestination === destination)) {
                     throw new Error('A different withdrawal is already prepared in this browser.');
                 }
             };
@@ -3279,21 +2552,9 @@ class BrowserWalletRuntime extends EventTarget {
                     'lease_pending'
                 );
             }
-            const existingHashes = Array.isArray(existing?.transactionHashes)
-                ? existing.transactionHashes
-                : existing?.transactionHash ? [existing.transactionHash] : [];
-            if (existing?.submissionId && !existingHashes.length) {
-                throw new BrowserWalletHttpError(
-                    existing.phase === 'ambiguous'
-                        ? 'MetaMask did not return a transaction ID. Check the chain, then explicitly retry if this balance is still active.'
-                        : 'This withdrawal is awaiting MetaMask in this or another tab.',
-                    409,
-                    existing.phase === 'ambiguous'
-                        ? 'withdrawal_submission_ambiguous'
-                        : 'withdrawal_wallet_pending'
-                );
-            }
-            if (existingHashes.length) {
+            // Signed Solana transactions may already be on the network: the
+            // journaled plan is resumed, never re-proved.
+            if (existing?.solanaJournal) {
                 if (!existing.public_inputs || !existing.proof) {
                     throw new Error('The submitted withdrawal proof is missing from this browser.');
                 }
@@ -3330,7 +2591,7 @@ class BrowserWalletRuntime extends EventTarget {
             // reusable for the same state, concession and destination until it
             // nears its validity deadline.
             if (existing?.mode === mode && existing.public_inputs
-                && existing.destination?.toLowerCase() === destination.toLowerCase()
+                && existing.destination === destination
                 && sameFelt(existing.stateAnchor, state.current_anchor)
                 && BigInt(existing.public_inputs.conceded ?? -1) === concession.conceded
                 && reusableExitProof(existing.public_inputs.valid_until, now)) {
@@ -3406,701 +2667,7 @@ class BrowserWalletRuntime extends EventTarget {
         });
     }
 
-    async claimPreparedWithdrawalSubmission() {
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            let prepared = this.runtime.preparedWithdrawal;
-            if (!prepared) throw new Error('The durable prepared withdrawal is missing.');
-            if (!prepared.operationId) {
-                prepared = { ...prepared, operationId: uuid() };
-                await this.commit({ ...this.runtime, preparedWithdrawal: prepared });
-            }
-            const knownHashes = Array.isArray(prepared.transactionHashes)
-                ? prepared.transactionHashes
-                : prepared.transactionHash ? [prepared.transactionHash] : [];
-            if (knownHashes.length) {
-                return {
-                    status: 'submitted',
-                    transactionHash: knownHashes[0],
-                    submissionId: prepared.submissionId || null,
-                    operationId: prepared.operationId,
-                    noteId: Number(prepared.noteId ?? prepared.public_inputs?.note_id),
-                    mode: prepared.mode,
-                    destination: prepared.destination,
-                    finalBalance: Number(prepared.public_inputs?.final_balance
-                        ?? this.runtime.state?.current_balance),
-                    clearanceReserved: prepared.clearanceReserved === true
-                        || prepared.mode === 'mutual',
-                    withdrawalNullifier: prepared.withdrawalNullifier
-                        || prepared.public_inputs?.withdrawal_nullifier
-                        || null,
-                    deploymentId: this.manifest.deployment_id,
-                    chainId: losslessChainId(this.config.funding.chain_id),
-                    contractAddress: this.config.funding.contract_address
-                };
-            }
-            if (prepared.submissionId) {
-                throw new BrowserWalletHttpError(
-                    prepared.phase === 'ambiguous'
-                        ? 'The previous wallet request has no transaction ID. Check its status before retrying.'
-                        : 'This withdrawal is already awaiting MetaMask in this or another tab.',
-                    409,
-                    prepared.phase === 'ambiguous'
-                        ? 'withdrawal_submission_ambiguous'
-                        : 'withdrawal_wallet_pending'
-                );
-            }
-            const now = Date.now();
-            const submissionId = uuid();
-            // C3: from here the proof can leave the device, so its state stays
-            // frozen until the proof's valid_until has passed.
-            const validUntil = Number(prepared.public_inputs?.valid_until ?? 0);
-            const next = {
-                ...prepared,
-                phase: 'awaiting_wallet',
-                submissionOutcome: 'awaiting_wallet',
-                submissionId,
-                submissionOwner: this.ownerId,
-                submissionStartedAt: now,
-                submissionNonceJournalRequired: true,
-                releasedValidUntil: Math.max(Number(prepared.releasedValidUntil || 0), validUntil) || null
-            };
-            await this.commit({ ...this.runtime, preparedWithdrawal: next });
-            return {
-                status: 'claimed',
-                submissionId,
-                transactionHash: null,
-                operationId: next.operationId,
-                noteId: Number(next.noteId ?? next.public_inputs?.note_id),
-                mode: next.mode,
-                destination: next.destination,
-                finalBalance: Number(next.public_inputs?.final_balance
-                    ?? this.runtime.state?.current_balance),
-                clearanceReserved: next.clearanceReserved === true
-                    || next.mode === 'mutual',
-                withdrawalNullifier: next.withdrawalNullifier
-                    || next.public_inputs?.withdrawal_nullifier
-                    || null,
-                deploymentId: this.manifest.deployment_id,
-                chainId: losslessChainId(this.config.funding.chain_id),
-                contractAddress: this.config.funding.contract_address
-            };
-        });
-    }
-
-    async rememberPreparedWithdrawalSubmissionMetadata(submission, metadata) {
-        const from = metadata?.from;
-        const nonce = Number(metadata?.nonce);
-        if (!/^0x[0-9a-fA-F]{40}$/.test(from || '')
-            || !Number.isSafeInteger(nonce) || nonce < 0) {
-            throw new Error('The withdrawal transaction metadata is invalid.');
-        }
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const prepared = this.runtime.preparedWithdrawal;
-            const reference = submission && typeof submission === 'object' ? submission : null;
-            const matches = prepared
-                && reference?.operationId === prepared.operationId
-                && reference?.submissionId === prepared.submissionId
-                && Number(reference.noteId) === Number(
-                    prepared.noteId ?? prepared.public_inputs?.note_id
-                )
-                && reference.mode === prepared.mode
-                && String(reference.destination || '').toLowerCase()
-                    === String(prepared.destination || '').toLowerCase()
-                && reference.deploymentId === this.manifest.deployment_id
-                && sameChainId(reference.chainId, this.config.funding.chain_id)
-                && String(reference.contractAddress || '').toLowerCase()
-                    === String(this.config.funding.contract_address || '').toLowerCase();
-            if (!matches) {
-                throw new Error('The withdrawal wallet claim changed before its nonce was saved.');
-            }
-            const next = {
-                ...prepared,
-                submissionFrom: from.toLowerCase(),
-                submissionNonce: nonce
-            };
-            await this.commit({ ...this.runtime, preparedWithdrawal: next });
-            return next;
-        });
-    }
-
-    async claimPreparedWithdrawalReplacement(expectedFrom) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const prepared = this.runtime.preparedWithdrawal;
-            if (!prepared || prepared.phase !== 'dropped_or_pending') {
-                throw new Error('Check the submitted withdrawal before replacing it.');
-            }
-            if (prepared.submissionId) {
-                throw new Error('A replacement request is already open in MetaMask.');
-            }
-            const hashes = Array.isArray(prepared.transactionHashes)
-                ? prepared.transactionHashes
-                : prepared.transactionHash ? [prepared.transactionHash] : [];
-            const hashSet = new Set(hashes.map(hash => String(hash).toLowerCase()));
-            const identities = [...new Map((prepared.transactionAttempts || [])
-                .filter(attempt => hashSet.has(String(attempt.hash || '').toLowerCase())
-                    && /^0x[0-9a-fA-F]{40}$/.test(attempt.from || '')
-                    && Number.isSafeInteger(Number(attempt.nonce))
-                    && Number(attempt.nonce) >= 0)
-                .map(attempt => {
-                    const identity = {
-                        from: attempt.from.toLowerCase(),
-                        nonce: Number(attempt.nonce)
-                    };
-                    return [`${identity.from}:${identity.nonce}`, identity];
-                })).values()];
-            if (identities.length !== 1) {
-                throw new Error(identities.length
-                    ? 'The saved withdrawal has more than one wallet nonce. Use MetaMask to cancel or speed up the pending transactions, then check again.'
-                    : 'The saved withdrawal has no replacement nonce. Use MetaMask to cancel or speed up the pending transaction, then check again.');
-            }
-            const [{ from, nonce }] = identities;
-            if (!/^0x[0-9a-fA-F]{40}$/.test(expectedFrom || '')
-                || from !== expectedFrom.toLowerCase()) {
-                throw new Error(`Connect the MetaMask account ${from} that submitted this withdrawal.`);
-            }
-            const submissionId = uuid();
-            const next = {
-                ...prepared,
-                phase: 'awaiting_wallet',
-                submissionOutcome: 'replacement_awaiting_wallet',
-                submissionId,
-                submissionOwner: this.ownerId,
-                submissionStartedAt: Date.now(),
-                submissionFrom: from,
-                submissionNonce: nonce,
-                submissionNonceJournalRequired: true,
-                replacementOf: [...hashSet]
-            };
-            await this.commit({ ...this.runtime, preparedWithdrawal: next });
-            return {
-                status: 'claimed',
-                submissionId,
-                transactionHash: null,
-                operationId: next.operationId,
-                noteId: Number(next.noteId ?? next.public_inputs?.note_id),
-                mode: next.mode,
-                destination: next.destination,
-                finalBalance: Number(next.public_inputs?.final_balance
-                    ?? this.runtime.state?.current_balance),
-                clearanceReserved: next.clearanceReserved === true
-                    || next.mode === 'mutual',
-                withdrawalNullifier: next.withdrawalNullifier
-                    || next.public_inputs?.withdrawal_nullifier
-                    || null,
-                deploymentId: this.manifest.deployment_id,
-                chainId: losslessChainId(this.config.funding.chain_id),
-                contractAddress: this.config.funding.contract_address,
-                replacementFrom: from,
-                replacementNonce: nonce,
-                plan: structuredClone(next)
-            };
-        });
-    }
-
-    async rememberPreparedWithdrawalTransaction(
-        transactionHash,
-        submission = null,
-        transactionMetadata = null
-    ) {
-        if (!/^0x[0-9a-fA-F]{64}$/.test(transactionHash || '')) {
-            throw new Error('MetaMask returned an invalid withdrawal transaction hash.');
-        }
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const prepared = this.runtime.preparedWithdrawal;
-            const reference = submission && typeof submission === 'object' ? submission : null;
-            if (!reference?.operationId || !reference.submissionId
-                || reference.deploymentId !== this.manifest.deployment_id
-                || !sameChainId(reference.chainId, this.config.funding.chain_id)
-                || String(reference.contractAddress || '').toLowerCase()
-                    !== String(this.config.funding.contract_address || '').toLowerCase()) {
-                throw new Error('The withdrawal transaction is missing its durable operation identity.');
-            }
-            const sameOperation = prepared && (
-                prepared.operationId === reference.operationId
-                    && Number(prepared.noteId ?? prepared.public_inputs?.note_id) === Number(reference.noteId)
-                    && prepared.mode === reference.mode
-                    && prepared.destination?.toLowerCase() === reference.destination?.toLowerCase()
-            );
-            if (!sameOperation) {
-                const attempts = Array.isArray(this.runtime.lateWithdrawalAttempts)
-                    ? this.runtime.lateWithdrawalAttempts
-                    : [];
-                const lateAttempt = {
-                    operationId: reference.operationId || null,
-                    submissionId: reference.submissionId || null,
-                    noteId: Number(reference.noteId),
-                    mode: reference.mode || null,
-                    destination: reference.destination || null,
-                    finalBalance: Number(reference.finalBalance),
-                    clearanceReserved: reference.clearanceReserved === true
-                        || reference.mode === 'mutual',
-                    withdrawalNullifier: reference.withdrawalNullifier || null,
-                    deploymentId: reference.deploymentId,
-                    chainId: losslessChainId(reference.chainId),
-                    contractAddress: reference.contractAddress,
-                    transactionHash: transactionHash.toLowerCase(),
-                    from: /^0x[0-9a-fA-F]{40}$/.test(
-                        transactionMetadata?.from || prepared?.submissionFrom || ''
-                    )
-                        ? (transactionMetadata?.from || prepared?.submissionFrom).toLowerCase()
-                        : null,
-                    nonce: Number.isSafeInteger(Number(
-                        transactionMetadata?.nonce ?? prepared?.submissionNonce
-                    ))
-                        ? Number(transactionMetadata?.nonce ?? prepared?.submissionNonce)
-                        : null,
-                    observedAt: Date.now(),
-                    status: 'submitted_late'
-                };
-                const deduplicated = attempts.filter(attempt => !(
-                    attempt.operationId === lateAttempt.operationId
-                    && attempt.transactionHash === lateAttempt.transactionHash
-                ));
-                await this.commit({
-                    ...this.runtime,
-                    lateWithdrawalAttempts: retainAttemptHistory(
-                        [...deduplicated, lateAttempt],
-                        LATE_WITHDRAWAL_TERMINAL_STATUSES
-                    )
-                });
-                return { late: true, ...lateAttempt };
-            }
-            // A wallet prompt can outlive its cross-tab ownership claim. Never
-            // reject a late valid hash: retaining every broadcast is the only
-            // safe way to reconcile a takeover without losing an on-chain tx.
-            const transactionHashes = [...new Set([
-                ...(Array.isArray(prepared.transactionHashes)
-                    ? prepared.transactionHashes
-                    : prepared.transactionHash ? [prepared.transactionHash] : []),
-                transactionHash
-            ].map(value => value.toLowerCase()))];
-            const transactionAttempts = [
-                ...(Array.isArray(prepared.transactionAttempts)
-                    ? prepared.transactionAttempts.filter(attempt => attempt.hash !== transactionHash.toLowerCase())
-                    : []),
-                {
-                    hash: transactionHash.toLowerCase(),
-                    submissionId: reference.submissionId || null,
-                    operationId: prepared.operationId,
-                    from: /^0x[0-9a-fA-F]{40}$/.test(
-                        transactionMetadata?.from || prepared.submissionFrom || ''
-                    )
-                        ? (transactionMetadata?.from || prepared.submissionFrom).toLowerCase()
-                        : null,
-                    nonce: Number.isSafeInteger(Number(
-                        transactionMetadata?.nonce ?? prepared.submissionNonce
-                    ))
-                        ? Number(transactionMetadata?.nonce ?? prepared.submissionNonce)
-                        : null,
-                    observedAt: Date.now()
-                }
-            ];
-            const next = {
-                ...prepared,
-                phase: 'submitted',
-                transactionHash: transactionHashes[0],
-                transactionHashes,
-                transactionAttempts,
-                submissionOutcome: 'submitted',
-                ...(reference.submissionId && prepared.submissionId !== reference.submissionId
-                    ? { concurrentSubmissionObserved: true }
-                    : {})
-            };
-            if (reference.submissionId && prepared.submissionId === reference.submissionId) {
-                delete next.submissionId;
-                delete next.submissionOwner;
-                delete next.submissionStartedAt;
-                delete next.submissionFrom;
-                delete next.submissionNonce;
-                delete next.submissionNonceJournalRequired;
-            }
-            await this.commit({ ...this.runtime, preparedWithdrawal: next });
-            return next;
-        });
-    }
-
-    async currentLateWithdrawalAttempts() {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            return (this.runtime.lateWithdrawalAttempts || []).map(attempt => ({ ...attempt }));
-        });
-    }
-
-    async updateLateWithdrawalAttempt(operationId, transactionHash, changes = {}, {
-        expectedStatus = null
-    } = {}) {
-        await this.init();
-        const normalizedHash = String(transactionHash || '').toLowerCase();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const attempts = Array.isArray(this.runtime.lateWithdrawalAttempts)
-                ? this.runtime.lateWithdrawalAttempts
-                : [];
-            const index = attempts.findIndex(attempt =>
-                attempt.operationId === operationId
-                && String(attempt.transactionHash || '').toLowerCase() === normalizedHash);
-            if (index < 0) return null;
-            const current = attempts[index];
-            if (expectedStatus != null && current.status !== expectedStatus) {
-                throw new Error('The late withdrawal attempt changed while its receipt was being checked.');
-            }
-            if (LATE_WITHDRAWAL_TERMINAL_STATUSES.has(current.status)
-                && changes.status && changes.status !== current.status) {
-                return { ...current };
-            }
-            const nextAttempt = {
-                ...current,
-                ...changes,
-                updatedAt: Date.now()
-            };
-            const nextAttempts = [...attempts];
-            nextAttempts[index] = nextAttempt;
-            await this.commit({
-                ...this.runtime,
-                lateWithdrawalAttempts: retainAttemptHistory(
-                    nextAttempts,
-                    LATE_WITHDRAWAL_TERMINAL_STATUSES
-                )
-            });
-            return { ...nextAttempt };
-        });
-    }
-
-    async transferLateWithdrawalAttempt(attempt, record) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const detachesSelectedNote = this.runtime.deploymentId === attempt.deploymentId
-                && this.runtime.state
-                && Number(this.runtime.state.note_id) === Number(attempt.noteId);
-            const result = await transferBrowserLateWithdrawalAttempt({
-                operationId: attempt.operationId,
-                transactionHash: attempt.transactionHash,
-                deploymentId: attempt.deploymentId,
-                chainId: losslessChainId(attempt.chainId),
-                contractAddress: attempt.contractAddress,
-                noteId: Number(attempt.noteId)
-            }, record);
-            this.runtime = result.runtime;
-            this.withdrawals = await listBrowserWithdrawals(this.manifest.deployment_id);
-            if (detachesSelectedNote) this.activeLease = null;
-            this.notify();
-            return result;
-        });
-    }
-
-    async releaseBackgroundWithdrawalStartSubmission(submission, options = {}) {
-        await this.init();
-        const recordId = this.withdrawalRecordId(submission?.noteId);
-        let result = await releaseBrowserWithdrawalStartSubmission(
-            recordId,
-            submission,
-            options
-        );
-        // Test adapters and older embedders may provide a runtime persistence
-        // layer without the shared IndexedDB stores. The production path above
-        // atomically checks both owners; this fallback preserves that adapter
-        // contract without creating a gap between production ownership checks.
-        if (!result) {
-            await this.reload();
-            const prepared = this.runtime.preparedWithdrawal;
-            if (prepared?.submissionId === submission?.submissionId
-                && prepared.operationId === submission?.operationId) {
-                const released = options.replacementUnknown
-                    ? await this.releasePreparedWithdrawalReplacementClaim(
-                        submission,
-                        options.message || null
-                    )
-                    : await this.markPreparedWithdrawalRetryable(null, submission);
-                result = released ? { location: 'selected', runtime: this.runtime } : null;
-            }
-        }
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async resolveLateChallengedWithdrawalAttempt(attempt) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const attempts = Array.isArray(this.runtime.lateWithdrawalAttempts)
-                ? this.runtime.lateWithdrawalAttempts
-                : [];
-            const index = attempts.findIndex(entry =>
-                entry.operationId === attempt.operationId
-                && String(entry.transactionHash || '').toLowerCase()
-                    === String(attempt.transactionHash || '').toLowerCase()
-                && Number(entry.noteId) === Number(attempt.noteId));
-            if (index < 0) throw new Error('The challenged withdrawal attempt is no longer available.');
-            const currentAttempt = attempts[index];
-            if (LATE_WITHDRAWAL_TERMINAL_STATUSES.has(currentAttempt.status)) {
-                return { ...currentAttempt };
-            }
-            const selectedOwns = Number(this.runtime.state?.note_id) === Number(attempt.noteId);
-            const backgroundOwns = this.withdrawals.some(record =>
-                Number(record.noteId) === Number(attempt.noteId) && record.state);
-            if (!selectedOwns && !backgroundOwns) {
-                throw new Error('The challenged withdrawal has no recoverable private note.');
-            }
-            const clearanceReserved = currentAttempt.clearanceReserved === true
-                || currentAttempt.mode === 'mutual';
-            const preparedWithdrawal = selectedOwns && clearanceReserved
-                ? this.runtime.preparedWithdrawal || {
-                    phase: 'prepared',
-                    mode: currentAttempt.mode === 'mutual' ? 'mutual' : 'escape',
-                    operationId: currentAttempt.operationId,
-                    noteId: Number(currentAttempt.noteId),
-                    destination: currentAttempt.destination,
-                    withdrawalNullifier: currentAttempt.withdrawalNullifier || null,
-                    clearanceReserved: true,
-                    submissionOutcome: 'challenged',
-                    createdAt: Number(currentAttempt.observedAt || Date.now())
-                }
-                : this.runtime.preparedWithdrawal;
-            const nextAttempt = {
-                ...currentAttempt,
-                status: 'challenged',
-                resolvedAt: Date.now(),
-                error: null
-            };
-            const nextAttempts = attempts.map((entry, entryIndex) => {
-                if (entryIndex === index) return nextAttempt;
-                return Number(entry.noteId) === Number(currentAttempt.noteId)
-                    && entry.deploymentId === currentAttempt.deploymentId
-                    && !LATE_WITHDRAWAL_TERMINAL_STATUSES.has(entry.status)
-                    ? {
-                        ...entry,
-                        status: 'superseded',
-                        supersededBy: currentAttempt.transactionHash,
-                        resolvedAt: Date.now(),
-                        error: null
-                    }
-                    : entry;
-            });
-            await this.commit({
-                ...this.runtime,
-                preparedWithdrawal,
-                lateWithdrawalAttempts: retainAttemptHistory(
-                    nextAttempts,
-                    LATE_WITHDRAWAL_TERMINAL_STATUSES
-                )
-            });
-            return { ...nextAttempt };
-        });
-    }
-
-    async markPreparedWithdrawalRetryable(expectedTransactionHash = null, submission = null) {
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const prepared = this.runtime.preparedWithdrawal;
-            if (!prepared) return null;
-            const reference = submission && typeof submission === 'object' ? submission : null;
-            if (!expectedTransactionHash && (!reference?.operationId || !reference.submissionId)) {
-                throw new Error('The withdrawal retry is missing its durable operation identity.');
-            }
-            if (reference?.operationId && prepared.operationId !== reference.operationId) {
-                throw new Error('The withdrawal operation changed while MetaMask was open.');
-            }
-            const hashes = Array.isArray(prepared.transactionHashes)
-                ? prepared.transactionHashes
-                : prepared.transactionHash ? [prepared.transactionHash] : [];
-            if (expectedTransactionHash
-                && !hashes.some(hash => hash.toLowerCase() === expectedTransactionHash.toLowerCase())) {
-                throw new Error('The withdrawal transaction changed while its receipt was being checked.');
-            }
-            if (!expectedTransactionHash && reference.submissionId
-                && prepared.submissionId !== reference.submissionId) {
-                throw new Error('The withdrawal submission changed while MetaMask was open.');
-            }
-            const remainingHashes = expectedTransactionHash
-                ? hashes.filter(hash => hash.toLowerCase() !== expectedTransactionHash.toLowerCase())
-                : hashes;
-            const remainingAttempts = Array.isArray(prepared.transactionAttempts)
-                ? prepared.transactionAttempts.filter(attempt => !expectedTransactionHash
-                    || attempt.hash.toLowerCase() !== expectedTransactionHash.toLowerCase())
-                : [];
-            const releasesClaim = !expectedTransactionHash
-                && reference?.submissionId
-                && prepared.submissionId === reference.submissionId;
-            const survivingClaimPhase = prepared.submissionId && !releasesClaim
-                ? (prepared.submissionOutcome === 'ambiguous' || prepared.phase === 'ambiguous'
-                    ? 'ambiguous'
-                    : 'awaiting_wallet')
-                : 'prepared';
-            const next = {
-                ...prepared,
-                phase: remainingHashes.length
-                    ? 'submitted'
-                    : survivingClaimPhase,
-                transactionHashes: remainingHashes,
-                transactionAttempts: remainingAttempts,
-                submissionOutcome: remainingHashes.length
-                    ? 'submitted'
-                    : releasesClaim
-                        ? 'explicitly_rejected'
-                        : prepared.submissionId
-                            ? prepared.submissionOutcome
-                            : expectedTransactionHash ? 'reverted' : prepared.submissionOutcome
-            };
-            if (remainingHashes.length) {
-                next.transactionHash = remainingHashes[0];
-            } else {
-                delete next.transactionHash;
-                delete next.transactionHashes;
-            }
-            if (releasesClaim) {
-                delete next.submissionId;
-                delete next.submissionOwner;
-                delete next.submissionStartedAt;
-                delete next.submissionFrom;
-                delete next.submissionNonce;
-                delete next.submissionNonceJournalRequired;
-            }
-            await this.commit({ ...this.runtime, preparedWithdrawal: next });
-            return next;
-        });
-    }
-
-    async markPreparedWithdrawalMissingReceipts(expectedTransactionHashes) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const prepared = this.runtime.preparedWithdrawal;
-            if (!prepared) return null;
-            const normalize = values => [...values]
-                .map(value => String(value).toLowerCase())
-                .sort();
-            const hashes = Array.isArray(prepared.transactionHashes)
-                ? prepared.transactionHashes
-                : prepared.transactionHash ? [prepared.transactionHash] : [];
-            if (JSON.stringify(normalize(hashes))
-                !== JSON.stringify(normalize(expectedTransactionHashes || []))) {
-                throw new Error('The withdrawal transactions changed while their receipts were checked.');
-            }
-            // A second tab may already be replacing this transaction. Preserve
-            // that live claim rather than regressing its UI/state phase.
-            if (prepared.submissionId) return prepared;
-            const next = {
-                ...prepared,
-                phase: 'dropped_or_pending',
-                submissionOutcome: 'receipt_missing',
-                missingReceiptCheckedAt: Date.now()
-            };
-            await this.commit({ ...this.runtime, preparedWithdrawal: next });
-            return next;
-        });
-    }
-
-    async markPreparedWithdrawalAmbiguous(submission, message = null) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const prepared = this.runtime.preparedWithdrawal;
-            const reference = submission && typeof submission === 'object' ? submission : null;
-            if (!prepared || !reference?.submissionId || !reference.operationId
-                || prepared.submissionId !== reference.submissionId
-                || prepared.operationId !== reference.operationId) {
-                throw new Error('The withdrawal operation changed before its ambiguous result could be saved.');
-            }
-            const next = {
-                ...prepared,
-                phase: 'ambiguous',
-                submissionOutcome: 'ambiguous',
-                submissionError: message || 'MetaMask did not return a transaction ID.',
-                ambiguousAt: Date.now()
-            };
-            await this.commit({ ...this.runtime, preparedWithdrawal: next });
-            return next;
-        });
-    }
-
-    async releasePreparedWithdrawalReplacementClaim(submission, message = null) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const prepared = this.runtime.preparedWithdrawal;
-            if (!prepared || prepared.submissionId !== submission?.submissionId
-                || prepared.operationId !== submission?.operationId
-                || !Number.isSafeInteger(Number(submission?.replacementNonce))) {
-                throw new Error('The replacement wallet request changed before it could be released.');
-            }
-            const history = Array.isArray(prepared.ambiguousReplacements)
-                ? prepared.ambiguousReplacements
-                : [];
-            const next = {
-                ...prepared,
-                phase: 'dropped_or_pending',
-                submissionOutcome: 'replacement_result_unknown',
-                ambiguousReplacements: [...history, {
-                    submissionId: prepared.submissionId,
-                    nonce: Number(submission.replacementNonce),
-                    startedAt: prepared.submissionStartedAt,
-                    releasedAt: Date.now(),
-                    message: message || 'The wallet did not return a replacement transaction ID.'
-                }].slice(-8),
-                missingReceiptCheckedAt: Date.now()
-            };
-            delete next.submissionId;
-            delete next.submissionOwner;
-            delete next.submissionStartedAt;
-            delete next.submissionFrom;
-            delete next.submissionNonce;
-            delete next.submissionNonceJournalRequired;
-            delete next.submissionError;
-            await this.commit({ ...this.runtime, preparedWithdrawal: next });
-            return next;
-        });
-    }
-
-    async authorizePreparedWithdrawalRetry() {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const prepared = this.runtime.preparedWithdrawal;
-            if (!prepared || prepared.phase !== 'ambiguous' || !prepared.submissionId) {
-                throw new Error('There is no ambiguous wallet request to retry.');
-            }
-            const hashes = Array.isArray(prepared.transactionHashes)
-                ? prepared.transactionHashes
-                : prepared.transactionHash ? [prepared.transactionHash] : [];
-            if (hashes.length) throw new Error('Check the submitted transaction before retrying.');
-            const history = Array.isArray(prepared.ambiguousSubmissions)
-                ? prepared.ambiguousSubmissions
-                : [];
-            const next = {
-                ...prepared,
-                phase: 'prepared',
-                submissionOutcome: 'retry_authorized',
-                ambiguousSubmissions: [...history, {
-                    submissionId: prepared.submissionId,
-                    startedAt: prepared.submissionStartedAt,
-                    authorizedAt: Date.now()
-                }].slice(-8)
-            };
-            delete next.submissionId;
-            delete next.submissionOwner;
-            delete next.submissionStartedAt;
-            delete next.submissionFrom;
-            delete next.submissionNonce;
-            delete next.submissionNonceJournalRequired;
-            delete next.submissionError;
-            await this.commit({ ...this.runtime, preparedWithdrawal: next });
-            return next;
-        });
-    }
-
-    async clearPreparedWithdrawal({
-        force = false,
-        expectedNoteId = null,
-        expectedTransactionHashes = null
-    } = {}) {
+    async clearPreparedWithdrawal({ expectedNoteId = null } = {}) {
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             const prepared = this.runtime.preparedWithdrawal;
@@ -4109,108 +2676,18 @@ class BrowserWalletRuntime extends EventTarget {
                 && Number(prepared.noteId ?? prepared.public_inputs?.note_id) !== Number(expectedNoteId)) {
                 throw new Error('The selected withdrawal changed before it could be cleared.');
             }
-            const hashes = Array.isArray(prepared.transactionHashes)
-                ? prepared.transactionHashes
-                : prepared.transactionHash ? [prepared.transactionHash] : [];
-            if (expectedTransactionHashes) {
-                const normalize = values => [...values].map(value => value.toLowerCase()).sort();
-                if (JSON.stringify(normalize(hashes))
-                    !== JSON.stringify(normalize(expectedTransactionHashes))) {
-                    throw new Error('The withdrawal transactions changed before recovery completed.');
-                }
-            }
-            if (!force && (prepared.mode === 'mutual' || prepared.clearanceReserved === true)) {
+            if (prepared.mode === 'mutual' || prepared.clearanceReserved === true) {
                 throw new Error('This balance already has a mutual-close authorization and must remain withdrawal-only.');
             }
-            // Even force recovery must preserve a hashless MetaMask claim: its
-            // delayed callback still needs a durable owner in this exact note.
-            if (prepared.submissionId) {
-                throw new Error('A MetaMask withdrawal request is still unresolved. Close or finish that prompt before clearing this balance.');
+            if (prepared.solanaJournal?.stages?.some(stage => stage.phase === 'finalized')) {
+                throw new Error('This withdrawal already finalized on Solana. Resume it to record the result.');
             }
-            if (!force && hashes.length) {
-                throw new Error('This withdrawal may already be in MetaMask. Check its transaction status before canceling it.');
-            }
-            if (!force && await exitProofStillLive(prepared.releasedValidUntil ?? null,
+            if (await exitProofStillLive(prepared.releasedValidUntil ?? null,
                 () => this.readFinalizedChainTime())) {
                 throw exitProofFrozenError(prepared);
             }
             await this.commit({ ...this.runtime, preparedWithdrawal: null });
             return null;
-        });
-    }
-
-    async recoverPreparedWithdrawalSubmissionClaim() {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const prepared = this.runtime.preparedWithdrawal;
-            if (!prepared?.submissionId) return prepared || null;
-            const hashes = Array.isArray(prepared.transactionHashes)
-                ? prepared.transactionHashes
-                : prepared.transactionHash ? [prepared.transactionHash] : [];
-            if (hashes.length) return prepared;
-            // A reload cannot prove whether another tab still has MetaMask
-            // open. Preserve the claim until the provider returns a definite
-            // rejection or the user explicitly starts recovery.
-            return prepared;
-        });
-    }
-
-    async markPreparedWithdrawalUnknown(message = null) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const prepared = this.runtime.preparedWithdrawal;
-            if (!prepared?.submissionId) {
-                throw new Error('There is no wallet request waiting to be recovered.');
-            }
-            if (prepared.phase === 'ambiguous') return prepared;
-            const next = {
-                ...prepared,
-                phase: 'ambiguous',
-                submissionOutcome: 'ambiguous',
-                submissionError: message || 'The wallet prompt was closed before a transaction ID was saved.',
-                ambiguousAt: Date.now()
-            };
-            await this.commit({ ...this.runtime, preparedWithdrawal: next });
-            return next;
-        });
-    }
-
-    async resolveChallengedPreparedEscape(noteId, expectedTransactionHashes = []) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const prepared = this.runtime.preparedWithdrawal;
-            if (!prepared || prepared.mode !== 'escape' || prepared.clearanceReserved !== true
-                || Number(prepared.noteId ?? prepared.public_inputs?.note_id) !== Number(noteId)) {
-                throw new Error('The challenged escape no longer matches the selected balance.');
-            }
-            if (prepared.submissionId) {
-                throw new Error('A wallet request is still unresolved for this balance.');
-            }
-            const normalize = values => [...values].map(value => value.toLowerCase()).sort();
-            const hashes = Array.isArray(prepared.transactionHashes)
-                ? prepared.transactionHashes
-                : prepared.transactionHash ? [prepared.transactionHash] : [];
-            if (JSON.stringify(normalize(hashes)) !== JSON.stringify(normalize(expectedTransactionHashes))) {
-                throw new Error('The withdrawal transactions changed while the challenge was being checked.');
-            }
-            const next = {
-                phase: 'prepared',
-                mode: 'escape',
-                operationId: prepared.operationId,
-                noteId: Number(noteId),
-                destination: prepared.destination,
-                withdrawalNullifier: prepared.withdrawalNullifier
-                    || prepared.public_inputs?.withdrawal_nullifier
-                    || null,
-                clearanceReserved: true,
-                submissionOutcome: 'challenged',
-                createdAt: Number(prepared.createdAt || Date.now())
-            };
-            await this.commit({ ...this.runtime, preparedWithdrawal: next });
-            return next;
         });
     }
 
@@ -4228,18 +2705,14 @@ class BrowserWalletRuntime extends EventTarget {
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             const noteId = Number(details.noteId);
-            const phase = details.phase === 'challenged_unconfirmed'
-                ? 'challenged_unconfirmed'
-                : 'pending';
             const result = await detachBrowserEscapeWithdrawal({
                 recordId: this.withdrawalRecordId(noteId),
                 deploymentId: this.manifest.deployment_id,
-                chainId: losslessChainId(this.config.funding.chain_id),
+                chainId: canonicalChainId(this.config.funding.chain_id),
                 contractAddress: this.config.funding.contract_address,
                 mode: 'escape',
-                phase,
-                chainStatus: details.chainStatus
-                    || (phase === 'challenged_unconfirmed' ? 'active' : 'pending_withdrawal'),
+                phase: 'pending',
+                chainStatus: 'pending_withdrawal',
                 noteId,
                 destination: details.destination,
                 finalBalance: Number(details.finalBalance),
@@ -4247,7 +2720,6 @@ class BrowserWalletRuntime extends EventTarget {
                 challengeDeadline: Number(details.challengeDeadline),
                 transactionHash: details.transactionHash || null,
                 startBlockNumber: Number(details.startBlockNumber || 0),
-                challengeObservedBlock: Number(details.challengeObservedBlock || 0),
                 lastObservedBlock: Number(details.lastObservedBlock || 0),
                 createdAt: Number(details.createdAt || Date.now())
             });
@@ -4267,7 +2739,7 @@ class BrowserWalletRuntime extends EventTarget {
             const result = await detachBrowserClosedWithdrawal({
                 recordId: this.withdrawalRecordId(noteId),
                 deploymentId: this.manifest.deployment_id,
-                chainId: losslessChainId(this.config.funding.chain_id),
+                chainId: canonicalChainId(this.config.funding.chain_id),
                 contractAddress: this.config.funding.contract_address,
                 mode: details.mode,
                 noteId,
@@ -4280,180 +2752,6 @@ class BrowserWalletRuntime extends EventTarget {
                 clearanceReserved: details.clearanceReserved === true,
                 createdAt: Number(details.createdAt || Date.now()),
                 closedAt: Date.now()
-            });
-            this.runtime = result.runtime;
-            this.withdrawals = await listBrowserWithdrawals(this.manifest.deployment_id);
-            this.activeLease = null;
-            this.notify();
-            return result.withdrawal;
-        });
-    }
-
-    backgroundWithdrawalIdentity(record) {
-        return { recordId: record?.recordId, deploymentId: this.manifest.deployment_id,
-            chainId: losslessChainId(this.config.funding.chain_id), contractAddress: this.config.funding.contract_address,
-            noteId: Number(record?.noteId), mode: record?.mode, destination: record?.destination };
-    }
-
-    async repairUnsubmittedBackgroundWithdrawal(recordId, observedBlock, expectedRevision) {
-        await this.init();
-        await this.reload();
-        const record = this.withdrawals.find(entry => entry.recordId === recordId);
-        if (!record) return null;
-        const result = await repairBrowserUnsubmittedBackgroundWithdrawal(
-            this.backgroundWithdrawalIdentity(record), Number(observedBlock), expectedRevision);
-        await this.reload();
-        if (result && Number(result.revision) !== Number(expectedRevision)) this.notify();
-        return result;
-    }
-
-    async resolveBackgroundWithdrawalForRetry(recordId, evidence) {
-        await this.init();
-        await this.reload();
-        const record = this.withdrawals.find(entry => entry.recordId === recordId);
-        const result = await resolveBrowserBackgroundWithdrawalForRetry(
-            this.backgroundWithdrawalIdentity(record), evidence);
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async prepareBackgroundWithdrawal(recordId) {
-        await this.init();
-        await this.reload();
-        const record = structuredClone(this.withdrawals.find(entry => entry.recordId === recordId));
-        const identity = this.backgroundWithdrawalIdentity(record);
-        assertBrowserBackgroundWithdrawalAvailable(record, this.runtime, identity);
-        const state = record.state;
-        const config = this.config;
-        if (!sameChainId(state.chain_id, identity.chainId) || !sameFelt(state.contract_address, identity.contractAddress)) {
-            throw new Error('The saved private state belongs to a different vault.');
-        }
-        const nullifier = await this.worker.call('withdrawalNullifier', { state });
-        const savedNullifiers = [record.withdrawalNullifier, record.preparedWithdrawal?.withdrawalNullifier,
-            record.preparedWithdrawal?.public_inputs?.withdrawal_nullifier].filter(value => value != null);
-        if (savedNullifiers.some(value => !sameFelt(value, nullifier))) {
-            throw new Error('The saved withdrawal authorization does not match its private balance.');
-        }
-        // Deliberately outside the global wallet lock: a proof must not stall
-        // unrelated deposits, requests, or settlement in another tab.
-        const clearance = await this.remoteJson(`${config.funding.protocol_server_url}/v2/withdraw/clearance`, {
-            method: 'POST', headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ withdrawal_nullifier: nullifier })
-        });
-        const validUntil = exitProofValidUntil(nowSeconds());
-        const plan = await this.worker.call('prepareWithdrawal', {
-            config: config.wallet_core, state,
-            args: { mode: 'mutual', destination: identity.destination, clearance, conceded: '0',
-                valid_until: String(validUntil) }, provingKey: config.proving_keys.withdrawal
-        });
-        const inputs = plan.public_inputs;
-        const encodedDestination = Array.isArray(inputs?.destination)
-            ? `0x${inputs.destination.map(value => Number(value).toString(16).padStart(2, '0')).join('')}`
-            : inputs?.destination;
-        if (!plan.proof || Number(inputs?.note_id) !== identity.noteId
-            || !sameChainId(inputs?.chain_id, identity.chainId)
-            || !sameFelt(inputs?.contract_address, identity.contractAddress)
-            || Number(inputs?.valid_until) !== validUntil
-            || BigInt(inputs?.conceded ?? -1) !== 0n || !sameFelt(inputs?.next_nullifier ?? -1, 0)
-            || !sameFelt(inputs?.withdrawal_nullifier, nullifier)
-            || !sameFelt(inputs?.final_balance, state.current_balance)
-            || String(encodedDestination || '').toLowerCase() !== identity.destination.toLowerCase()
-            || inputs?.has_clearance !== true) {
-            throw new Error('The generated withdrawal proof does not match its saved balance and vault.');
-        }
-        Object.assign(plan, { destination: identity.destination, mode: 'mutual', phase: 'prepared',
-            operationId: uuid(), noteId: identity.noteId, withdrawalNullifier: nullifier,
-            clearanceReserved: true, stateAnchor: state.current_anchor,
-            releasedValidUntil: record.preparedWithdrawal?.releasedValidUntil ?? null,
-            createdAt: Number(record.createdAt || Date.now()) });
-        await saveBrowserBackgroundWithdrawalPlan(identity, record, plan);
-        await this.reload();
-        this.notify();
-        return plan;
-    }
-
-    async claimBackgroundWithdrawalSubmission(recordId, expectedOperationId) {
-        await this.init();
-        await this.reload();
-        const record = this.withdrawals.find(entry => entry.recordId === recordId);
-        const result = await claimBrowserBackgroundWithdrawalSubmission(
-            this.backgroundWithdrawalIdentity(record), expectedOperationId, this.ownerId);
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async rememberBackgroundWithdrawalSubmissionMetadata(submission, metadata) {
-        const result = await rememberBrowserBackgroundWithdrawalMetadata(submission, metadata);
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async markBackgroundWithdrawalAmbiguous(submission, message) {
-        const result = await markBrowserBackgroundWithdrawalAmbiguous(submission, message);
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async releaseBackgroundWithdrawalSubmission(submission) {
-        const result = await releaseBrowserBackgroundWithdrawalSubmission(submission);
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async cancelBackgroundWithdrawalPreparation(recordId) {
-        await this.init();
-        await this.reload();
-        const record = this.withdrawals.find(entry => entry.recordId === recordId);
-        if (!record) throw new Error('This saved withdrawal is no longer available.');
-        const submission = { ...this.backgroundWithdrawalIdentity(record),
-            submissionId: record.startSubmissionId, operationId: record.startOperationId };
-        const result = await releaseBrowserBackgroundWithdrawalSubmission(submission, { requireNoNonce: true });
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async rememberBackgroundWithdrawalTransaction(hash, submission, metadata = null) {
-        const result = await rememberBrowserBackgroundWithdrawalTransaction(hash, submission, metadata);
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async parkPreparedWithdrawal() {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const prepared = this.runtime.preparedWithdrawal;
-            const noteId = Number(this.runtime.state?.note_id);
-            if (!prepared || (prepared.mode !== 'mutual' && prepared.clearanceReserved !== true)
-                || !Number.isFinite(noteId)) {
-                throw new Error('There is no withdrawal-only balance to set aside.');
-            }
-            const hashes = Array.isArray(prepared.transactionHashes)
-                ? prepared.transactionHashes
-                : prepared.transactionHash ? [prepared.transactionHash] : [];
-            if (!['reserving', 'prepared'].includes(prepared.phase || 'prepared')
-                || prepared.submissionId || hashes.length) {
-                throw new Error('Check the submitted withdrawal before setting this balance aside.');
-            }
-            const result = await parkBrowserWithdrawal({
-                recordId: this.withdrawalRecordId(noteId),
-                deploymentId: this.manifest.deployment_id,
-                chainId: losslessChainId(this.config.funding.chain_id),
-                contractAddress: this.config.funding.contract_address,
-                mode: prepared.mode,
-                phase: 'parked',
-                noteId,
-                destination: prepared.destination,
-                finalBalance: Number(prepared.public_inputs?.final_balance
-                    ?? this.runtime.state.current_balance),
-                createdAt: Number(prepared.createdAt || Date.now())
             });
             this.runtime = result.runtime;
             this.withdrawals = await listBrowserWithdrawals(this.manifest.deployment_id);
@@ -4487,237 +2785,6 @@ class BrowserWalletRuntime extends EventTarget {
             await this.reload();
             const record = this.withdrawals.find(entry => entry.recordId === recordId);
             return record ? structuredClone(record) : null;
-        });
-    }
-
-    async claimBackgroundWithdrawalStartReplacement(recordId, expectedFrom) {
-        await this.init();
-        const result = await claimBrowserWithdrawalStartReplacement(
-            recordId,
-            this.ownerId,
-            expectedFrom
-        );
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async claimWithdrawalFinalization(recordId) {
-        await this.init();
-        const result = await claimBrowserWithdrawalFinalization(
-            recordId,
-            this.ownerId
-        );
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async claimWithdrawalFinalizationReplacement(recordId, expectedFrom) {
-        await this.init();
-        const result = await claimBrowserWithdrawalFinalizationReplacement(
-            recordId,
-            this.ownerId,
-            expectedFrom
-        );
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async rememberWithdrawalFinalization(
-        recordId,
-        transactionHash,
-        submission = null,
-        transactionMetadata = null
-    ) {
-        await this.init();
-        const result = await rememberBrowserWithdrawalFinalization(
-            recordId,
-            transactionHash,
-            submission,
-            transactionMetadata
-        );
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async rememberWithdrawalFinalizationSubmissionMetadata(
-        recordId,
-        submission,
-        transactionMetadata
-    ) {
-        await this.init();
-        const result = await rememberBrowserWithdrawalFinalizationSubmissionMetadata(
-            recordId,
-            submission,
-            transactionMetadata
-        );
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async releaseWithdrawalFinalization(recordId, options = {}) {
-        await this.init();
-        const result = await releaseBrowserWithdrawalFinalization(recordId, options);
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async markWithdrawalFinalizationMissingReceipts(recordId, expectedTransactionHashes) {
-        await this.init();
-        const result = await markBrowserWithdrawalFinalizationMissingReceipts(
-            recordId,
-            expectedTransactionHashes
-        );
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async releaseWithdrawalFinalizationReplacementClaim(
-        recordId,
-        submission,
-        message = null
-    ) {
-        await this.init();
-        const result = await releaseBrowserWithdrawalFinalizationReplacementClaim(
-            recordId,
-            submission,
-            message
-        );
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async markWithdrawalFinalizationAmbiguous(recordId, submission, message = null) {
-        await this.init();
-        const result = await markBrowserWithdrawalFinalizationAmbiguous(
-            recordId,
-            submission,
-            message
-        );
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async markWithdrawalFinalizationUnknown(recordId) {
-        await this.init();
-        await this.reload();
-        const record = this.withdrawals.find(entry => entry.recordId === recordId);
-        if (!record?.finalizeSubmissionId || !record.finalizeOperationId) {
-            throw new Error('There is no finalization wallet request waiting to be recovered.');
-        }
-        if (record.phase === 'ambiguous') return record;
-        return this.markWithdrawalFinalizationAmbiguous(recordId, {
-            recordId,
-            submissionId: record.finalizeSubmissionId,
-            operationId: record.finalizeOperationId,
-            generation: Number(record.finalizeGeneration || 0),
-            deploymentId: record.deploymentId,
-            chainId: losslessChainId(record.chainId),
-            contractAddress: record.contractAddress,
-            noteId: Number(record.noteId),
-            destination: record.destination
-        }, 'The wallet prompt was closed before a transaction ID was saved.');
-    }
-
-    async resolveChallengedWithdrawalFinalization(recordId, {
-        expectedRevision = null,
-        observedBlock = null
-    } = {}) {
-        await this.init();
-        await this.reload();
-        const record = this.withdrawals.find(entry => entry.recordId === recordId);
-        if (!record?.finalizeSubmissionId || !record.finalizeOperationId) {
-            throw new Error('There is no challenged wallet prompt to release.');
-        }
-        const result = await resolveBrowserChallengedFinalization(recordId, {
-            recordId,
-            submissionId: record.finalizeSubmissionId,
-            operationId: record.finalizeOperationId,
-            generation: Number(record.finalizeGeneration || 0),
-            deploymentId: record.deploymentId,
-            chainId: losslessChainId(record.chainId),
-            contractAddress: record.contractAddress,
-            noteId: Number(record.noteId),
-            destination: record.destination
-        }, { expectedRevision, observedBlock });
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async authorizeWithdrawalFinalizationRetry(recordId) {
-        await this.init();
-        const result = await authorizeBrowserWithdrawalFinalizationRetry(recordId);
-        await this.reload();
-        this.notify();
-        return result;
-    }
-
-    async restoreWithdrawal(recordId, {
-        expectedRevision = null,
-        observedBlock = null
-    } = {}) {
-        await this.init();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const record = this.withdrawals.find(entry => entry.recordId === recordId);
-            if (!record) throw new Error('The recoverable private balance is no longer available.');
-            if (expectedRevision == null || Number(record.revision) !== Number(expectedRevision)) {
-                throw new Error('The withdrawal changed after its on-chain status was checked. Check it again before selecting this balance.');
-            }
-            const chainFloor = Math.max(
-                Number(record.startBlockNumber || 0),
-                Number(record.lastObservedBlock || 0)
-            );
-            if (observedBlock == null || Number(observedBlock) < chainFloor) {
-                throw new Error('The connected RPC has not caught up to this withdrawal. Check it again before selecting this balance.');
-            }
-            // C3: a balance whose exit proof can still land is never selected
-            // for requests again until that proof is dead.
-            if (await exitProofStillLive(record.preparedWithdrawal?.releasedValidUntil ?? null,
-                () => this.readFinalizedChainTime())) {
-                throw exitProofFrozenError(record.preparedWithdrawal);
-            }
-            const runtime = await restoreBrowserWithdrawal(recordId, {
-                deploymentId: this.manifest.deployment_id,
-                chainId: losslessChainId(this.config.funding.chain_id),
-                contractAddress: this.config.funding.contract_address
-            }, expectedRevision);
-            this.runtime = runtime;
-            this.withdrawals = await listBrowserWithdrawals(this.manifest.deployment_id);
-            this.notify();
-            return this.walletStatus();
-        });
-    }
-
-    async archiveNote(reason = 'closed', expectedNoteId = null) {
-        await this.init();
-        if (expectedNoteId == null) {
-            throw new Error('Archiving a private note requires its exact note identity.');
-        }
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const noteId = expectedNoteId ?? this.runtime.state?.note_id;
-            if (reason === 'expiry-claimed' && this.activeLease?.inFlight > 0) {
-                throw new Error('Finish the current response before starting a new private balance.');
-            }
-            this.runtime = await archiveBrowserWallet(reason, noteId);
-            this.withdrawals = await listBrowserWithdrawals(this.manifest.deployment_id);
-            if (reason === 'expiry-claimed' && this.settlementTimer) {
-                clearTimeout(this.settlementTimer);
-                this.settlementTimer = null;
-            }
-            this.activeLease = null;
-            this.notify();
-            return this.walletStatus();
         });
     }
 }

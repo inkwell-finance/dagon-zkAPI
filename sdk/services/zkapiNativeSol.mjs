@@ -2,7 +2,29 @@ import { browserSdkTransport } from '../configure.js';
 import { canonicalChainId, sameChainId } from './zkapiLedgerIdentity.mjs';
 import { base58Decode, base58Encode, inspectPreparedSolanaMessage }
     from './zkapiSolanaTransport.mjs';
-import { parseUnits } from './zkapiNativeEth.mjs';
+
+export function parseUnits(value, decimals) {
+    const match = String(value).trim().match(new RegExp(`^(\\d+)(?:\\.(\\d{0,${decimals}}))?$`));
+    if (!match) throw new Error(`Enter a positive amount with no more than ${decimals} decimal places.`);
+    return BigInt(match[1]) * (10n ** BigInt(decimals))
+        + BigInt((match[2] || '').padEnd(decimals, '0') || '0');
+}
+
+export function formatUnits(value, decimals) {
+    const amount = BigInt(value);
+    if (amount < 0n) throw new Error('Amounts cannot be negative.');
+    const scale = 10n ** BigInt(decimals);
+    const fraction = (amount % scale).toString().padStart(decimals, '0').replace(/0+$/, '');
+    return `${amount / scale}${fraction ? `.${fraction}` : ''}`;
+}
+
+/** The SOL/USD quote a proved request committed to in its payload. */
+export function requestBillingQuote(request) {
+    try {
+        const payload = typeof request?.payload === 'string' ? JSON.parse(request.payload) : request?.payload;
+        return payload?.billing_quote || null;
+    } catch { return null; }
+}
 
 export const LAMPORTS_PER_SOL = 1_000_000_000n;
 const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
@@ -20,7 +42,6 @@ const NOTE_STATUSES = new Map([
 ]);
 const FELT = /^0x[0-9a-f]{64}$/i;
 const FEED = /^0x[0-9a-f]{64}$/i;
-const unsigned = value => /^(?:0|[1-9]\d*)$/.test(String(value));
 const signed = value => /^(?:0|-?[1-9]\d*)$/.test(String(value));
 
 function exactInteger(value, label, { minimum = null, maximum = null } = {}) {
@@ -75,7 +96,7 @@ export function validateSolanaFunding(funding) {
         [funding.pyth_receiver_program, 'Pyth receiver program'],
         [funding.pyth_price_account, 'Pyth price account']
     ]) account(value, label);
-    trustedRpcUrl(funding.rpc_url || funding.demo_rpc_url);
+    trustedRpcUrl(funding.rpc_url);
     if (!Number.isSafeInteger(funding.pyth_max_age_seconds)
         || funding.pyth_max_age_seconds < 1 || funding.pyth_max_age_seconds > 60
         || !Number.isSafeInteger(funding.pyth_max_confidence_bps)
@@ -85,31 +106,67 @@ export function validateSolanaFunding(funding) {
     return funding;
 }
 
+// The exact field set of the server's `BillingQuote`
+// (crates/zkapi-serverd/src/billing.rs, `#[serde(deny_unknown_fields)]`). The
+// quote is bound verbatim into the request proof's payload, so no field may be
+// added, renamed or retyped.
+export const SOLANA_QUOTE_FIELDS = Object.freeze(['asset', 'source', 'credit_unit', 'base_units_per_asset',
+    'chain_id', 'deployment_binding', 'backend', 'network', 'vault', 'feed_id', 'feed_account',
+    'receiver_program', 'price', 'exponent', 'confidence', 'publish_time', 'expires_at', 'posted_slot']);
+export const PYTH_QUOTE_SOURCE = 'pyth_solana_receiver';
+const DECIMAL_U64 = /^(?:0|[1-9]\d{0,19})$/;
+const FELT_HEX = /^0x[0-9a-f]{1,64}$/i;
+
+function quoteDecimal(value, label, minimum) {
+    if (typeof value !== 'string' || !DECIMAL_U64.test(value)) {
+        throw new Error(`${label} must be a canonical decimal string.`);
+    }
+    return exactInteger(value, label, { minimum, maximum: (1n << 64n) - 1n });
+}
+
+function quoteNumber(value, label, minimum, maximum) {
+    if (typeof value !== 'number') throw new Error(`${label} must be a JSON integer.`);
+    return exactInteger(value, label, { minimum, maximum });
+}
+
 export function validateSolanaQuote(quote, funding, {
     now = Math.floor(Date.now() / 1000), allowExpired = false
 } = {}) {
     validateSolanaFunding(funding);
-    const price = exactInteger(quote?.price, 'Pyth price', { minimum: 1, maximum: (1n << 63n) - 1n });
-    const confidence = exactInteger(quote?.confidence, 'Pyth confidence', { minimum: 0, maximum: (1n << 64n) - 1n });
-    const exponent = exactInteger(quote?.exponent, 'Pyth exponent', { minimum: -18, maximum: 18 });
-    const publishedAt = exactInteger(quote?.published_at, 'Pyth publication time', { minimum: 1, maximum: MAX_SAFE });
-    const expiresAt = exactInteger(quote?.expires_at, 'Pyth expiry time', { minimum: 1, maximum: MAX_SAFE });
-    const postedSlot = exactInteger(quote?.posted_slot, 'Pyth posted slot', { minimum: 1, maximum: (1n << 64n) - 1n });
-    const lower = price - confidence;
-    if (!quote || quote.asset !== 'native_sol' || quote.source !== 'pyth_receiver'
+    const invalid = () => new Error('The SOL/USD quote is invalid or stale. Please check again.');
+    if (!quote || typeof quote !== 'object' || Array.isArray(quote)
+        || Object.keys(quote).length !== SOLANA_QUOTE_FIELDS.length
+        || !SOLANA_QUOTE_FIELDS.every(field => Object.hasOwn(quote, field))) {
+        throw invalid();
+    }
+    let price, confidence, publishTime, expiresAt;
+    try {
+        price = quoteDecimal(quote.price, 'Pyth price', 1);
+        confidence = quoteDecimal(quote.confidence, 'Pyth confidence', 0);
+        quoteDecimal(quote.chain_id, 'Quote chain ID', 0);
+        quoteNumber(quote.base_units_per_asset, 'SOL asset scale', 1, MAX_SAFE);
+        quoteNumber(quote.exponent, 'Pyth exponent', -18, 18);
+        publishTime = quoteNumber(quote.publish_time, 'Pyth publication time', 1, MAX_SAFE);
+        expiresAt = quoteNumber(quote.expires_at, 'Pyth expiry time', 1, MAX_SAFE);
+        quoteNumber(quote.posted_slot, 'Pyth posted slot', 0, MAX_SAFE);
+    } catch {
+        throw invalid();
+    }
+    if (quote.asset !== 'native_sol' || quote.source !== PYTH_QUOTE_SOURCE
         || quote.credit_unit !== 'lamports'
-        || String(quote.base_units_per_asset) !== String(LAMPORTS_PER_SOL)
+        || BigInt(quote.base_units_per_asset) !== LAMPORTS_PER_SOL
         || !sameChainId(quote.chain_id, funding.chain_id)
-        || String(quote.deployment_binding).toLowerCase() !== funding.contract_address.toLowerCase()
+        || typeof quote.deployment_binding !== 'string' || !FELT_HEX.test(quote.deployment_binding)
+        || BigInt(quote.deployment_binding) !== BigInt(funding.contract_address)
         || quote.backend !== funding.ledger_backend || quote.network !== funding.network
         || quote.vault !== funding.vault_state || quote.receiver_program !== funding.pyth_receiver_program
-        || quote.price_account !== funding.pyth_price_account
-        || String(quote.feed_id).toLowerCase() !== funding.pyth_feed_id.toLowerCase()
-        || expiresAt !== publishedAt + BigInt(funding.pyth_max_age_seconds)
-        || publishedAt > BigInt(now) || (!allowExpired && expiresAt <= BigInt(now))
-        || lower <= 0n || confidence * 10_000n > price * BigInt(funding.pyth_max_confidence_bps)
-        || postedSlot <= 0n || exponent < -18n || exponent > 18n) {
-        throw new Error('The SOL/USD quote is invalid or stale. Please check again.');
+        || quote.feed_account !== funding.pyth_price_account
+        || quote.feed_id !== funding.pyth_feed_id
+        || price > (1n << 63n) - 1n
+        || expiresAt !== publishTime + BigInt(funding.pyth_max_age_seconds)
+        || publishTime > BigInt(now) || (!allowExpired && expiresAt <= BigInt(now))
+        || confidence >= price || confidence * 10_000n > price * BigInt(funding.pyth_max_confidence_bps)) {
+        throw invalid();
     }
     return quote;
 }
@@ -141,15 +198,15 @@ export function solanaUsdMicros(amount, quote) {
     return units * price.numerator * 1_000_000n / (LAMPORTS_PER_SOL * price.denominator);
 }
 
+/** Byte-for-byte the same quote, field by field (its JSON is proof-bound). */
 export function sameSolanaQuote(left, right) {
-    return ['asset', 'source', 'credit_unit', 'base_units_per_asset', 'chain_id', 'deployment_binding',
-        'backend', 'network', 'vault', 'receiver_program', 'price_account', 'feed_id', 'price',
-        'confidence', 'exponent', 'published_at', 'expires_at', 'posted_slot']
-        .every(key => String(left?.[key]).toLowerCase() === String(right?.[key]).toLowerCase());
+    return Boolean(left && right) && SOLANA_QUOTE_FIELDS.every(key => left[key] === right[key])
+        && Object.keys(left).length === SOLANA_QUOTE_FIELDS.length
+        && Object.keys(right).length === SOLANA_QUOTE_FIELDS.length;
 }
 
 export async function solanaRpc(funding, method, params, signal) {
-    const response = await browserSdkTransport(funding.demo_rpc_url || funding.rpc_url, {
+    const response = await browserSdkTransport(funding.rpc_url, {
         method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'omit',
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal, cache: 'no-store'
     }, { preferProxy: true });

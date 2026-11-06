@@ -1,5 +1,5 @@
-// EIP-1193 providers may reject with a serialized JSON-RPC object instead of
-// an Error. Keep the useful message and metadata without printing the object.
+// Wallet Standard wallets may reject with a serialized error object instead of
+// an Error. Keep the useful message without printing the object.
 export function walletErrorMessage(error, fallback = 'The wallet could not complete this request.') {
     const seen = new Set();
     const message = (value, depth = 0) => {
@@ -17,22 +17,4 @@ export function walletErrorMessage(error, fallback = 'The wallet could not compl
         return null;
     };
     return message(error) || fallback;
-}
-
-export function normalizeWalletError(error, fallback) {
-    if (error instanceof Error) {
-        error.message = walletErrorMessage(error, fallback);
-        return error;
-    }
-    const normalized = new Error(walletErrorMessage(error, fallback), { cause: error });
-    for (const field of [
-        'code', 'data', 'status', 'transactionHash', 'transactionReceipt',
-        'transactionStage', 'broadcastPossible', 'withdrawalNeedsAction'
-    ]) {
-        if (error?.[field] != null) normalized[field] = error[field];
-    }
-    if (typeof error?.shortMessage === 'string' && error.shortMessage !== '[object Object]') {
-        normalized.shortMessage = error.shortMessage;
-    }
-    return normalized;
 }

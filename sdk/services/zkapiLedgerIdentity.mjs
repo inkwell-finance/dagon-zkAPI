@@ -1,6 +1,10 @@
 const U64_MAX = 18_446_744_073_709_551_615n;
 
-/** Parse a protocol chain identity without ever passing through Number. */
+/**
+ * Parse a protocol chain identity without ever passing through Number. Solana
+ * chain IDs are full u64 values derived from the genesis hash, so they are
+ * carried as canonical decimal strings.
+ */
 export function chainIdBigInt(value, label = 'chain ID') {
     let parsed;
     if (typeof value === 'bigint') {
@@ -24,16 +28,6 @@ export function chainIdBigInt(value, label = 'chain ID') {
 /** Canonical, lossless comparison/storage key for a protocol chain identity. */
 export function canonicalChainId(value, label = 'chain ID') {
     return chainIdBigInt(value, label).toString(10);
-}
-
-/**
- * Preserve legacy safe-number manifests while retaining string identities for
- * Solana deployments. This avoids a storage migration for EVM users and never
- * narrows an exact decimal string through Number.
- */
-export function losslessChainId(value, label = 'chain ID') {
-    const canonical = canonicalChainId(value, label);
-    return typeof value === 'number' ? Number(canonical) : canonical;
 }
 
 export function sameChainId(left, right) {

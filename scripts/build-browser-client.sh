@@ -5,7 +5,6 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 protocol_rust="$repo_root/protocol/rust"
 wasm_target="$protocol_rust/target/wasm32-unknown-unknown/release/zkapi_browser.wasm"
 wasm_output="$repo_root/sdk/wasm"
-dist_root="${1:-$repo_root/dist/browser}"
 
 wasm_bindgen_bin="${WASM_BINDGEN_BIN:-$(command -v wasm-bindgen || true)}"
 if [[ -z "$wasm_bindgen_bin" ]]; then
@@ -32,7 +31,6 @@ mkdir -p "$wasm_output"
   --omit-default-module-path
 
 node "$repo_root/scripts/sync-sdk-assets.mjs"
-node "$repo_root/scripts/build-sdk.mjs" --out-dir "$dist_root"
 
-echo "Browser SDK assets built at $dist_root"
-echo "The host application owns the chat UI and deployment."
+echo "Browser WASM rebuilt and SDK assets synced in $repo_root/sdk."
+echo "Build a deployment's browser bundle with: npm run build:sdk -- --identity <network|identity.json> --deployment <deployment.json>"

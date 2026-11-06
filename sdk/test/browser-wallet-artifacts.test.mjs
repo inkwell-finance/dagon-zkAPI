@@ -119,76 +119,29 @@ test('static proving keys match the concession-exit development setup hashes', (
     );
 });
 
-test('browser config pins the fresh native ETH note-bound Sepolia deployment', () => {
-    const config = JSON.parse(fs.readFileSync(path.join(__dirname, 'assets/config/sepolia.json'), 'utf8'));
-    assert.equal(config.deployment_manifest_url, 'https://zkapi-sepolia.openanonymity.ai/config.json');
-    assert.deepEqual(config.allowed_deployment_manifest_urls, [config.deployment_manifest_url]);
-    assert.equal(config.trusted_deployment.chain_id, 11155111);
-    assert.equal(config.trusted_deployment.deployment_id, 'zkapi-native-eth-sepolia-note-bound-v1-fresh-20260930');
-    assert.equal(config.trusted_deployment.contract_address.toLowerCase(), '0x49fa19f9bdece7a48ebc7749fd69ad40f577590f');
-    assert.equal(config.trusted_deployment.billing_token_address, null);
-    assert.equal(config.trusted_deployment.protocol_server_url, 'https://zkapi-sepolia.openanonymity.ai');
-    assert.equal(config.trusted_deployment.indexer_url, config.trusted_deployment.protocol_server_url);
-    assert.equal(config.trusted_deployment.circuit_id, 'zkapi-v2-concession-v1');
-    assert.equal(config.deployment_status, undefined);
-    assert.equal(config.trusted_deployment.request_proving_key_sha256, sha256(path.join(root, 'assets/proofs/request.pk')));
-    assert.equal(config.trusted_deployment.withdrawal_proving_key_sha256, sha256(path.join(root, 'assets/proofs/withdrawal.pk')));
-    assert.equal(config.proving_keys_base_url, './proofs/');
-    assert.equal(config.deployment_api_proxy_path, '/zkapi-deployment/');
-    assert.equal(config.trusted_deployment.billing_asset, 'native_eth');
-    assert.equal(config.trusted_deployment.billing_unit, 'gwei');
-    assert.equal(config.trusted_deployment.native_asset_wei_per_unit, '1000000000');
-    assert.equal(config.trusted_deployment.rpc_url, 'https://ethereum-sepolia-rpc.publicnode.com');
-    assert.equal(config.trusted_deployment.native_price_feed_address.toLowerCase(), '0x694aa1769357215de4fac081bf1f309adc325306');
-    assert.equal(config.trusted_deployment.native_price_feed_decimals, 8);
-    assert.equal(config.trusted_deployment.native_price_max_age_seconds, 4500);
-    assert.equal(config.credits_per_usd, null);
-    assert.equal(config.suggested_deposit_amount, undefined);
-    assert.equal(config.billing_token_symbol, 'ETH');
-    assert.equal(config.billing_token_decimals, 9);
-    assert.equal(config.require_oa_key_source, true);
-    assert.equal(config.openrouter_requests_per_key, undefined);
-});
-
-test('mainnet browser config pins the finalized native ETH note-bound deployment', () => {
-    const config = JSON.parse(fs.readFileSync(path.join(__dirname, 'assets/config/mainnet.json'), 'utf8'));
-    assert.equal(config.deployment_manifest_url, 'https://zkapi-mainnet.openanonymity.ai/config.json');
-    assert.deepEqual(config.allowed_deployment_manifest_urls, [config.deployment_manifest_url]);
-    assert.equal(config.trusted_deployment.deployment_id, 'zkapi-native-eth-mainnet-note-bound-v1-fresh-20260930');
-    assert.equal(config.trusted_deployment.chain_id, 1);
-    assert.equal(config.deployment_status, undefined);
-    assert.equal(config.trusted_deployment.circuit_id, 'zkapi-v2-concession-v1');
-    assert.equal(config.trusted_deployment.contract_address.toLowerCase(), '0x4386fdbda35d995beb3bf8625118ec5982ec81fe');
-    assert.equal(config.trusted_deployment.protocol_server_url, 'https://zkapi-mainnet.openanonymity.ai');
-    assert.equal(config.trusted_deployment.indexer_url, config.trusted_deployment.protocol_server_url);
-    assert.deepEqual(config.trusted_deployment.state_signing_key, {
-        x: '0x2094c5f9e183a8aef5be682556a17aa4dbafdb03fd6e6a97d75a03efed2fe5a4',
-        y: '0x11c7bbbeb288a09378e6721bd06ed5cc95b87046ff8cf6733e46ced0af1300d7'
-    });
-    assert.deepEqual(config.trusted_deployment.clearance_signing_key, {
-        x: '0x12d2b4547d9de0a359fc26abcf5e66cd359be83b53167850c9070540a8045cec',
-        y: '0x11cc3f621d6d39b557b4bb64826ebaaeda04f98910f116e307d6650177dead82'
-    });
-    assert.equal(config.trusted_deployment.request_proving_key_sha256, sha256(path.join(root, 'assets/proofs/request.pk')));
-    assert.equal(config.trusted_deployment.withdrawal_proving_key_sha256, sha256(path.join(root, 'assets/proofs/withdrawal.pk')));
-    assert.equal(config.proving_keys_base_url, './proofs/');
-    assert.equal(config.deployment_api_proxy_path, '/zkapi-deployment/');
-    assert.equal(config.trusted_deployment.billing_asset, 'native_eth');
-    assert.equal(config.trusted_deployment.billing_unit, 'gwei');
-    assert.equal(config.trusted_deployment.billing_token_address, null);
-    assert.equal(config.trusted_deployment.native_asset_wei_per_unit, '1000000000');
-    assert.equal(config.trusted_deployment.rpc_url, 'https://ethereum-rpc.publicnode.com');
-    assert.equal(config.trusted_deployment.native_price_feed_address.toLowerCase(), '0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419');
-    assert.equal(config.trusted_deployment.native_price_feed_decimals, 8);
-    assert.equal(config.trusted_deployment.native_price_max_age_seconds, 4500);
-    assert.equal(config.trusted_deployment.openrouter_inference_base, 'https://openrouter.ai/api/v1');
-    assert.equal(config.trusted_deployment.verifier_url, 'https://verifier2.openanonymity.ai');
-    assert.equal(config.credits_per_usd, null);
-    assert.equal(config.suggested_deposit_amount, undefined);
-    assert.equal(config.billing_token_symbol, 'ETH');
-    assert.equal(config.billing_token_decimals, 9);
-    assert.equal(config.require_oa_key_source, true);
-    assert.equal(config.openrouter_requests_per_key, undefined);
+test('packaged Solana configs are generated copies of solana/profile, never hand-written values', () => {
+    const repository = path.resolve(root, '..');
+    assert.equal(
+        sha256(path.join(root, 'assets/config/profile.json')),
+        sha256(path.join(repository, 'solana/profile/shared.json'))
+    );
+    const sources = fs.readdirSync(path.join(repository, 'solana/profile')).filter(name => name.endsWith('.identity.json')).sort();
+    const packaged = fs.readdirSync(path.join(root, 'assets/config')).sort();
+    assert.deepEqual(packaged, ['profile.json', ...sources].sort());
+    for (const name of sources) {
+        assert.equal(sha256(path.join(root, 'assets/config', name)), sha256(path.join(repository, 'solana/profile', name)), name);
+    }
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, 'assets/manifest.json'), 'utf8'));
+    const profile = JSON.parse(fs.readFileSync(path.join(root, 'assets/config/profile.json'), 'utf8'));
+    assert.equal(manifest.circuitId, profile.protocol.circuit_id);
+    for (const name of packaged) {
+        assert.equal(manifest.files[`assets/config/${name}`], sha256(path.join(root, 'assets/config', name)), name);
+    }
+    // No deployment trust anchor is checked in: each build derives it.
+    for (const file of fs.readdirSync(path.join(root, 'services'))) {
+        const source = fs.readFileSync(path.join(root, 'services', file), 'utf8');
+        assert.doesNotMatch(source, /7NdY5ZVP2He8gSiDHZbkfmNfSgKWV2tkZmZgty2C1d8H|rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ/, file);
+    }
 });
 
 test('browser direct requests derive output headroom from the proof-backed dollar budget', async () => {
@@ -222,63 +175,21 @@ test('browser direct requests derive output headroom from the proof-backed dolla
     );
 });
 
-test('wallet transactions use a bounded preflight gas limit and leave EIP-1559 fees to MetaMask', async () => {
-    const gas = await import(pathToFileURL(path.join(__dirname, 'services/zkapiGas.mjs')));
-    assert.equal(gas.bufferedGasLimit('0x6d094d'), '0x839b46');
-    assert.throws(
-        () => gas.bufferedGasLimit(16_000_000n),
-        error => error.code === 'transaction_gas_limit_exceeded'
-    );
-    assert.throws(() => gas.bufferedGasLimit('0x0'), /invalid gas estimate/);
-    const contractErrors = await import(pathToFileURL(path.join(__dirname, 'services/zkapiContractError.mjs')));
-    const staleRoot = contractErrors.contractEstimateError({
-        message: 'execution reverted',
-        data: { originalError: { data: '0x607447de' } }
-    });
-    assert.equal(staleRoot.code, 'stale_root');
-    assert.match(staleRoot.message, /vault changed/i);
-    const unknown = contractErrors.contractEstimateError({ message: 'execution reverted' });
-    assert.equal(unknown.code, 'gas_estimation_failed');
-    assert.match(unknown.message, /Transaction simulation failed: execution reverted/);
-    assert.doesNotMatch(unknown.message, /market|gas price/i);
+test('the escape window shown to the user is the finalized vault challenge period', () => {
     const client = fs.readFileSync(path.join(__dirname, 'services/zkapiClient.js'), 'utf8');
-    const send = sourceMethodAt(client, 'async sendContractTransaction(');
-    const estimateIndex = send.indexOf("method: 'eth_estimateGas'");
-    const gasIndex = send.indexOf('transaction.gas = bufferedGasLimit(estimate)');
-    const submitIndex = send.indexOf("method: 'eth_sendTransaction'");
-    assert.ok(estimateIndex >= 0 && gasIndex > estimateIndex && submitIndex > gasIndex);
-    assert.match(send, /catch \(error\) \{[\s\S]*tagTransactionError\(contractEstimateError\(error\), 'estimate', false\)[\s\S]*\}\s*let hash;[\s\S]*method: 'eth_sendTransaction'/);
-    assert.doesNotMatch(send, /transaction\.(?:gasPrice|maxFeePerGas|maxPriorityFeePerGas)\s*=/);
-    assert.match(client, /contractRevertSelector\(error\)/);
-    assert.match(client, /error\?\.code !== 'stale_root'/);
-});
-
-test('published vault challenge-period getter is probed before the reverting fallback', () => {
-    const client = fs.readFileSync(path.join(__dirname, 'services/zkapiClient.js'), 'utf8');
-    const method = sourceMethodAt(client, 'async loadChallengePeriod()');
-    const publishedGetter = method.indexOf('ABI.legacyChallengePeriod');
-    const fallbackGetter = method.indexOf('ABI.challengePeriod');
-
-    assert.ok(publishedGetter >= 0, 'published CHALLENGE_PERIOD() getter is missing');
-    assert.ok(fallbackGetter >= 0, 'challengePeriod() fallback getter is missing');
-    assert.ok(
-        publishedGetter < fallbackGetter,
-        'the known-reverting fallback must not be probed before the published getter'
-    );
+    const runtime = fs.readFileSync(path.join(__dirname, 'services/browserWalletRuntime.js'), 'utf8');
+    assert.match(runtime, /this\.vaultState = await assertSolanaVault\(this\.config\.funding\)/);
+    assert.match(sourceMethodAt(client, 'async refresh('), /browserWalletRuntime\.vaultState\?\.challengePeriod/);
 });
 
 test('browser exits are leaf-bound: no root read, Merkle path or root retry', () => {
     const runtime = fs.readFileSync(path.join(__dirname, 'services/browserWalletRuntime.js'), 'utf8');
     const client = fs.readFileSync(path.join(__dirname, 'services/zkapiClient.js'), 'utf8');
-    for (const marker of ['async prepareWithdrawal(mode,', 'async prepareBackgroundWithdrawal(']) {
-        const method = sourceMethodAt(runtime, marker);
-        assert.doesNotMatch(method, /treePath|active_root|merkle_siblings|expectedActiveRoot/, marker);
-        assert.match(method, /valid_until: String\(validUntil\)/, marker);
-    }
-    for (const marker of ['async performWithdrawal(', 'async performBackgroundWithdrawal(', 'async performSolanaWithdrawal(']) {
-        const method = sourceMethodAt(client, marker);
-        assert.doesNotMatch(method, /currentRoot|expectedActiveRoot|stale_root|restoreChallenged|restore_required/, marker);
-    }
+    const prepare = sourceMethodAt(runtime, 'async prepareWithdrawal(mode,');
+    assert.doesNotMatch(prepare, /treePath|active_root|merkle_siblings|expectedActiveRoot/);
+    assert.match(prepare, /valid_until: String\(validUntil\)/);
+    const withdraw = sourceMethodAt(client, 'async performWithdrawal(');
+    assert.doesNotMatch(withdraw, /currentRoot|expectedActiveRoot|stale_root|restoreChallenged|restore_required/);
     assert.doesNotMatch(client, /restoreChallengedNote|restore_required/);
     assert.doesNotMatch(runtime, /challenges\/restore\/prepare|siblings: plan\.siblings/);
 });
@@ -304,21 +215,29 @@ test('active root synchronization waits for the indexer and fails closed', async
     );
 });
 
-test('only a never-submitted prepared deposit can be replaced after cancellation', () => {
-    const runtime = fs.readFileSync(path.join(__dirname, 'services/browserWalletRuntime.js'), 'utf8');
-    assert.match(runtime, /pending\.phase !== 'prepared' \|\| pending\.submissionId[\s\S]*pending\.transactionHash \|\| pending\.transactionHashes\?\.length/);
-    assert.match(runtime, /await this\.commit\(\{ \.\.\.this\.runtime, pendingDeposit: null \}\)/);
-    assert.match(runtime, /A previous deposit may already be in MetaMask\. Recover it before changing the amount/);
+test('only a never-journaled prepared deposit can be re-quoted or replaced', async () => {
+    const { BrowserWalletRuntime } = await import(pathToFileURL(path.join(__dirname, 'services/browserWalletRuntime.js')));
+    const runtime = new BrowserWalletRuntime();
+    assert.equal(runtime.canQuotePendingDeposit({ operationId: 'deposit-1', phase: 'prepared' }), true);
+    assert.equal(runtime.canQuotePendingDeposit({ operationId: 'deposit-1' }), true);
+    assert.equal(runtime.canQuotePendingDeposit({ operationId: 'deposit-1', phase: 'prepared',
+        solanaJournal: { stages: [] } }), false);
+    assert.equal(runtime.canQuotePendingDeposit({ phase: 'prepared' }), false);
+    assert.equal(runtime.canQuotePendingDeposit(null), false);
+    const source = fs.readFileSync(path.join(__dirname, 'services/browserWalletRuntime.js'), 'utf8');
+    assert.match(sourceMethodAt(source, 'async prepareDeposit(amount,'),
+        /if \(!this\.canQuotePendingDeposit\(pending\)\)[\s\S]*A previous Solana deposit is unfinished/);
 });
 
-test('browser deposits refresh an unsigned Merkle path before submission', () => {
+test('browser deposits refresh an unsigned Merkle path against the finalized vault root before submission', () => {
     const runtime = fs.readFileSync(path.join(__dirname, 'services/browserWalletRuntime.js'), 'utf8');
     const client = fs.readFileSync(path.join(__dirname, 'services/zkapiClient.js'), 'utf8');
     const refresh = sourceMethodAt(runtime, 'async refreshPendingDeposit(');
     assert.match(refresh, /async refreshPendingDeposit\(amount, expectedActiveRoot = null,/);
+    assert.match(refresh, /if \(!this\.canQuotePendingDeposit\(pending\)\)/);
     assert.match(refresh, /const refreshed = \{[\s\S]*\.\.\.pending,[\s\S]*next_note_id: path\.note_id,[\s\S]*active_root: path\.active_root,[\s\S]*zero_path: path\.siblings/);
     assert.doesNotMatch(refresh, /secret:/);
-    assert.match(client, /await browserWalletRuntime\.refreshPendingDeposit\([\s\S]*Number\(amount\),[\s\S]*expectedActiveRoot/);
-    assert.match(client, /const attempts = 3/);
-    assert.match(client, /error\?\.code !== 'stale_root'/);
+    const deposit = sourceMethodAt(client, 'async performDeposit(');
+    assert.match(deposit, /const vault = assertSolanaDepositsOpen\(await assertSolanaVault\(funding\)\);[\s\S]*await browserWalletRuntime\.refreshPendingDeposit\([\s\S]*Number\(amount\),[\s\S]*vault\.root/);
+    assert.ok(deposit.indexOf('refreshPendingDeposit') < deposit.indexOf("submitSolanaOperation('deposit'"));
 });

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { canonicalChainId, chainIdBigInt, losslessChainId, sameChainId, U64_MAX }
+import { canonicalChainId, chainIdBigInt, sameChainId, U64_MAX }
     from '../services/zkapiLedgerIdentity.mjs';
 import { base58Decode, base58Encode, inspectPreparedSolanaMessage, submitPreparedSolanaOperation,
     unsignedSolanaTransaction, validatePreparedSolanaOperation } from '../services/zkapiSolanaTransport.mjs';
@@ -56,9 +56,9 @@ function signed(unsigned, fill) {
 test('full u64 chain identities remain canonical decimal strings', () => {
     assert.equal(chainIdBigInt(U64_MAX.toString()), U64_MAX);
     assert.equal(canonicalChainId(U64_MAX), '18446744073709551615');
-    assert.equal(losslessChainId('18446744073709551615'), '18446744073709551615');
-    assert.equal(losslessChainId(1), 1);
-    assert.equal(sameChainId('11155111', 11155111), true);
+    assert.equal(canonicalChainId(1), '1');
+    assert.equal(sameChainId('265940889672238678', '265940889672238678'), true);
+    assert.equal(sameChainId('1', 2), false);
     for (const invalid of [Number.MAX_SAFE_INTEGER + 1, '-1', '01', '1.0', U64_MAX + 1n]) {
         assert.throws(() => canonicalChainId(invalid));
     }

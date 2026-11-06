@@ -5,9 +5,11 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
-import { buildBrowserSdkAssets, verifyBrowserSdkAssets } from '../build.mjs';
+import { buildBrowserSdkAssets, solanaBrowserConfig, verifyBrowserSdkAssets } from '../build.mjs';
 import { configureBrowserSdk, browserSdkOptions, browserSdkTransport, beginBrowserSdkInitialization } from '../configure.js';
 import { BrowserWalletRuntime } from '../services/browserWalletRuntime.js';
+
+const fixture = async name => JSON.parse(await fs.readFile(new URL(`./fixtures/${name}`, import.meta.url), 'utf8'));
 
 test('SDK imports without a host UI, codec global, wallet connection or network request', async () => {
     assert.equal(globalThis.zkapiWallet, undefined);
@@ -61,7 +63,8 @@ test('host configuration resolves explicit paths and retains trusted same-origin
         await runtime.loadBrowserConfig();
         assert.equal(calls[0][0], 'https://host.example/zkapi/browser-config.json');
         assert.equal(calls[0][1].credentials, 'omit');
-        const config = JSON.parse(await fs.readFile(new URL('../assets/config/sepolia.json', import.meta.url), 'utf8'));
+        const config = await solanaBrowserConfig({ identity: await fixture('localnet.identity.json'),
+            deployment: await fixture('localnet.deployment.json'), deploymentApiProxyPath: '/zkapi-deployment/' });
         runtime.browserConfig = config;
         await runtime.remoteFetch(config.trusted_deployment.protocol_server_url + '/v2/requests', { method: 'POST', body: '{"proof":"private-proof"}', credentials: 'include' });
         assert.equal(calls[1][0], 'https://host.example/zkapi-deployment/v2/requests');
@@ -86,27 +89,33 @@ test('packaged proof assets and host-built worker are independent of source subm
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'zkapi-sdk-assets-'));
     try {
         const pinned = await verifyBrowserSdkAssets();
-        for (const network of ['sepolia', 'mainnet']) {
-            const result = await buildBrowserSdkAssets({ outDir: path.join(temp, network), network, publicPath: '/chat/zkapi/', build });
-            assert.equal(result.configUrl, '/chat/zkapi/browser-config.json');
-            assert.equal(result.workerUrl, '/chat/zkapi/assets/zkapiWasmWorker.js');
-            assert.equal(result.config.trusted_deployment.chain_id, network === 'mainnet' ? 1 : 11155111);
-            assert.equal(result.config.trusted_deployment.billing_asset, 'native_eth');
-            assert.equal(result.config.trusted_deployment.billing_unit, 'gwei');
-            assert.equal(result.config.trusted_deployment.billing_token_address, null);
-            assert.equal(result.config.billing_token_symbol, 'ETH');
-            assert.equal(result.config.billing_token_decimals, 9);
-            assert.equal(result.config.credits_per_usd, null);
-            assert.equal(result.config.suggested_deposit_amount, undefined);
-            assert.equal(result.config.deployment_status, undefined);
-            assert.equal(result.files['proofs/request.pk'], pinned.files['assets/proofs/request.pk']);
-            assert.equal(result.files['wasm/zkapi_browser_bg.wasm'], pinned.files['wasm/zkapi_browser_bg.wasm']);
-            const worker = await fs.readFile(path.join(result.directory, 'assets/zkapiWasmWorker.js'), 'utf8');
-            assert.match(worker, /\.\.\/wasm\/zkapi_browser_bg\.wasm/);
-            assert.doesNotMatch(worker, /ChatApp|funding-page|networkProxy/);
-        }
-        await assert.rejects(buildBrowserSdkAssets({outDir: temp, network: 'invalid', build}), /Network/);
-        await assert.rejects(buildBrowserSdkAssets({outDir: temp, publicPath: '//other.example/', build}), /same-origin/);
+        const identity = await fixture('localnet.identity.json');
+        const deployment = await fixture('localnet.deployment.json');
+        const result = await buildBrowserSdkAssets({ outDir: path.join(temp, 'localnet'), identity, deployment,
+            publicPath: '/chat/zkapi/', build });
+        assert.equal(result.configUrl, '/chat/zkapi/browser-config.json');
+        assert.equal(result.workerUrl, '/chat/zkapi/assets/zkapiWasmWorker.js');
+        const trusted = result.config.trusted_deployment;
+        assert.equal(trusted.billing_asset, 'native_sol');
+        assert.equal(trusted.billing_unit, 'lamports');
+        assert.equal(trusted.network, 'localnet');
+        assert.equal(trusted.wallet_standard_chain, 'solana:localnet');
+        assert.equal(result.config.deployment_api_proxy_path, undefined);
+        assert.equal(result.files['proofs/request.pk'], pinned.files['assets/proofs/request.pk']);
+        assert.equal(trusted.request_proving_key_sha256, pinned.files['assets/proofs/request.pk']);
+        assert.equal(result.files['wasm/zkapi_browser_bg.wasm'], pinned.files['wasm/zkapi_browser_bg.wasm']);
+        assert.deepEqual(JSON.parse(await fs.readFile(path.join(result.directory, 'browser-config.json'), 'utf8')), result.config);
+        const worker = await fs.readFile(path.join(result.directory, 'assets/zkapiWasmWorker.js'), 'utf8');
+        assert.match(worker, /\.\.\/wasm\/zkapi_browser_bg\.wasm/);
+        assert.doesNotMatch(worker, /ChatApp|funding-page|networkProxy/);
+        // The packaged mainnet-beta identity has no vault yet: a production
+        // build refuses it instead of producing an unusable trust anchor.
+        await assert.rejects(buildBrowserSdkAssets({ outDir: path.join(temp, 'mainnet'), identity: 'mainnet-beta',
+            deployment, build }), /mainnet-beta identity has no vault_authority \(undeployed\)/);
+        await assert.rejects(buildBrowserSdkAssets({ outDir: temp, identity: 'unknown-net', deployment, build }),
+            /packages no identity/);
+        await assert.rejects(buildBrowserSdkAssets({ outDir: temp, identity, deployment, publicPath: '//other.example/', build }),
+            /same-origin/);
     } finally { await fs.rm(temp, { recursive: true, force: true }); }
 });
 

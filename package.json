@@ -2,20 +2,18 @@
   "name": "@dagon/zkapi-browser-sdk",
   "version": "0.2.0",
   "private": true,
-  "description": "Dagon zkAPI browser wallet, Groth16 proofs, native-SOL ledger lifecycle and EVM compatibility",
+  "description": "Dagon zkAPI browser wallet on Solana: Groth16 proofs, native-SOL vault lifecycle and Wallet Standard transport",
   "engines": {
     "node": ">=24"
   },
   "scripts": {
     "generate:solana-vk": "node scripts/generate-solana-verifier.mjs",
     "verify:solana-vk": "node scripts/generate-solana-verifier.mjs --check",
-    "build": "npm run build:browser",
-    "build:browser": "node scripts/build-sdk.mjs --network sepolia",
-    "build:mainnet": "node scripts/build-sdk.mjs --network mainnet",
-    "test": "npm run test:sdk",
-    "test:sdk": "node --test sdk/test/*.test.mjs",
-    "test:e2e:v2": "bash scripts/run-v2-acceptance.sh",
-    "verify:assets": "node scripts/sync-sdk-assets.mjs --check"
+    "sync:assets": "node scripts/sync-sdk-assets.mjs",
+    "verify:assets": "node scripts/sync-sdk-assets.mjs --check",
+    "build:sdk": "node scripts/build-sdk.mjs",
+    "build:sdk:fixture": "node scripts/build-sdk.mjs --identity sdk/test/fixtures/localnet.identity.json --deployment sdk/test/fixtures/localnet.deployment.json --out-dir dist/sdk-localnet-fixture",
+    "test": "node --test sdk/test/*.test.mjs"
   },
   "devDependencies": {
     "esbuild": "0.27.2"
@@ -29,24 +27,20 @@
     "./client": "./sdk/services/zkapiClient.js",
     "./runtime": "./sdk/services/browserWalletRuntime.js",
     "./store": "./sdk/services/browserWalletStore.js",
-    "./wallet": "./sdk/wallet.js",
     "./ledger-identity": "./sdk/services/zkapiLedgerIdentity.mjs",
     "./solana-transport": "./sdk/services/zkapiSolanaTransport.mjs",
     "./solana-journal": "./sdk/services/zkapiSolanaJournal.mjs",
     "./build": "./sdk/build.mjs",
     "./request-compat": "./sdk/services/zkapiRequestCompat.mjs",
-    "./withdrawal-recovery": "./sdk/services/zkapiWithdrawalRecovery.mjs",
     "./expiry-history": "./sdk/services/zkapiExpiryHistory.mjs",
     "./active-root": "./sdk/services/zkapiActiveRoot.mjs",
     "./exit-policy": "./sdk/services/zkapiExitPolicy.mjs",
-    "./gas": "./sdk/services/zkapiGas.mjs",
-    "./native-billing": "./sdk/services/zkapiNativeBilling.mjs",
     "./native-sol": "./sdk/services/zkapiNativeSol.mjs",
-    "./contract-error": "./sdk/services/zkapiContractError.mjs",
     "./wallet-error": "./sdk/services/zkapiWalletError.mjs",
     "./package.json": "./package.json"
   },
   "dependencies": {
+    "@noble/hashes": "1.8.0",
     "@solana/web3.js": "1.98.4"
   }
 }

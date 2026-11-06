@@ -1,19 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { BrowserWalletRuntime } from '../services/browserWalletRuntime.js';
+import { nativeFunding } from './helpers/native-fixtures.mjs';
 
 const CIRCUIT_ID = 'zkapi-v2-concession-v1';
 
 function manifest() {
     return {
+        ...nativeFunding(),
         protocol_version: 2,
         proof_backend: 'groth16_bn254',
-        deployment_id: 'note-bound-test',
-        chain_id: 1,
-        contract_address: '0x' + '11'.repeat(20),
-        billing_asset: 'native_eth', billing_unit: 'gwei', native_asset_wei_per_unit: '1000000000',
-        native_price_feed_address: '0x' + '22'.repeat(20), native_price_feed_decimals: 8,
-        native_price_max_age_seconds: 3600, rpc_url: 'https://rpc.example',
+        deployment_id: 'dagon-localnet-test',
         protocol_server_url: 'https://server.example',
         indexer_url: 'https://indexer.example',
         request_charge_cap: 1000,
@@ -30,6 +27,8 @@ function manifest() {
         }
     };
 }
+
+const trustedPins = deployment => ({ ...deployment, ...deployment.proof_setup, ...deployment.privacy_mode });
 
 test('browser rejects missing, legacy, and unknown circuits with migration guidance', () => {
     const runtime = new BrowserWalletRuntime();
@@ -55,16 +54,38 @@ test('browser rejects missing, legacy, and unknown circuits with migration guida
 test('browser requires its trusted configuration to pin the same circuit', () => {
     const runtime = new BrowserWalletRuntime();
     const deployment = manifest();
-    runtime.browserConfig = { trusted_deployment: {
-        ...deployment,
-        ...deployment.proof_setup,
-        ...deployment.privacy_mode
-    } };
+    runtime.browserConfig = { trusted_deployment: trustedPins(deployment) };
     runtime.validateManifestTrust(deployment);
     delete runtime.browserConfig.trusted_deployment.circuit_id;
     assert.throws(() => runtime.validateManifestTrust(deployment), /pinned proof circuit/);
     runtime.browserConfig.trusted_deployment.circuit_id = 'legacy-unbound';
     assert.throws(() => runtime.validateManifestTrust(deployment), /pinned proof circuit/);
+});
+
+test('every Solana identity, Pyth and RPC pin must match the trusted configuration', () => {
+    const deployment = manifest();
+    for (const [field, changed] of [
+        ['network', 'devnet'], ['program_id', deployment.vault_state], ['vault_state', deployment.program_id],
+        ['genesis_hash', deployment.program_id], ['wallet_standard_chain', 'solana:devnet'],
+        ['pyth_receiver_program', deployment.program_id], ['pyth_price_account', deployment.program_id],
+        ['pyth_feed_id', `0x${'01'.repeat(32)}`], ['pyth_max_age_seconds', 60], ['pyth_max_confidence_bps', 50],
+        ['rpc_url', 'https://other-rpc.example'], ['chain_id', '1'], ['contract_address', `0x${'22'.repeat(32)}`],
+        ['request_charge_cap', 2000]
+    ]) {
+        const runtime = new BrowserWalletRuntime();
+        runtime.browserConfig = { trusted_deployment: trustedPins(deployment) };
+        assert.throws(() => runtime.validateManifestTrust({ ...deployment, [field]: changed }), /changed its pinned/, field);
+    }
+});
+
+test('an operator without an OA verifier pins none, and a manifest cannot add one', () => {
+    const deployment = manifest();
+    deployment.privacy_mode.verifier_url = null;
+    const runtime = new BrowserWalletRuntime();
+    runtime.browserConfig = { trusted_deployment: { ...trustedPins(deployment), verifier_url: null } };
+    runtime.validateManifestTrust(deployment);
+    assert.throws(() => runtime.validateManifestTrust({ ...deployment,
+        privacy_mode: { ...deployment.privacy_mode, verifier_url: 'https://verifier.example' } }), /OA verifier/);
 });
 
 test('funding a legacy deployment fails before any proof worker or wallet storage mutation', async t => {
@@ -92,14 +113,7 @@ test('funding a legacy deployment fails before any proof worker or wallet storag
     assert.equal(runtime.initialized, false);
 });
 
-
-test('historical packaged vault pins cannot be relabeled as a repaired deployment', () => {
-    const runtime = new BrowserWalletRuntime();
-    runtime.browserConfig = { deployment_status: 'migration_required' };
-    assert.throws(() => runtime.validateManifestTrust({}), /newly deployed note-bound vault/);
-});
-
-test('token deployments are rejected before deployment selection, worker creation or wallet writes', async t => {
+test('non-Solana deployments are rejected before deployment selection, worker creation or wallet writes', async t => {
     const oldLocation = globalThis.location;
     const oldStorage = globalThis.localStorage;
     t.after(() => { globalThis.location = oldLocation; globalThis.localStorage = oldStorage; });
@@ -109,12 +123,12 @@ test('token deployments are rejected before deployment selection, worker creatio
         setItem: () => assert.fail('unsupported deployments must not change saved selection'),
         removeItem: () => assert.fail('no stored selection to remove')
     };
-    for (const asset of ['erc20', undefined]) {
+    for (const changes of [{ billing_asset: 'erc20' }, { billing_asset: undefined },
+        { ledger_backend: 'other.groth16.v1' }, { billing_unit: 'microlamports' }]) {
         const runtime = new BrowserWalletRuntime();
         runtime.loadBrowserConfig = async () => ({ deployment_manifest_url: 'https://server.example/config.json' });
-        runtime.directJson = async () => ({ ...manifest(), billing_asset: asset,
-            billing_token_address: `0x${'44'.repeat(20)}` });
-        await assert.rejects(runtime.prepareDeposit(1000), /only native ETH deployments are supported/);
+        runtime.directJson = async () => ({ ...manifest(), ...changes });
+        await assert.rejects(runtime.prepareDeposit(1000), /Unsupported Solana billing or ledger backend|invalid protocol or billing configuration/);
         assert.equal(runtime.worker, null);
         assert.equal(runtime.initialized, false);
     }
@@ -124,12 +138,10 @@ test('operator manifest loss or replacement leaves a pin-validated exit-only wal
     for (const unavailable of [true, false]) {
         const runtime = new BrowserWalletRuntime();
         const deployment = manifest();
-        runtime.browserConfig = { trusted_deployment: {
-            ...deployment, ...deployment.proof_setup, ...deployment.privacy_mode
-        } };
+        runtime.browserConfig = { trusted_deployment: trustedPins(deployment) };
         runtime.directJson = async () => {
             if (unavailable) throw new TypeError('operator offline');
-            return { ...deployment, contract_address: `0x${'99'.repeat(20)}` };
+            return { ...deployment, contract_address: `0x${'99'.repeat(32)}` };
         };
         const restored = await runtime.loadDeploymentManifest('https://server.example/config.json');
         assert.equal(restored.contract_address, deployment.contract_address);
@@ -140,7 +152,7 @@ test('operator manifest loss or replacement leaves a pin-validated exit-only wal
         runtime.init = async () => {};
         await assert.rejects(runtime.prepareDeposit(1000), { code: 'deployment_exit_only' });
         await assert.rejects(runtime.prepareLeaseRequest(), { code: 'deployment_exit_only' });
-        await assert.rejects(runtime.claimPendingDepositSubmission(), { code: 'deployment_exit_only' });
+        await assert.rejects(runtime.prepareDepositQuote(1000), { code: 'deployment_exit_only' });
         runtime.directJson = async () => deployment;
         await runtime.loadDeploymentManifest('https://server.example/config.json');
         assert.equal(runtime.exitOnly, false);
@@ -153,7 +165,6 @@ test('exit-only initialization never falls back to missing or incompatible trust
     runtime.directJson = async () => { throw new TypeError('operator offline'); };
     runtime.browserConfig = {};
     await assert.rejects(runtime.loadDeploymentManifest('https://server.example/config.json'), /operator offline/);
-    runtime.browserConfig.trusted_deployment = { ...deployment, ...deployment.proof_setup, ...deployment.privacy_mode,
-        circuit_id: 'zkapi-v2-note-bound-v1' };
+    runtime.browserConfig.trusted_deployment = { ...trustedPins(deployment), circuit_id: 'zkapi-v2-note-bound-v1' };
     await assert.rejects(runtime.loadDeploymentManifest('https://server.example/config.json'), { code: 'incompatible_proof_circuit' });
 });

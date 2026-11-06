@@ -1,6 +1,6 @@
 // Host integration is explicit: importing the SDK does not create a worker,
 // connect a wallet, fetch configuration, or enable an application proxy.
-let options = Object.freeze({ transport: null, configUrl: null, workerUrl: null, mode: 'browser', requestTestnetPassword: null });
+let options = Object.freeze({ transport: null, configUrl: null, workerUrl: null, mode: 'browser' });
 let initializing = false;
 
 function absoluteUrl(value, label) {
@@ -20,14 +20,11 @@ export function configureBrowserSdk(next = {}) {
     if (!next || typeof next !== 'object' || Array.isArray(next)) {
         throw new TypeError('zkAPI browser SDK configuration must be an object.');
     }
-    const unknown = Object.keys(next).filter(key => !['transport', 'configUrl', 'workerUrl', 'mode', 'requestTestnetPassword'].includes(key));
+    const unknown = Object.keys(next).filter(key => !['transport', 'configUrl', 'workerUrl', 'mode'].includes(key));
     if (unknown.length) throw new TypeError(`Unknown zkAPI browser SDK option: ${unknown.join(', ')}.`);
     const merged = { ...options, ...next };
     if (merged.transport !== null && typeof merged.transport !== 'function') {
         throw new TypeError('zkAPI transport must be a fetch-compatible function.');
-    }
-    if (merged.requestTestnetPassword !== null && typeof merged.requestTestnetPassword !== 'function') {
-        throw new TypeError('requestTestnetPassword must be a password-dialog function.');
     }
     if (merged.mode !== 'browser') {
         throw new TypeError('Only browser mode is supported; local daemon and automatic probing modes have been removed.');

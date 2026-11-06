@@ -1,0 +1,9 @@
+{
+  "schema": "dagon-zkapi.solana-identity.v1",
+  "network": "localnet",
+  "genesis_hash": "US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx",
+  "vault_authority": "k7FaK87WHGVXzkaoHb7CdVPgkKDQhZ29VLDeBVbDfYn",
+  "vault_state": "NNWQTbGzTKLpZyFC65wgzhq8XFjSnqLxJpuL2Hj69Mx",
+  "treasury": "p2Yicb86aZig616Eav2VWG9vuXR5mEqhtzshZYBxzsV",
+  "pyth_price_account": "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE"
+}

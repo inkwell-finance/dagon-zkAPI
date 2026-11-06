@@ -11,10 +11,26 @@ test('initialization starts the browser wallet without probing a local daemon or
     const calls = [];
     t.mock.method(client, 'enableBrowserMode', async () => { calls.push('browser'); });
     t.mock.method(client, 'refresh', async () => { calls.push('refresh'); });
-    t.mock.method(client, 'reconcileBrowserWithdrawalsOnLoad', async () => { calls.push('recovery'); });
-    t.mock.method(client, 'attachWalletEvents', () => {});
     await client.init();
-    assert.deepEqual(calls, ['browser', 'refresh', 'recovery']);
+    assert.deepEqual(calls, ['browser', 'refresh']);
     assert.equal(client.browserMode, true);
     assert.equal(client.requestMode, 'direct_openrouter');
+    assert.equal(client.billingTokenSymbol, 'SOL');
+});
+
+test('background refresh never opens a wallet and coalesces concurrent ticks', async t => {
+    const client = new ZkapiClient();
+    let release;
+    let refreshes = 0;
+    t.mock.method(client, 'refresh', () => {
+        refreshes += 1;
+        return new Promise(resolve => { release = resolve; });
+    });
+    t.mock.method(client, 'connectSolanaWallet', async () => assert.fail('background refresh must not connect a wallet'));
+    const first = client.refreshInBackground();
+    const second = client.refreshInBackground();
+    assert.equal(first, second);
+    release();
+    assert.equal(await first, true);
+    assert.equal(refreshes, 1);
 });

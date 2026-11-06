@@ -107,6 +107,7 @@ function memoryIndexedDb() {
     };
 }
 
+
 const values = new Map();
 globalThis.localStorage = {
     getItem: key => values.get(key) ?? null,
@@ -116,33 +117,30 @@ globalThis.sessionStorage = globalThis.localStorage;
 globalThis.window = new EventTarget();
 globalThis.window.location = { search: '', hostname: 'localhost' };
 globalThis.indexedDB = memoryIndexedDb();
-const {
-    archiveBrowserWallet, readBrowserWallet, readBrowserWalletSnapshot, recordBrowserExpiryClaims,
-    updateBrowserWithdrawal, writeBrowserWallet
-} = await import('../services/browserWalletStore.js');
+const { readBrowserWalletSnapshot, updateBrowserWithdrawal, writeBrowserWallet }
+    = await import('../services/browserWalletStore.js');
 const { default: singleton } = await import('../services/browserWalletRuntime.js');
-const { ZkapiClient } = await import('../services/zkapiClient.js');
-const { ABI, abiWord } = await import('../wallet.js');
+const { base58Encode } = await import('../services/zkapiSolanaTransport.mjs');
 
-const DEPLOYMENT = 'deployment:sepolia';
-const OTHER_DEPLOYMENT = 'deployment:mainnet';
-const HASH = `0x${'ab'.repeat(32)}`;
-const REPLACED_HASH = `0x${'cd'.repeat(32)}`;
+const DEPLOYMENT = 'dagon-localnet-test';
+const OTHER_DEPLOYMENT = 'dagon-devnet-test';
+const SIGNATURE = base58Encode(new Uint8Array(64).fill(7));
 const state = (noteId = 7, amount = 2_000_000) => ({
     note_id: noteId, deposit_amount: amount, current_balance: 123,
     secret: 'private-note-secret', current_commitment: 'private-commitment'
 });
 const plan = (overrides = {}) => ({
     operationId: 'deposit-operation', next_note_id: 7, amount: 2_000_000,
-    secret: 'private-note-secret', commitment: '0x123', phase: 'submitted',
-    createdAt: 1000, transactionHash: REPLACED_HASH, ...overrides
+    secret: 'private-note-secret', commitment: '0x123', phase: 'prepared',
+    createdAt: 1000, ...overrides
 });
+const journaled = (overrides = {}) => plan({ solanaJournal: { operationId: 'deposit-operation', stages: [] }, ...overrides });
 function seedRuntime(value) {
     indexedDB.stores.get('runtime').set('active', clone({ deploymentId: DEPLOYMENT, ...value }));
 }
 function makeRuntime() {
     const runtime = new singleton.constructor();
-    runtime.manifest = { deployment_id: DEPLOYMENT };
+    runtime.manifest = { deployment_id: DEPLOYMENT, billing_asset: 'native_sol' };
     runtime.config = { wallet_core: {}, funding: nativeFunding() };
     runtime.init = async () => runtime.snapshot();
     runtime.walletStatus = async () => ({ has_note: Boolean(runtime.runtime.state) });
@@ -163,7 +161,7 @@ function assertSanitized(records) {
 
 test.beforeEach(() => indexedDB.clear());
 
-test('v2 migration recovers original deposits from notes, archives and withdrawal states without invented dates', async () => {
+test('migration recovers original deposits from notes, archives and withdrawal states without invented dates', async () => {
     seedRuntime({ state: state(), updatedAt: 98765 });
     const original = clone(indexedDB.stores.get('runtime').get('active'));
     indexedDB.stores.get('archives').set('old', {
@@ -177,7 +175,7 @@ test('v2 migration recovers original deposits from notes, archives and withdrawa
     });
     indexedDB.stores.get('withdrawals').set('withdrawal', {
         recordId: 'withdrawal', deploymentId: DEPLOYMENT, createdAt: 3000,
-        state: state(5, 4_000_000), phase: 'parked'
+        state: state(5, 4_000_000), phase: 'pending'
     });
     indexedDB.stores.get('withdrawals').set('no-original-amount', {
         recordId: 'no-original-amount', deploymentId: DEPLOYMENT,
@@ -185,7 +183,6 @@ test('v2 migration recovers original deposits from notes, archives and withdrawa
     });
     const snapshot = await readBrowserWalletSnapshot(DEPLOYMENT);
     assert.deepEqual(snapshot.deposits.map(row => row.amount).sort(), [2_000_000, 4_000_000, 5_000_000]);
-    assert.equal(snapshot.deposits.length, 3);
     for (const row of snapshot.deposits) {
         assert.equal(row.status, 'confirmed');
         assert.equal(row.createdAt, null);
@@ -201,21 +198,21 @@ test('v2 migration recovers original deposits from notes, archives and withdrawa
     assert.equal((await readBrowserWalletSnapshot(OTHER_DEPLOYMENT)).deposits[0].amount, 9_000_000);
 });
 
-test('confirmed deposits retain actual receipt identity across spending, closure, replacement and runtime reload', async () => {
-    seedRuntime({ pendingDeposit: plan() });
+test('confirmed deposits retain their Solana signature across spending, a new note and runtime reload', async () => {
+    seedRuntime({ pendingDeposit: journaled() });
     const runtime = makeRuntime();
-    await runtime.confirmDeposit(confirmArgs({ transactionHash: HASH.toUpperCase().replace('0X', '0x') }));
+    await runtime.confirmDeposit(confirmArgs({ transactionHash: SIGNATURE }));
     const confirmed = runtime.snapshot().deposits;
     assert.equal(confirmed.length, 1);
     assert.equal(confirmed[0].status, 'confirmed');
-    assert.equal(confirmed[0].transactionHash, HASH);
+    assert.equal(confirmed[0].transactionHash, SIGNATURE);
     assert.equal(confirmed[0].createdAt, 1000);
     assert.ok(confirmed[0].confirmedAt > 1000);
     assert.equal(confirmed[0].operationId, 'deposit-operation');
-    assert.equal((await readBrowserWallet()).pendingDeposit, null);
-    await writeBrowserWallet({ ...(await readBrowserWallet()), state: { ...state(), current_balance: 1 } });
+    assert.equal((await readBrowserWalletSnapshot(DEPLOYMENT)).runtime.pendingDeposit, null);
+    const current = (await readBrowserWalletSnapshot(DEPLOYMENT)).runtime;
+    await writeBrowserWallet({ ...current, state: { ...state(), current_balance: 1 } });
     assert.deepEqual((await readBrowserWalletSnapshot(DEPLOYMENT)).deposits, confirmed);
-    await archiveBrowserWallet('closed', 7);
     await writeBrowserWallet({ deploymentId: DEPLOYMENT, state: state(8, 3_000_000) });
     const reloaded = makeRuntime();
     await reloaded.reload();
@@ -224,154 +221,62 @@ test('confirmed deposits retain actual receipt identity across spending, closure
     assertSanitized(reloaded.snapshot().deposits);
 });
 
+test('only a canonical Solana signature is recorded as the deposit transaction', async () => {
+    for (const transactionHash of [`0x${'ab'.repeat(32)}`, 'not-a-signature', base58Encode(new Uint8Array(32).fill(1))]) {
+        indexedDB.clear();
+        seedRuntime({ pendingDeposit: journaled() });
+        const runtime = makeRuntime();
+        await runtime.confirmDeposit(confirmArgs({ transactionHash }));
+        assert.equal(runtime.snapshot().deposits[0].transactionHash, null, transactionHash);
+        assert.equal(runtime.snapshot().deposits[0].status, 'confirmed');
+    }
+});
+
 test('exact deposit commit succeeds independently of worker status and survives reload', async () => {
-    seedRuntime({ pendingDeposit: plan() });
+    seedRuntime({ pendingDeposit: journaled() });
     const runtime = makeRuntime();
     runtime.walletStatus = async () => { throw new Error('Status worker unavailable'); };
-    const result = await runtime.confirmDeposit(confirmArgs({ transactionHash: HASH }));
+    const result = await runtime.confirmDeposit(confirmArgs({ transactionHash: SIGNATURE }));
     assert.deepEqual(result, {
         status: 'confirmed', operationId: 'deposit-operation', noteId: 7,
-        amount: 2_000_000, transactionHash: HASH
+        amount: 2_000_000, transactionHash: SIGNATURE
     });
     const reloaded = makeRuntime();
     await reloaded.reload();
     assert.equal(reloaded.snapshot().runtime.pendingDeposit, null);
     assert.equal(reloaded.snapshot().runtime.state.note_id, 7);
     assert.equal(reloaded.snapshot().deposits[0].status, 'confirmed');
-    assert.equal(reloaded.snapshot().deposits[0].transactionHash, HASH);
+    assert.equal(reloaded.snapshot().deposits[0].transactionHash, SIGNATURE);
 });
 
-function confirmationClient(t, runtime) {
-    const client = new ZkapiClient();
-    client.browserMode = true;
-    client.config = runtime.config;
-    t.mock.method(singleton, 'confirmDeposit', runtime.confirmDeposit.bind(runtime));
-    t.mock.method(singleton, 'snapshot', runtime.snapshot.bind(runtime));
-    t.mock.method(singleton, 'walletStatus', async () => { throw new Error('Status worker unavailable'); });
-    return client;
-}
-
-function depositReceipt() {
-    const vault = `0x${'12'.repeat(20)}`;
-    return { vault, receipt: { status: '0x1', transactionHash: HASH, logs: [{
-        address: vault, topics: [ABI.noteDeposited, '0x7', '0x123'],
-        data: `0x${[2_000_000, 9999, 77].map(abiWord).join('')}`
-    }] } };
-}
-
-for (const recovery of [false, true]) {
-    test(`${recovery ? 'vault recovery' : 'receipt confirmation'} stays successful after commit when the balance refresh fails`, async t => {
-        seedRuntime({ pendingDeposit: plan() });
-        const runtime = makeRuntime();
-        const client = confirmationClient(t, runtime);
-        const statuses = [];
-        let result;
-        if (recovery) {
-            t.mock.method(singleton, 'pendingDeposit', async () => plan());
-            t.mock.method(singleton, 'treePath', async () => assert.fail('deposit recovery never reads the operator indexer'));
-            t.mock.method(client, 'readBrowserNote', async () => ({
-                status: 1, amount: 2_000_000n, commitment: '0x123', expiryTs: 9999
-            }));
-            result = await client.recoverBrowserDeposit(message => statuses.push(message));
-        } else {
-            const { vault, receipt } = depositReceipt();
-            result = await client.confirmBrowserDepositReceipt(plan(), receipt, vault, message => statuses.push(message));
-        }
-        assert.equal(result.status, 'confirmed');
-        assert.equal(result.balanceRefreshPending, true);
-        assert.equal(result.noteId, 7);
-        assert.equal(result.amount, 2_000_000);
-        assert.match(statuses.at(-1), /saved.*display will refresh/);
-        assert.match(client.lastError.message, /Status worker unavailable/);
-        assert.equal(client.config.pending_deposit, null);
-        assert.equal(client.deposits[0].status, 'confirmed');
-        const persisted = await readBrowserWalletSnapshot(DEPLOYMENT);
-        assert.equal(persisted.runtime.pendingDeposit, null);
-        assert.equal(persisted.runtime.state.note_id, 7);
-        assert.equal(persisted.deposits[0].status, 'confirmed');
-        // Ordinary read-only refresh recovers the display without another
-        // confirmation, proof, signing request or transaction.
-        t.mock.method(singleton, 'walletStatus', async () => ({ has_note: true, note: state() }));
-        await client.refresh({ quiet: true });
-        assert.equal(client.lastError, null);
-        assert.equal(client.wallet.has_note, true);
-        assert.equal(client.config.pending_deposit, null);
-    });
-}
-
-// Threat: an operator that accepted a deposit withholds its tree mirror so the
-// note is never installed, cannot be exited, and is swept at expiry. The vault
-// note alone (Active, matching commitment and amount) confirms the deposit.
-test('vault recovery confirms a landed deposit while the operator indexer is unavailable', async t => {
+test('unsigned preparations are omitted and a journaled deposit stays pending until confirmation', async () => {
     seedRuntime({ pendingDeposit: plan() });
-    const runtime = makeRuntime();
-    const client = confirmationClient(t, runtime);
-    t.mock.method(client, 'refresh', async () => {});
-    t.mock.method(singleton, 'pendingDeposit', async () => plan());
-    const indexer = t.mock.method(singleton, 'treePath', async () => { throw new Error('Indexer unavailable'); });
-    t.mock.method(client, 'readBrowserNote', async () => ({
-        status: 1, amount: 2_000_000n, commitment: '0x123', expiryTs: 9999
-    }));
-    const result = await client.recoverBrowserDeposit();
-    assert.equal(result.status, 'confirmed');
-    assert.equal(indexer.mock.callCount(), 0);
-    const persisted = await readBrowserWalletSnapshot(DEPLOYMENT);
-    assert.equal(persisted.runtime.pendingDeposit, null);
-    assert.equal(persisted.runtime.state.note_id, 7);
-});
-
-for (const failure of ['worker', 'storage', 'old-note']) {
-    test(`a ${failure} failure before this deposit commit is never classified as confirmed`, async t => {
-        seedRuntime({ pendingDeposit: plan(), ...(failure === 'old-note' ? { state: state(6) } : {}) });
-        const runtime = makeRuntime();
-        const client = confirmationClient(t, runtime);
-        let refreshes = 0;
-        t.mock.method(client, 'refresh', async () => { refreshes += 1; });
-        if (failure === 'worker') runtime.worker.call = async () => { throw new Error('Invalid confirmation'); };
-        if (failure === 'storage') indexedDB.failNextDepositWrite();
-        const { vault, receipt } = depositReceipt();
-        await assert.rejects(client.confirmBrowserDepositReceipt(plan(), receipt, vault, () => {}),
-            failure === 'worker' ? /Invalid confirmation/ : failure === 'storage' ? /history storage failure/ : /already has an active/);
-        assert.equal(refreshes, 0, 'only an actual successful commit reaches best-effort display refresh');
-        const persisted = await readBrowserWalletSnapshot(DEPLOYMENT);
-        assert.equal(persisted.runtime.pendingDeposit.operationId, plan().operationId);
-        assert.ok(!persisted.deposits.some(row => row.noteId === 7 && row.status === 'confirmed'));
-    });
-}
-
-test('unsigned preparations are omitted and durable wallet/receipt recovery remains pending until confirmation', async () => {
-    const pending = plan({ phase: 'prepared', transactionHash: null });
-    seedRuntime({ pendingDeposit: pending });
     assert.equal((await readBrowserWalletSnapshot(DEPLOYMENT)).deposits.length, 0);
-    for (const phase of ['awaiting_wallet', 'ambiguous', 'submitted', 'dropped_or_pending']) {
-        await writeBrowserWallet({ deploymentId: DEPLOYMENT, pendingDeposit: {
-            ...pending, phase, ...(phase === 'submitted' ? { transactionHash: HASH } : {})
-        } });
-        const reloaded = makeRuntime();
-        await reloaded.reload();
-        const rows = reloaded.snapshot().deposits;
-        assert.equal(rows.length, 1);
-        assert.equal(rows[0].status, 'pending');
-        assert.equal(rows[0].pendingPhase, phase);
-        assert.equal(rows[0].confirmedAt, null);
-        assert.equal(reloaded.snapshot().config.pending_deposit.operation_id, pending.operationId);
-        assertSanitized(rows);
-        assert.equal(indexedDB.stores.get('deposits').size, 0);
-    }
-    // Definite wallet rejection returns the same plan to the unsigned stage.
-    await writeBrowserWallet({ deploymentId: DEPLOYMENT, pendingDeposit: pending });
-    assert.equal((await readBrowserWalletSnapshot(DEPLOYMENT)).deposits.length, 0);
+    await writeBrowserWallet({ deploymentId: DEPLOYMENT, pendingDeposit: journaled() });
+    const reloaded = makeRuntime();
+    await reloaded.reload();
+    const rows = reloaded.snapshot().deposits;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].status, 'pending');
+    assert.equal(rows[0].pendingPhase, 'submitting');
+    assert.equal(rows[0].confirmedAt, null);
+    const pending = reloaded.snapshot().config.pending_deposit;
+    assert.equal(pending.operation_id, 'deposit-operation');
+    assert.equal(pending.phase, 'submitting');
+    assert.equal(pending.funding_quote_available, false, 'a journaled deposit is never re-quoted');
+    assertSanitized(rows);
+    assert.equal(indexedDB.stores.get('deposits').size, 0);
 });
 
 test('failed confirmation and failed atomic history write retain pending recovery and never record a deposit', async () => {
-    seedRuntime({ pendingDeposit: plan() });
+    seedRuntime({ pendingDeposit: journaled() });
     const runtime = makeRuntime();
     await assert.rejects(runtime.confirmDeposit(confirmArgs({ amount: 1 })), /does not match/);
     runtime.worker.call = async () => { throw new Error('Invalid confirmation'); };
     await assert.rejects(runtime.confirmDeposit(confirmArgs()), /Invalid confirmation/);
     runtime.worker.call = async () => state();
     indexedDB.failNextDepositWrite();
-    await assert.rejects(runtime.confirmDeposit(confirmArgs({ transactionHash: HASH })), /history storage failure/);
+    await assert.rejects(runtime.confirmDeposit(confirmArgs({ transactionHash: SIGNATURE })), /history storage failure/);
     const snapshot = await readBrowserWalletSnapshot(DEPLOYMENT);
     assert.equal(snapshot.runtime.state, null);
     assert.equal(snapshot.runtime.pendingDeposit.secret, plan().secret);
@@ -379,452 +284,68 @@ test('failed confirmation and failed atomic history write retain pending recover
     assert.equal(snapshot.deposits[0].status, 'pending');
     assert.equal(indexedDB.stores.get('deposits').size, 0);
     // The unchanged durable plan can be confirmed successfully after retry.
-    await runtime.confirmDeposit(confirmArgs({ transactionHash: HASH }));
+    await runtime.confirmDeposit(confirmArgs({ transactionHash: SIGNATURE }));
     assert.equal(runtime.snapshot().deposits[0].status, 'confirmed');
 });
 
-test('vault-state recovery does not mislabel a replaced or unresolved saved hash as the mined transaction', async () => {
-    seedRuntime({ pendingDeposit: plan() });
-    const runtime = makeRuntime();
-    await runtime.confirmDeposit(confirmArgs());
-    assert.equal(runtime.snapshot().deposits[0].transactionHash, null);
-    assert.equal(runtime.snapshot().deposits[0].status, 'confirmed');
-});
-
-test('withdrawal finality preserves legacy deposit metadata before sanitizing the last recovery state', async () => {
+test('withdrawal finality preserves deposit metadata before sanitizing the last recovery state', async () => {
     indexedDB.stores.get('withdrawals').set('old-return', {
         recordId: 'old-return', deploymentId: DEPLOYMENT, revision: 1,
-        state: state(1, 8_000_000), phase: 'closed_unconfirmed',
+        state: state(1, 8_000_000), phase: 'finalizing', mode: 'escape',
         proof: 'private-proof', withdrawalNullifier: 'private-nullifier',
-        createdAt: 4000, transactionHash: HASH
+        solanaFinalizeOperationId: 'finalize-1', solanaFinalizationJournal: { stages: [] },
+        createdAt: 4000, transactionHash: SIGNATURE
     });
-    await updateBrowserWithdrawal('old-return', { phase: 'closed' }, { sanitize: true });
+    await assert.rejects(updateBrowserWithdrawal('old-return', { phase: 'closed' }, { expectedRevision: 7 }),
+        /changed while its status was being checked/);
+    await updateBrowserWithdrawal('old-return', { phase: 'closed', finalizeTransactionHash: SIGNATURE }, { sanitize: true });
     const snapshot = await readBrowserWalletSnapshot(DEPLOYMENT);
-    assert.equal(snapshot.withdrawals[0].state, undefined);
+    const [record] = snapshot.withdrawals;
+    for (const field of ['state', 'proof', 'withdrawalNullifier', 'solanaFinalizationJournal', 'solanaFinalizeOperationId']) {
+        assert.equal(record[field], undefined, field);
+    }
+    assert.equal(record.finalizeTransactionHash, SIGNATURE, 'the public finalization signature stays');
     assert.equal(snapshot.deposits.length, 1);
     assert.equal(snapshot.deposits[0].amount, 8_000_000);
-    assert.equal(snapshot.deposits[0].transactionHash, null, 'withdrawal hash is not a deposit receipt');
-    assert.equal(snapshot.deposits[0].createdAt, null, 'withdrawal date is not a deposit date');
+    assert.equal(snapshot.deposits[0].transactionHash, null, 'a withdrawal signature is not a deposit transaction');
+    assert.equal(snapshot.deposits[0].createdAt, null, 'a withdrawal date is not a deposit date');
     assertSanitized(snapshot.deposits);
+    await assert.rejects(updateBrowserWithdrawal('old-return', { phase: 'pending' }), /cannot return to an earlier phase/);
 });
 
-test('late replacement attempts deduplicate without turning pending deposits into success or mixing deployments', async () => {
-    seedRuntime({ pendingDeposit: plan(), lateDepositAttempts: [
-        { operationId: 'deposit-operation', deploymentId: DEPLOYMENT, noteId: 7,
-            amount: 2_000_000, status: 'reverted', transactionHash: REPLACED_HASH, observedAt: 2000 },
-        { operationId: 'other', deploymentId: OTHER_DEPLOYMENT, noteId: 7,
-            amount: 9_000_000, status: 'submitted_late', transactionHash: HASH,
-            secret: 'private-note-secret', observedAt: 2001 }
-    ] });
-    const rows = (await readBrowserWalletSnapshot(DEPLOYMENT)).deposits;
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].status, 'pending');
-    assert.equal(rows[0].amount, 2_000_000);
-    const other = (await readBrowserWalletSnapshot(OTHER_DEPLOYMENT)).deposits;
-    assert.equal(other.length, 1);
-    assert.equal(other[0].status, 'pending');
-    assert.equal(other[0].amount, 9_000_000);
-    assertSanitized(other);
-});
-
-test('different operations sharing a vault slot retain separate attempts while rebased attempts stay one row', async () => {
-    const late = { operationId: 'old-operation', deploymentId: DEPLOYMENT, noteId: 7,
-        amount: 1_000_000, status: 'submitted_late', transactionHash: REPLACED_HASH, observedAt: 800 };
-    seedRuntime({ pendingDeposit: plan(), lateDepositAttempts: [late, {
-        ...late, operationId: 'deposit-operation', noteId: 6, amount: 2_000_000
-    }] });
-    const snapshot = await readBrowserWalletSnapshot(DEPLOYMENT);
-    assert.equal(snapshot.deposits.length, 2);
-    assert.equal(snapshot.deposits.find(row => row.operationId === 'deposit-operation').noteId, 7);
-    assert.equal(snapshot.deposits.find(row => row.operationId === 'old-operation').amount, 1_000_000);
-    assert.equal(new Set(snapshot.deposits.map(row => row.recordId)).size, 2);
+test('prefunding drafts persist and rebase across reload without pending deposits or secret regeneration', async () => {
+    seedRuntime({});
     const runtime = makeRuntime();
-    await runtime.confirmDeposit(confirmArgs({ transactionHash: HASH }));
-    const rows = runtime.snapshot().deposits;
-    assert.equal(rows.length, 2);
-    assert.equal(rows.find(row => row.operationId === 'deposit-operation').status, 'confirmed');
-    assert.equal(rows.find(row => row.operationId === 'old-operation').status, 'pending');
-    const reloaded = makeRuntime();
-    await reloaded.reload();
-    assert.deepEqual(reloaded.snapshot().deposits, rows);
-});
-
-const EXPIRY_TS = 2_000_000;
-const BLOCK_HASH = `0x${'ef'.repeat(32)}`;
-const expiryClaim = (extra = {}) => ({
-    noteId: 7, amount: 2_000_000, transactionHash: HASH,
-    blockHash: BLOCK_HASH, blockNumber: 50, claimedAt: EXPIRY_TS * 1000,
-    ...extra
-});
-
-test('expiry metadata migrates from active, archived and background states and preserves unknown legacy expiry', async () => {
-    seedRuntime({ state: { ...state(), expiry_ts: EXPIRY_TS } });
-    indexedDB.stores.get('archives').set('old-expiry', {
-        archiveId: `${DEPLOYMENT}:8:4000`, archivedAt: 4001,
-        state: { ...state(8), expiry_ts: EXPIRY_TS + 1 }
-    });
-    indexedDB.stores.get('withdrawals').set('expiry-withdrawal', {
-        recordId: 'expiry-withdrawal', deploymentId: DEPLOYMENT,
-        state: { ...state(9), expiry_ts: EXPIRY_TS + 2 }
-    });
-    indexedDB.stores.get('deposits').set(`${DEPLOYMENT}:deposit:7`, {
-        recordId: `${DEPLOYMENT}:deposit:7`, deploymentId: DEPLOYMENT,
-        type: 'deposit', status: 'confirmed', noteId: 7, amount: 2_000_000,
-        transactionHash: HASH, confirmedAt: 1000
-    });
-    indexedDB.stores.get('deposits').set(`${DEPLOYMENT}:deposit:10`, {
-        recordId: `${DEPLOYMENT}:deposit:10`, deploymentId: DEPLOYMENT,
-        type: 'deposit', status: 'confirmed', noteId: 10, amount: 2_000_000
-    });
-    const rows = (await readBrowserWalletSnapshot(DEPLOYMENT)).deposits;
-    assert.deepEqual(new Map(rows.map(row => [row.noteId, row.expiryTs])), new Map([
-        [7, EXPIRY_TS], [8, EXPIRY_TS + 1], [9, EXPIRY_TS + 2], [10, null]
-    ]));
-    assert.equal(rows.find(row => row.noteId === 7).transactionHash, HASH);
-    await writeBrowserWallet({ deploymentId: DEPLOYMENT, state: state() });
-    indexedDB.stores.get('archives').clear();
-    indexedDB.stores.get('withdrawals').clear();
-    assert.deepEqual((await readBrowserWalletSnapshot(DEPLOYMENT)).deposits, rows);
-    assert.deepEqual(await recordBrowserExpiryClaims(DEPLOYMENT, [expiryClaim({ noteId: 10 })]), []);
-    assert.equal((await readBrowserWalletSnapshot(DEPLOYMENT)).deposits.find(row => row.noteId === 10).expiryClaim, undefined);
-});
-
-test('expiry claims persist sanitized evidence without changing selected wallet or private recovery state', async () => {
-    seedRuntime({ state: { ...state(), expiry_ts: EXPIRY_TS },
-        journal: { privateRecovery: 'private-note-secret' },
-        lease: { sessionId: 'chat-a', client_request_id: 'request-a' },
-        preparedWithdrawal: { proof: 'private-proof' } });
-    const before = await readBrowserWallet();
-    const runtime = makeRuntime();
-    let notifications = 0;
-    runtime.addEventListener('change', () => { notifications += 1; });
-    const updated = await runtime.rememberExpiryClaims([expiryClaim({
-        transactionHash: HASH.toUpperCase().replace('0X', '0x'),
-        blockHash: BLOCK_HASH.toUpperCase().replace('0X', '0x'),
-        secret: 'private-note-secret', proof: 'private-proof', state: state(),
-        withdrawalNullifier: 'private-nullifier'
-    })]);
-    assert.equal(updated.length, 1);
-    assert.deepEqual(updated[0].expiryClaim, {
-        transactionHash: HASH, blockHash: BLOCK_HASH, blockNumber: 50,
-        claimedAt: EXPIRY_TS * 1000, amount: 2_000_000
-    });
-    assert.deepEqual(await readBrowserWallet(), before);
-    assert.equal(indexedDB.stores.get('archives').size, 0, 'recording evidence never archives a note');
-    assert.equal(notifications, 1);
-    assert.deepEqual(await runtime.rememberExpiryClaims([expiryClaim()]), []);
-    assert.equal(notifications, 1, 'repeated observations do not create duplicate updates');
-    const reloaded = makeRuntime();
-    const history = await reloaded.getDepositHistory();
-    assertSanitized(history);
-    assert.deepEqual(history[0].expiryClaim, updated[0].expiryClaim);
-    history[0].expiryClaim.amount = 1;
-    assert.equal(reloaded.snapshot().deposits[0].expiryClaim.amount, 2_000_000,
-        'public snapshots cannot mutate nested runtime evidence');
-    await writeBrowserWallet({ ...before, state: { ...before.state, current_balance: 1 } });
-    assert.deepEqual((await readBrowserWalletSnapshot(DEPLOYMENT)).deposits[0].expiryClaim, updated[0].expiryClaim);
-});
-
-test('expiry claims reject mismatched evidence atomically and cannot create or cross deployment history', async () => {
-    await writeBrowserWallet({ deploymentId: DEPLOYMENT, state: { ...state(), expiry_ts: EXPIRY_TS } });
-    indexedDB.stores.get('deposits').set(`${OTHER_DEPLOYMENT}:deposit:7`, {
-        recordId: `${OTHER_DEPLOYMENT}:deposit:7`, deploymentId: OTHER_DEPLOYMENT,
-        type: 'deposit', status: 'confirmed', noteId: 7, amount: 2_000_000, expiryTs: EXPIRY_TS
-    });
-    const before = clone([...indexedDB.stores.get('deposits').entries()]);
-    for (const changes of [
-        { amount: 1 }, { transactionHash: '0x123' }, { blockHash: '0x123' },
-        { blockNumber: 0 }, { blockNumber: 1.5 }, { claimedAt: EXPIRY_TS * 1000 - 1 },
-        { claimedAt: null }, { noteId: -1 }, { deploymentId: OTHER_DEPLOYMENT }
-    ]) {
-        await assert.rejects(recordBrowserExpiryClaims(DEPLOYMENT, [expiryClaim(), expiryClaim(changes)]),
-            /invalid deployment or note identity|does not match/);
-        assert.deepEqual([...indexedDB.stores.get('deposits').entries()], before);
-    }
-    assert.deepEqual(await recordBrowserExpiryClaims(DEPLOYMENT, [expiryClaim({ noteId: 55 })]), []);
-    assert.deepEqual(await recordBrowserExpiryClaims('unrelated-deployment', [expiryClaim()]), []);
-    await recordBrowserExpiryClaims(DEPLOYMENT, [expiryClaim()]);
-    assert.equal((await readBrowserWalletSnapshot(OTHER_DEPLOYMENT)).deposits[0].expiryClaim, undefined);
-    await assert.rejects(recordBrowserExpiryClaims(DEPLOYMENT, [expiryClaim({ transactionHash: REPLACED_HASH })]),
-        /different finalized expiry claim/);
-    assert.equal((await readBrowserWalletSnapshot(DEPLOYMENT)).deposits[0].expiryClaim.transactionHash, HASH);
-});
-
-test('an expiry history storage failure retains all recovery state and leaves the observation retryable', async () => {
-    await writeBrowserWallet({ deploymentId: DEPLOYMENT,
-        state: { ...state(), expiry_ts: EXPIRY_TS }, journal: { recovery: 'private-note-secret' } });
-    const before = await readBrowserWalletSnapshot(DEPLOYMENT);
-    indexedDB.failNextDepositWrite();
-    await assert.rejects(recordBrowserExpiryClaims(DEPLOYMENT, [expiryClaim()]), /history storage failure/);
-    assert.deepEqual(await readBrowserWalletSnapshot(DEPLOYMENT), before);
-    assert.equal((await recordBrowserExpiryClaims(DEPLOYMENT, [expiryClaim()])).length, 1);
-});
-
-test('explicit claimed-note archive preserves private recovery material and durable payment evidence', async () => {
-    await writeBrowserWallet({ deploymentId: DEPLOYMENT,
-        state: { ...state(), expiry_ts: EXPIRY_TS },
-        journal: { recovery: 'private-note-secret' },
-        lease: { sessionId: 'chat-a', client_request_id: 'request-a' },
-        preparedWithdrawal: { proof: 'private-proof' } });
-    const before = await readBrowserWallet();
-    await assert.rejects(archiveBrowserWallet('expiry-claimed', 7), /no matching confirmed expiry claim/);
-    assert.deepEqual(await readBrowserWallet(), before);
-    await recordBrowserExpiryClaims(DEPLOYMENT, [expiryClaim()]);
-    await assert.rejects(archiveBrowserWallet('expiry-claimed', 8), /selected private note changed/);
-    const runtime = makeRuntime();
-    runtime.activeLease = { sessionId: 'chat-a', inFlight: 1 };
-    await assert.rejects(runtime.archiveNote('expiry-claimed', 7), /Finish the current response/);
-    assert.deepEqual(await readBrowserWallet(), before);
-    runtime.activeLease.inFlight = 0;
-    await runtime.archiveNote('expiry-claimed', 7);
-    const archives = [...indexedDB.stores.get('archives').values()];
-    assert.equal(archives.length, 1);
-    for (const field of ['state', 'journal', 'lease', 'preparedWithdrawal', 'pendingDeposit']) {
-        assert.deepEqual(archives[0][field], before[field]);
-    }
-    const empty = await readBrowserWallet();
-    assert.equal(empty.state, null);
-    assert.equal(empty.journal, null);
-    assert.equal(empty.lease, null);
-    assert.equal(runtime.activeLease, null);
-    await writeBrowserWallet({ deploymentId: DEPLOYMENT, state: { ...state(8), expiry_ts: EXPIRY_TS + 1 } });
-    const rows = (await readBrowserWalletSnapshot(DEPLOYMENT)).deposits;
-    assert.equal(rows.length, 2);
-    assert.equal(rows.find(row => row.noteId === 7).expiryClaim.transactionHash, HASH);
-    assertSanitized(rows);
-});
-
-
-function quoteRuntime() {
-    const runtime = makeRuntime();
-    runtime.config.funding = { billing_asset: 'native_eth', chain_id: 11155111, contract_address: `0x${'22'.repeat(20)}` };
-    let generation = 0;
-    runtime.worker = { call: async operation => {
-        assert.equal(operation, 'generateDeposit');
-        return { secret: `private-note-secret-${++generation}`, registration_commitment: `0x${generation}` };
+    let generated = 0;
+    let root = '0x1';
+    runtime.worker = { call: async method => {
+        assert.equal(method, 'generateDeposit');
+        generated += 1;
+        return { secret: `secret-${generated}`, registration_commitment: `0x${generated}` };
     } };
-    runtime.nextDepositPath = async root => ({ note_id: Number(root || 1), active_root: `0x${root || 1}`,
-        siblings: Array(32).fill('0x0') });
-    runtime.prewarmRequestProver = async () => {};
-    return runtime;
-}
-
-test('prefunding drafts persist and rebase across reload without pending deposits, payment history or secret regeneration', async () => {
-    const first = quoteRuntime();
-    const draft = await first.prepareDepositQuote(123, 1n);
-    assert.equal((await readBrowserWallet()).depositQuote.operationId, draft.operationId);
-    assert.equal((await readBrowserWallet()).pendingDeposit, null);
-    assert.equal(first.snapshot().config.pending_deposit, null);
-    assert.equal(first.snapshot().deposits.length, 0);
-    const reloaded = quoteRuntime();
-    reloaded.worker.call = () => assert.fail('Reusing a quote must not generate a second note');
-    const refreshed = await reloaded.prepareDepositQuote(123, 2n);
-    assert.equal(refreshed.operationId, draft.operationId);
-    assert.equal(refreshed.secret, draft.secret);
-    assert.equal(refreshed.commitment, draft.commitment);
-    assert.equal(refreshed.next_note_id, 2);
-    assert.equal(refreshed.active_root, '0x2');
-    assert.equal((await readBrowserWallet()).pendingDeposit, null);
+    runtime.nextDepositPath = async expected => ({ note_id: 3, active_root: expected ?? root, siblings: [root] });
+    const draft = await runtime.prepareDepositQuote(2_000_000, '0x1');
+    assert.equal(draft.secret, 'secret-1');
+    assert.equal((await readBrowserWalletSnapshot(DEPLOYMENT)).runtime.pendingDeposit, null);
     assert.equal((await readBrowserWalletSnapshot(DEPLOYMENT)).deposits.length, 0);
-});
-
-test('changing a quote amount atomically replaces only the draft and rejects an old explicit action', async () => {
-    const runtime = quoteRuntime();
-    const first = await runtime.prepareDepositQuote(123, 1n);
-    const replacement = await runtime.prepareDepositQuote(456, 2n);
-    assert.notEqual(first.operationId, replacement.operationId);
-    assert.notEqual(first.secret, replacement.secret);
-    await assert.rejects(runtime.prepareDeposit(123, { preparedOperationId: first.operationId }), /changed in another tab/);
-    assert.equal((await readBrowserWallet()).pendingDeposit, null);
-    const promoted = await runtime.prepareDeposit(456, { preparedOperationId: replacement.operationId });
-    assert.equal(promoted.operationId, replacement.operationId);
-    assert.equal(promoted.secret, replacement.secret);
-    assert.equal(promoted.phase, 'prepared');
-    assert.equal((await readBrowserWallet()).depositQuote, null);
-    await assert.rejects(runtime.prepareDeposit(123, { preparedOperationId: replacement.operationId }), /amount does not match/);
-    assert.equal((await runtime.prepareDepositQuote(456, 2n)).operationId, replacement.operationId);
-    await assert.rejects(runtime.prepareDepositQuote(123, 2n), /amount is fixed/);
-    assert.equal((await readBrowserWallet()).pendingDeposit.amount, 456);
-});
-
-test('concurrent tabs cannot promote a superseded quote or refresh and claim a different deposit', async () => {
-    const first = quoteRuntime();
-    const second = quoteRuntime();
-    const [older, newer] = await Promise.all([first.prepareDepositQuote(123, 1n), second.prepareDepositQuote(456, 2n)]);
-    await assert.rejects(first.prepareDeposit(123, { preparedOperationId: older.operationId }), /changed in another tab/);
-    const current = await second.prepareDeposit(456, { preparedOperationId: newer.operationId });
-    await assert.rejects(first.refreshPendingDeposit(456, 2n, { expectedOperationId: older.operationId }), /changed in another tab/);
-    await assert.rejects(first.claimPendingDepositSubmission(older.operationId), /changed in another tab/);
-    const claimed = await second.claimPendingDepositSubmission(current.operationId);
-    assert.equal(claimed.plan.secret, newer.secret);
-    assert.equal(claimed.plan.active_root, newer.active_root);
-    assert.equal((await readBrowserWallet()).pendingDeposit.submissionId, claimed.submissionId);
-    await assert.rejects(first.claimPendingDepositSubmission(current.operationId), /already awaiting/);
-});
-
-test('an ordinary wallet deposit discards an unused address quote and active notes never prepare another quote', async () => {
-    const runtime = quoteRuntime();
-    const draft = await runtime.prepareDepositQuote(123, 1n);
-    const ordinary = await runtime.prepareDeposit(123);
-    assert.notEqual(ordinary.operationId, draft.operationId);
-    assert.equal((await readBrowserWallet()).depositQuote, null);
-    await assert.rejects(runtime.prepareDeposit(123, { preparedOperationId: draft.operationId }), /changed in another tab/);
-    seedRuntime({ state: state() });
-    await assert.rejects(runtime.prepareDepositQuote(456, 2n), /Recover/);
-});
-
-test('actual receipt fee and funding account survive reload and closure without becoming private history', async () => {
-    seedRuntime({ pendingDeposit: plan() });
-    const runtime = makeRuntime();
-    const fee = { transactionHash: HASH, feeWei: '123000000000', gasUsed: '123', effectiveGasPrice: '1000000000',
-        fundingAddress: `0x${'11'.repeat(20)}`, receiptBlockNumber: 1234, receiptBlockHash: `0x${'22'.repeat(32)}` };
-    await runtime.confirmDeposit(confirmArgs({ transactionHash: HASH, receiptMetadata: fee }));
-    const original = runtime.snapshot().deposits[0];
-    for (const [key, value] of Object.entries(fee)) assert.equal(original[key], value);
-    assertSanitized([original]);
+    root = '0x2';
     const reloaded = makeRuntime();
+    reloaded.worker = runtime.worker;
+    reloaded.nextDepositPath = runtime.nextDepositPath;
     await reloaded.reload();
-    assert.deepEqual(reloaded.snapshot().deposits[0], original);
-    await archiveBrowserWallet('closed', 7);
-    assert.deepEqual((await readBrowserWalletSnapshot(DEPLOYMENT)).deposits[0], original);
-});
-
-test('incomplete or arithmetically invalid fee metadata is omitted instead of displayed as zero', async () => {
-    for (const fee of [null, { feeWei: '0' }, { transactionHash: HASH, feeWei: '12', gasUsed: '123', effectiveGasPrice: '1000000000',
-        fundingAddress: `0x${'11'.repeat(20)}`, receiptBlockNumber: 1234, receiptBlockHash: `0x${'22'.repeat(32)}` }]) {
-        indexedDB.clear();
-        seedRuntime({ pendingDeposit: plan() });
-        const runtime = makeRuntime();
-        await runtime.confirmDeposit(confirmArgs({ transactionHash: HASH, receiptMetadata: fee }));
-        assert.equal(runtime.snapshot().deposits[0].feeWei, undefined);
-        assert.equal(runtime.snapshot().deposits[0].fundingAddress, undefined);
-    }
-});
-
-
-test('a proven pre-broadcast failure can refresh its funding quote without changing the pending operation', async () => {
-    const runtime = quoteRuntime();
-    const draft = await runtime.prepareDepositQuote(123, 1n);
-    await runtime.prepareDeposit(123, { preparedOperationId: draft.operationId });
-    assert.equal(runtime.snapshot().config.pending_deposit.funding_quote_available, true);
-    const claim = await runtime.claimPendingDepositSubmission(draft.operationId);
-    await runtime.rememberPendingDepositSubmissionMetadata(claim, { from: `0x${'11'.repeat(20)}`, nonce: 0 });
-    assert.equal(runtime.snapshot().config.pending_deposit.funding_quote_available, false);
-    await assert.rejects(runtime.prepareDepositQuote(123, 2n), /Recover/);
-    await runtime.markPendingDepositRetryable(null, claim);
-    assert.equal(runtime.snapshot().config.pending_deposit.funding_quote_available, true);
-    const fresh = await runtime.prepareDepositQuote(123, 2n);
-    assert.equal(fresh.operationId, draft.operationId);
-    assert.equal(fresh.secret, draft.secret);
-    assert.equal(fresh.commitment, draft.commitment);
-    assert.equal(fresh.next_note_id, 2);
-    assert.equal((await readBrowserWallet()).depositQuote, null);
-    assert.equal((await runtime.prepareDeposit(123, { preparedOperationId: draft.operationId })).operationId, draft.operationId);
-});
-
-test('signed, ambiguous, legacy, exact-retry and uncertain prepared attempts never become funding quotes', async () => {
-    for (const change of [
-        { phase: 'submitted', transactionHash: HASH },
-        { phase: 'ambiguous' }, { phase: 'retry_exact' },
-        { phase: 'prepared', submissionId: 'claim' },
-        { phase: 'prepared', transactionHashes: [HASH] },
-        { phase: 'prepared', transactionAttempts: [{ hash: HASH }] },
-        { phase: 'prepared', ambiguousSubmissions: [{ submissionId: 'old' }] },
-        { phase: 'prepared', legacyRecovery: true },
-        { phase: 'prepared', submissionFrom: `0x${'11'.repeat(20)}`, submissionNonce: 0 }
-    ]) {
-        indexedDB.clear();
-        seedRuntime({ pendingDeposit: plan({ transactionHash: null, ...change }) });
-        const runtime = quoteRuntime();
-        await runtime.reload();
-        assert.equal(runtime.snapshot().config.pending_deposit.funding_quote_available, false);
-        await assert.rejects(runtime.prepareDepositQuote(2_000_000, 2n), /Recover/);
-        assert.deepEqual((await readBrowserWallet()).pendingDeposit, plan({ transactionHash: null, ...change }));
-    }
-});
-
-test('explicit retry fee review keeps the exact uncertain calldata across quotes and pre-broadcast failures', async () => {
-    const runtime = quoteRuntime();
-    const pending = plan({ transactionHash: null, phase: 'ambiguous', submissionId: 'unknown-send',
-        submissionFrom: `0x${'11'.repeat(20)}`, submissionNonce: 0,
-        active_root: '0x1', zero_path: Array(32).fill('0x2') });
-    seedRuntime({ pendingDeposit: pending });
-    await assert.rejects(runtime.prepareDepositQuote(pending.amount, 999n), /Recover/);
-    const authorized = await runtime.authorizePendingDepositRetry({ forFundingQuote: true });
-    assert.equal(runtime.snapshot().config.pending_deposit.funding_quote_available, true);
-    runtime.nextDepositPath = async () => assert.fail('Uncertain exact retry must never refresh its Merkle path');
-    const quoted = await runtime.prepareDepositQuote(pending.amount, 999n);
-    assert.deepEqual(quoted, authorized);
-    assert.equal(quoted.active_root, pending.active_root);
-    assert.deepEqual(quoted.zero_path, pending.zero_path);
-    assert.equal((await runtime.prepareDeposit(pending.amount, { preparedOperationId: pending.operationId })).phase, 'retry_exact');
-    const claim = await runtime.claimPendingDepositSubmission(pending.operationId);
-    assert.equal(claim.plan.phase, 'awaiting_wallet');
-    await runtime.markPendingDepositRetryable(null, claim);
-    assert.equal((await readBrowserWallet()).pendingDeposit.phase, 'retry_exact');
-    assert.equal(runtime.snapshot().config.pending_deposit.funding_quote_available, true);
-    assert.deepEqual((await runtime.prepareDepositQuote(pending.amount, 123n)).zero_path, pending.zero_path);
-    assert.equal((await readBrowserWallet()).pendingDeposit.ambiguousSubmissions[0].submissionId, 'unknown-send');
-});
-
-test('an existing exact retry needs an explicit fee review before it can be quoted', async () => {
-    const runtime = quoteRuntime();
-    const pending = plan({ transactionHash: null, phase: 'retry_exact', legacyRecovery: true,
-        ambiguousSubmissions: [{ submissionId: 'old-unknown-send' }], zero_path: Array(32).fill('0x2') });
-    seedRuntime({ pendingDeposit: pending });
-    await runtime.reload();
-    assert.equal(runtime.snapshot().config.pending_deposit.funding_quote_available, false);
-    await assert.rejects(runtime.prepareDepositQuote(pending.amount, 1n), /Recover/);
-    await runtime.authorizePendingDepositRetry({ forFundingQuote: true });
-    assert.equal(runtime.snapshot().config.pending_deposit.funding_quote_available, true);
-    runtime.nextDepositPath = async () => assert.fail('Do not rebase a legacy exact retry');
-    assert.deepEqual((await runtime.prepareDepositQuote(pending.amount, 999n)).zero_path, pending.zero_path);
-});
-
-test('finalized consumed-slot recovery permits rebasing only the ambiguity it actually resolved', async () => {
-    const runtime = quoteRuntime();
-    const pending = plan({ transactionHash: null, phase: 'retry_exact', legacyRecovery: true,
-        fundingQuoteRetryAuthorized: true, ambiguousSubmissions: [{ submissionId: 'old-unknown-send' }],
-        zero_path: Array(32).fill('0x2'), submissionFrom: `0x${'11'.repeat(20)}`, submissionNonce: 0 });
-    seedRuntime({ pendingDeposit: pending });
-    await runtime.resolvePendingDepositSlotConflict({ operationId: pending.operationId, noteId: pending.next_note_id,
-        amount: pending.amount, commitment: pending.commitment, phase: pending.phase, transactionHashes: [] });
-    assert.equal(runtime.snapshot().config.pending_deposit.funding_quote_available, true);
-    const rebased = await runtime.prepareDepositQuote(pending.amount, 999n);
-    assert.equal(rebased.next_note_id, 999);
-    assert.equal(rebased.operationId, pending.operationId);
-    assert.equal(rebased.secret, pending.secret);
-    assert.deepEqual(rebased.resolvedAmbiguousSubmissionIds, ['old-unknown-send']);
-    assert.deepEqual(rebased.ambiguousSubmissions, pending.ambiguousSubmissions, 'late recovery claims remain saved');
-    assert.equal(runtime.canQuotePendingDeposit({ ...rebased, ambiguousSubmissions:
-        [...rebased.ambiguousSubmissions, { submissionId: 'new-unknown-send' }] }), false);
-});
-
-test('an unresolved late callback blocks both prepared and authorized exact funding quotes', async () => {
-    const runtime = quoteRuntime();
-    for (const phase of ['prepared', 'retry_exact']) {
-        const pending = plan({ transactionHash: null, phase, fundingQuoteRetryAuthorized: true,
-            ...(phase === 'retry_exact' ? { ambiguousSubmissions: [{ submissionId: 'old' }] } : {}) });
-        seedRuntime({ pendingDeposit: pending, lateDepositAttempts: [{ operationId: pending.operationId,
-            status: 'submitted_late', transactionHash: HASH }] });
-        await runtime.reload();
-        assert.equal(runtime.canQuotePendingDeposit(pending), false);
-        await assert.rejects(runtime.prepareDepositQuote(pending.amount, 999n), /Recover/);
-        if (phase === 'retry_exact') await assert.rejects(runtime.authorizePendingDepositRetry({ forFundingQuote: true }), /unresolved/);
-    }
-});
-
-test('legacy or token wallet state cannot be relabeled as a native ETH wallet', async () => {
-    for (const legacy of [
-        { deploymentId: null },
-        { deploymentId: OTHER_DEPLOYMENT },
-        { billingAsset: 'erc20' }
-    ]) {
-        seedRuntime({ state: state(), ...legacy });
-        const before = clone(indexedDB.stores.get('runtime').get('active'));
-        const runtime = makeRuntime();
-        await assert.rejects(runtime.reload(), /Switch back to that deployment/);
-        assert.deepEqual(indexedDB.stores.get('runtime').get('active'), before);
-        assert.equal(runtime.runtime, null);
-    }
+    const rebased = await reloaded.prepareDepositQuote(2_000_000, '0x2');
+    assert.equal(rebased.operationId, draft.operationId);
+    assert.equal(rebased.secret, draft.secret);
+    assert.equal(rebased.active_root, '0x2');
+    assert.equal(generated, 1, 'the same amount keeps its secret');
+    const promoted = await reloaded.prepareDeposit(2_000_000, { preparedOperationId: draft.operationId });
+    assert.equal(promoted.operationId, draft.operationId);
+    assert.equal(promoted.phase, 'prepared');
+    await assert.rejects(reloaded.prepareDeposit(2_000_000, { preparedOperationId: 'other-tab-quote' }),
+        /quote changed in another tab/);
+    // Once a Solana journal exists the plan can never change amount or re-quote.
+    await writeBrowserWallet({ deploymentId: DEPLOYMENT, pendingDeposit: { ...promoted, solanaJournal: { stages: [] } } });
+    await reloaded.reload();
+    await assert.rejects(reloaded.prepareDeposit(3_000_000), /previous Solana deposit is unfinished/);
+    await assert.rejects(reloaded.prepareDepositQuote(2_000_000, '0x2'), /Recover the existing private balance or deposit/);
 });

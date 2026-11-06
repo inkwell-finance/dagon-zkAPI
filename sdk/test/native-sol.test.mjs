@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFile } from 'node:fs/promises';
 
 import { configureBrowserSdk } from '../configure.js';
 import { base58Encode } from '../services/zkapiSolanaTransport.mjs';
 import { assertSolanaDepositsOpen, assertSolanaVault, confirmFinalizedSolanaTransaction, decodeSolanaNoteState,
     decodeSolanaPendingWithdrawal, decodeSolanaVaultState, readFinalizedSolanaOperationState,
     readFinalizedSolanaTime, sendSignedSolanaTransaction, solanaUnitsForUsd, solanaUsdMicros, UPGRADEABLE_LOADER,
-    validateSolanaFunding, validateSolanaQuote }
+    SOLANA_QUOTE_FIELDS, validateSolanaFunding, validateSolanaQuote, sameSolanaQuote }
     from '../services/zkapiNativeSol.mjs';
 
 let rpcHandler = null;
@@ -34,15 +35,49 @@ const funding = {
     rpc_url: 'https://rpc.example.test',
     protocol_server_url: 'https://api.example.test'
 };
-const quote = {
-    asset: 'native_sol', source: 'pyth_receiver', credit_unit: 'lamports',
+// Serialized exactly like the server's `BillingQuote`: same field order, string
+// u64 identities and decimals, and JSON numbers for the integer fields.
+const quote = JSON.parse(JSON.stringify({
+    asset: 'native_sol', source: 'pyth_solana_receiver', credit_unit: 'lamports',
     base_units_per_asset: 1_000_000_000, chain_id: funding.chain_id,
-    deployment_binding: funding.contract_address, backend: funding.ledger_backend,
-    network: funding.network, vault: funding.vault_state,
-    receiver_program: funding.pyth_receiver_program, price_account: funding.pyth_price_account,
-    feed_id: funding.pyth_feed_id, price: '15000000000', confidence: '150000000',
-    exponent: -8, published_at: now - 10, expires_at: now + 20, posted_slot: '123456789'
-};
+    // Felt252 serializes as minimal lowercase hex (leading zeros trimmed).
+    deployment_binding: '0x1111111111111111111111111111111111111111111111111111111111111111',
+    backend: funding.ledger_backend, network: funding.network, vault: funding.vault_state,
+    feed_id: funding.pyth_feed_id, feed_account: funding.pyth_price_account,
+    receiver_program: funding.pyth_receiver_program, price: '15000000000', exponent: -8,
+    confidence: '150000000', publish_time: now - 10, expires_at: now + 20, posted_slot: 123456789
+}));
+
+test('the SDK accepts exactly the server BillingQuote fields (serde deny_unknown_fields)', async () => {
+    const source = await readFile(new URL('../../crates/zkapi-serverd/src/billing.rs', import.meta.url), 'utf8');
+    const declaration = source.match(/#\[serde\(deny_unknown_fields\)\]\s*pub struct BillingQuote \{([\s\S]*?)\n\}/);
+    assert.ok(declaration, 'BillingQuote must keep deny_unknown_fields');
+    assert.doesNotMatch(declaration[0], /rename|alias|flatten/, 'no serde field renames');
+    const fields = [...declaration[1].matchAll(/^\s*pub (\w+):/gm)].map(match => match[1]);
+    assert.deepEqual(SOLANA_QUOTE_FIELDS, fields);
+    assert.deepEqual(Object.keys(quote), fields);
+    assert.match(source, /pub const PYTH_SOURCE: &str = "pyth_solana_receiver";/);
+    for (const [field, type] of [['chain_id', 'String'], ['price', 'String'], ['confidence', 'String'],
+        ['base_units_per_asset', 'u64'], ['exponent', 'i32'], ['publish_time', 'u64'],
+        ['expires_at', 'u64'], ['posted_slot', 'u64']]) {
+        assert.match(declaration[1], new RegExp(`pub ${field}: ${type},`), field);
+    }
+    // A field more, less, or renamed is not the proof-bound quote.
+    assert.throws(() => validateSolanaQuote({ ...quote, extra: 1 }, funding, { now }));
+    const { feed_account: _account, ...missing } = quote;
+    assert.throws(() => validateSolanaQuote(missing, funding, { now }));
+    assert.throws(() => validateSolanaQuote({ ...missing, price_account: quote.feed_account }, funding, { now }));
+    assert.equal(sameSolanaQuote(quote, structuredClone(quote)), true);
+    assert.equal(sameSolanaQuote(quote, { ...quote, extra: 1 }), false);
+    assert.equal(sameSolanaQuote(quote, { ...quote, posted_slot: quote.posted_slot + 1 }), false);
+});
+
+test('a Felt252 deployment binding with trimmed leading zeros matches the padded pin', () => {
+    const padded = { ...funding, contract_address: `0x00${'ab'.repeat(31)}` };
+    const trimmed = { ...quote, deployment_binding: `0x${'ab'.repeat(31)}` };
+    assert.equal(validateSolanaQuote(trimmed, padded, { now }), trimmed);
+    assert.throws(() => validateSolanaQuote({ ...trimmed, deployment_binding: 'ab'.repeat(31) }, padded, { now }));
+});
 
 test('native SOL pins and quotes retain full-u64 identity and conservative Pyth arithmetic', () => {
     assert.equal(validateSolanaFunding(funding), funding);
@@ -55,11 +90,19 @@ test('native SOL pins and quotes retain full-u64 identity and conservative Pyth 
 test('native SOL quote validation fails closed on deployment, confidence, time, and chain changes', () => {
     const invalid = [
         { chain_id: '18446744073709551614' },
+        { chain_id: 18446744073709551615 },
         { deployment_binding: `0x${'12'.repeat(32)}` },
+        { source: 'pyth_receiver' },
+        { feed_account: key(9) },
+        { feed_id: funding.pyth_feed_id.toUpperCase() },
         { confidence: quote.price },
-        { published_at: now + 1, expires_at: now + 31 },
+        { price: 15000000000 },
+        { price: '015000000000' },
+        { publish_time: now + 1, expires_at: now + 31 },
+        { publish_time: String(now - 10) },
         { expires_at: now + 21 },
         { exponent: -19 },
+        { base_units_per_asset: '1000000000' },
         { vault: key(9) }
     ];
     for (const patch of invalid) {
