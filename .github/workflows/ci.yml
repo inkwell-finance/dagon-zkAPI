@@ -24,12 +24,14 @@ jobs:
       - name: Install SDK test dependencies
         run: npm ci
 
-      - name: Test SDK and package both network asset sets
+      - name: Test SDK, verify assets and build the fixture bundle
         run: |
           npm test
+          npm run verify:assets
+          npm run verify:solana-vk
+          npm run build:sdk:fixture
           node --test docker/aws/run-daemon.test.mjs
-          npm run build:browser
-          npm run build:mainnet
+          node --test scripts/check-solana-parity.test.mjs
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -53,7 +55,7 @@ jobs:
         run: cargo clippy --workspace -- -D warnings
 
       - name: Validate operator scripts
-        run: bash -n scripts/build-browser-client.sh docker/tee/attestation-hook.sh && sh -n docker/aws/run-daemon.sh
+        run: bash -n scripts/build-browser-client.sh scripts/build-verifiable-program.sh docker/tee/attestation-hook.sh && sh -n docker/aws/run-daemon.sh
 
   protocol-rust:
     runs-on: ubuntu-latest
@@ -74,23 +76,19 @@ jobs:
       - name: Test protocol Rust workspace
         run: cargo test --release --manifest-path protocol/rust/Cargo.toml --workspace -- --test-threads=1
 
-  contracts:
+  verifiable-program:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
 
-      - name: Forge build
-        working-directory: protocol/contracts
-        run: forge build
-
-      - name: Forge test
-        working-directory: protocol/contracts
-        run: forge test -vvv
+      - name: Verifiable SBF build matches the profile executable hash
+        run: bash scripts/build-verifiable-program.sh --check
 
   docker:
     runs-on: ubuntu-latest
@@ -100,4 +98,4 @@ jobs:
           persist-credentials: false
 
       - name: Build Docker image
-        run: docker build -f docker/Dockerfile -t ethereum/zkapi:ci .
+        run: docker build -f docker/Dockerfile -t dagon-zkapi:ci .
