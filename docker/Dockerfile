@@ -1,6 +1,6 @@
 FROM rust:bookworm AS builder
 
-# The operator image runs native ETH API, indexer and challenge services.
+# The operator image runs Dagon zkAPI server, indexer and challenge services.
 # The browser SDK and host application build separately.
 WORKDIR /app
 
@@ -19,17 +19,17 @@ RUN apt-get update \
 
 WORKDIR /srv/zkapi
 
-COPY --from=builder /app/target/release/zkapi /usr/local/bin/zkapi
-COPY --from=builder /app/target/release/zkapi-indexerd /usr/local/bin/zkapi-indexerd
-COPY --from=builder /app/target/release/zkapi-challenged /usr/local/bin/zkapi-challenged
+COPY --from=builder /app/target/release/dagon-zkapi /usr/local/bin/dagon-zkapi
+COPY --from=builder /app/target/release/dagon-zkapi-indexerd /usr/local/bin/dagon-zkapi-indexerd
+COPY --from=builder /app/target/release/dagon-zkapi-challenged /usr/local/bin/dagon-zkapi-challenged
 COPY --from=builder /app/protocol/setup/v2 /srv/zkapi/protocol/setup/v2
 
-COPY --chmod=755 docker/aws/run-daemon.sh /usr/local/bin/zkapi-run
+COPY --chmod=755 docker/aws/run-daemon.sh /usr/local/bin/dagon-zkapi-run
 
 USER zkapi
 
 ENV RUST_LOG=info
 VOLUME ["/data"]
 
-ENTRYPOINT ["zkapi-run"]
+ENTRYPOINT ["dagon-zkapi-run"]
 CMD ["server"]

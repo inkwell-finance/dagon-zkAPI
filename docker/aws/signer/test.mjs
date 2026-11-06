@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { Transaction, Wallet } from 'ethers';
+import { Interface, Transaction, Wallet } from 'ethers';
 import { RpcError, createSigner, createUpstream, parseChainId, vaultInterface } from './signer.mjs';
 import { createHttpServer } from './server.mjs';
 
@@ -13,7 +13,22 @@ const sender = new Wallet(key).address;
 const vault = '0x0000000000000000000000000000000000001234';
 const proof = `0x${'00'.repeat(256)}`;
 const inputs = [2, CHAIN_ID, vault, 0, 1, 2, 0, 1, 0, 0, 0, 0];
-const data = vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, inputs, proof, Array(32).fill(0)]);
+const data = vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, inputs, proof]);
+assert.equal(data.slice(0, 10), '0xda0ce43d');
+const raiseData = vaultInterface.encodeFunctionData('raiseEscapeConcession', [0, inputs, proof, 50_000]);
+assert.equal(raiseData.slice(0, 10), '0xdd0064ba');
+// Calls the challenger never signs: the superseded one-step challenge (with
+// siblings), the deleted phase-2 restore, and the permissionless exits/sweeps.
+const W = '(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,uint64,uint128,address,uint256,bool,uint256,uint128,uint64)';
+const otherVaultCalls = new Interface([
+  'function challengeEscapeWithdrawal(uint32 noteId,(uint16,uint64,address,uint256,uint256,uint256,uint64,uint128,uint256,uint256,uint256,uint256) inputs,bytes proof,uint256[32] siblings)',
+  'function restoreChallengedNote(uint32 noteId,uint256[32] siblings)',
+  'function retireClosedLeaf(uint32 noteId,uint256[32] siblings)',
+  'function claimExpired(uint32 noteId)',
+  'function finalizeEscapeWithdrawal(uint32 noteId)',
+  `function initiateEscapeWithdrawal(${W} inputs,bytes proof)`,
+  'function pause()',
+]);
 const validTx = { from: sender, to: vault, data, gas: '0x7a1200', nonce: '0x4' };
 
 function fixture(overrides = {}, options = {}) {
@@ -54,10 +69,20 @@ test('rejects unauthorized transaction changes before any RPC or signature', asy
     { from: vault }, { to: sender }, { to: null }, { value: '0x1' }, { chainId: '0x1' },
     { data: '0xdeadbeef' }, { data: `${data}00` }, { gas: '0xffffffff' },
     { nonce: undefined }, { nonce: '0xffffffffffffffff' }, { nonce: '0x04' },
-    { gasPrice: '0x1' }, { accessList: [] }, { authorizationList: [] },
-    { data: vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, 1, vault, ...inputs.slice(3)], proof, Array(32).fill(0)]) },
-    { data: vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, CHAIN_ID, sender, ...inputs.slice(3)], proof, Array(32).fill(0)]) },
-    { data: vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, inputs, '0x00', Array(32).fill(0)]) },
+    { gasPrice: '0x1000000000000' }, { gasPrice: '0x01' }, { accessList: [] }, { authorizationList: [] },
+    { data: vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, 1, vault, ...inputs.slice(3)], proof]) },
+    { data: vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, CHAIN_ID, sender, ...inputs.slice(3)], proof]) },
+    { data: vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, inputs, '0x00']) },
+    { data: vaultInterface.encodeFunctionData('raiseEscapeConcession', [0, inputs, proof, 0]) },
+    { data: vaultInterface.encodeFunctionData('raiseEscapeConcession', [0, [2, 1, vault, ...inputs.slice(3)], proof, 1]) },
+    { data: `${raiseData}00` },
+    { data: otherVaultCalls.encodeFunctionData('challengeEscapeWithdrawal', [0, inputs, proof, Array(32).fill(0)]) },
+    { data: otherVaultCalls.encodeFunctionData('restoreChallengedNote', [0, Array(32).fill(0)]) },
+    { data: otherVaultCalls.encodeFunctionData('retireClosedLeaf', [0, Array(32).fill(0)]) },
+    { data: otherVaultCalls.encodeFunctionData('claimExpired', [0]) },
+    { data: otherVaultCalls.encodeFunctionData('finalizeEscapeWithdrawal', [0]) },
+    { data: otherVaultCalls.encodeFunctionData('initiateEscapeWithdrawal', [[2, CHAIN_ID, vault, 0, 1, 2, 0, 0, 0, 1, 1, 1, sender, 1, false, 2, 0, 1], proof]) },
+    { data: otherVaultCalls.encodeFunctionData('pause', []) },
   ];
   for (const modification of modifications) {
     const { signer, calls } = fixture();
@@ -102,6 +127,29 @@ test('RPC method allowlist excludes generic signing, account management and raw 
   assert.equal(await signer.handle('eth_blockNumber', []), '0x1');
 });
 
+test('challenger reads its fee through HTTP before submitting a signed challenge', async t => {
+  const { signer, calls } = fixture();
+  const server = createHttpServer(signer).listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const post = (id, method, params) => fetch(base, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+  }).then(response => response.json());
+  const fee = await post(1, 'eth_gasPrice', []);
+  assert.deepEqual(fee, { jsonrpc: '2.0', id: 1, result: '0x3b9aca00' });
+  assert.deepEqual(calls, [{ method: 'eth_gasPrice', params: [] }]);
+  const sent = await post(2, 'eth_sendTransaction', [{ ...validTx, gasPrice: fee.result }]);
+  assert.equal(sent.error, undefined);
+  assert.equal(sent.result, `0x${'ab'.repeat(32)}`);
+  const signed = Transaction.from(calls.at(-1).params[0]);
+  assert.equal(signed.gasPrice, BigInt(fee.result));
+  assert.equal(signed.nonce, 4);
+  assert.equal(signed.data, data);
+});
+
 test('HTTP errors suppress provider details and health detects wrong upstream chain', async t => {
   const secret = 'https://provider.invalid/private-key-material';
   const { signer } = fixture({ eth_blockNumber: new Error(secret) });
@@ -142,7 +190,7 @@ test('Mainnet and Sepolia preserve chain-specific signatures, proof bindings and
   for (const chainId of [1n, 11155111n]) {
     const other = chainId === 1n ? 11155111n : 1n;
     const chainHex = `0x${chainId.toString(16)}`;
-    const selectedData = vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, chainId, vault, ...inputs.slice(3)], proof, Array(32).fill(0)]);
+    const selectedData = vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, chainId, vault, ...inputs.slice(3)], proof]);
     const transaction = { ...validTx, data: selectedData, chainId: chainHex };
     const { signer, calls } = fixture({ eth_chainId: chainHex }, { chainId });
     await signer.handle('eth_sendTransaction', [transaction]);
@@ -150,7 +198,7 @@ test('Mainnet and Sepolia preserve chain-specific signatures, proof bindings and
     assert.equal(Transaction.from(calls.at(-1).params[0]).chainId, chainId);
     const baseline = calls.length;
     await assert.rejects(signer.handle('eth_sendTransaction', [{ ...transaction, chainId: `0x${other.toString(16)}` }]), RpcError);
-    const wrongData = vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, other, vault, ...inputs.slice(3)], proof, Array(32).fill(0)]);
+    const wrongData = vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, other, vault, ...inputs.slice(3)], proof]);
     await assert.rejects(signer.handle('eth_sendTransaction', [{ ...transaction, data: wrongData }]), RpcError);
     assert.equal(calls.length, baseline);
     for (const overrides of [{ eth_chainId: `0x${other.toString(16)}` }, { eth_gasPrice: '0xffffffffffff' }, { eth_estimateGas: '0xffffff' }]) {
@@ -167,4 +215,24 @@ test('Mainnet health advertises only its explicitly configured chain', async t =
   await once(server, 'listening'); t.after(() => server.close());
   const response = await fetch(`http://127.0.0.1:${server.address().port}/health`).then(r => r.json());
   assert.equal(response.chain_id, 1);
+});
+
+test('signs a canonical concession raise and a fee-bumped same-nonce defeat replacing it', async () => {
+  const raise = fixture();
+  await raise.signer.handle('eth_sendTransaction', [{ ...validTx, data: raiseData }]);
+  const signedRaise = Transaction.from(raise.calls.at(-1).params[0]);
+  assert.equal(signedRaise.data, raiseData);
+  assert.equal(signedRaise.nonce, 4);
+  assert.equal(signedRaise.gasPrice, 1_000_000_000n);
+  // A defeat supersedes the unmined raise at the same nonce with a higher fee.
+  const defeat = fixture();
+  await defeat.signer.handle('eth_sendTransaction', [{ ...validTx, gasPrice: '0x47868c00' }]);
+  const signedDefeat = Transaction.from(defeat.calls.at(-1).params[0]);
+  assert.equal(signedDefeat.data, data);
+  assert.equal(signedDefeat.nonce, 4);
+  assert.equal(signedDefeat.gasPrice, 1_200_000_000n);
+  // A caller floor below the market price never lowers the fee.
+  const low = fixture();
+  await low.signer.handle('eth_sendTransaction', [{ ...validTx, gasPrice: '0x1' }]);
+  assert.equal(Transaction.from(low.calls.at(-1).params[0]).gasPrice, 1_000_000_000n);
 });

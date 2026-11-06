@@ -4,14 +4,20 @@ export function parseChainId(value) {
   if (value !== '1' && value !== '11155111') throw new Error('Explicit challenge chain ID must be 1 or 11155111');
   return BigInt(value);
 }
-export const CHALLENGE_ABI = 'function challengeEscapeWithdrawal(uint32 noteId,(uint16 protocolVersion,uint64 chainId,address contractAddress,uint256 activeRoot,uint256 stateSigningKeyX,uint256 stateSigningKeyY,uint64 requestTime,uint128 solvencyBound,uint256 requestNullifier,uint256 authorizationTag,uint256 anonymousCommitmentX,uint256 anonymousCommitmentY) inputs,bytes proof,uint256[32] siblings)';
-export const vaultInterface = new Interface([CHALLENGE_ABI]);
+const REQUEST_TUPLE = '(uint16 protocolVersion,uint64 chainId,address contractAddress,uint256 activeRoot,uint256 stateSigningKeyX,uint256 stateSigningKeyY,uint64 requestTime,uint128 solvencyBound,uint256 requestNullifier,uint256 authorizationTag,uint256 anonymousCommitmentX,uint256 anonymousCommitmentY) inputs';
+// The challenger sends exactly two concession-exit calls: a defeat (request
+// evidence at the escape's successor nullifier) and a raise (request evidence
+// at the escaped nullifier, capped on-chain by its solvency bound).
+export const CHALLENGE_ABI = `function challengeEscapeWithdrawal(uint32 noteId,${REQUEST_TUPLE},bytes proof)`;
+export const RAISE_ABI = `function raiseEscapeConcession(uint32 noteId,${REQUEST_TUPLE},bytes proof,uint128 amount)`;
+export const AUTHORIZED_CALLS = Object.freeze(['challengeEscapeWithdrawal', 'raiseEscapeConcession']);
+export const vaultInterface = new Interface([CHALLENGE_ABI, RAISE_ABI]);
 const readMethods = new Set([
   'eth_chainId', 'eth_blockNumber', 'eth_getBlockByNumber', 'eth_getLogs',
   'eth_getTransactionReceipt', 'eth_getTransactionByHash',
-  'eth_getTransactionCount', 'eth_call', 'eth_estimateGas',
+  'eth_getTransactionCount', 'eth_call', 'eth_estimateGas', 'eth_gasPrice',
 ]);
-const transactionFields = new Set(['from', 'to', 'data', 'gas', 'nonce', 'value', 'chainId']);
+const transactionFields = new Set(['from', 'to', 'data', 'gas', 'nonce', 'value', 'chainId', 'gasPrice']);
 
 export class RpcError extends Error {
   constructor(code, message) { super(message); this.code = code; }
@@ -80,23 +86,31 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     requireValid(nonce <= BigInt(Number.MAX_SAFE_INTEGER), 'Nonce is too large');
     requireValid(isHexString(tx.data) && tx.data.length <= 16_386, 'Invalid calldata');
     let decoded;
+    let name;
     try {
-      decoded = vaultInterface.decodeFunctionData('challengeEscapeWithdrawal', tx.data);
-      requireValid(vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', decoded).toLowerCase() === tx.data.toLowerCase(), 'Noncanonical challenge calldata');
-    } catch { throw new RpcError(-32602, 'Only canonical challengeEscapeWithdrawal calls are authorized'); }
+      ({ name, args: decoded } = vaultInterface.parseTransaction({ data: tx.data }));
+      requireValid(AUTHORIZED_CALLS.includes(name), 'Unauthorized vault call');
+      requireValid(vaultInterface.encodeFunctionData(name, decoded).toLowerCase() === tx.data.toLowerCase(), 'Noncanonical challenge calldata');
+    } catch { throw new RpcError(-32602, 'Only canonical challengeEscapeWithdrawal or raiseEscapeConcession calls are authorized'); }
     requireValid(decoded.inputs.protocolVersion === 2n && decoded.inputs.chainId === chainId && address(decoded.inputs.contractAddress) === destination, 'Challenge proof targets another deployment');
     requireValid(isHexString(decoded.proof, 256), 'Challenge requires a 256-byte Groth16 proof');
-    return { to: destination, data: tx.data, value: 0n, chainId: chainId, gasLimit, nonce: Number(nonce), type: 0 };
+    requireValid(name !== 'raiseEscapeConcession' || decoded.amount > 0n, 'A raise must name a positive concession');
+    // A defeat may replace an unmined raise at the same nonce; the caller then
+    // names a higher gas price, still bounded by the configured cap.
+    const gasPriceFloor = tx.gasPrice === undefined ? 0n : quantity(tx.gasPrice, 'gas price');
+    requireValid(gasPriceFloor <= maxGasPrice, 'Gas price exceeds configured limit');
+    return { to: destination, data: tx.data, value: 0n, chainId: chainId, gasLimit, nonce: Number(nonce), type: 0, gasPriceFloor };
   }
 
   async function signAndSend(tx) {
-    const transaction = validateTransaction(tx);
+    const { gasPriceFloor, ...transaction } = validateTransaction(tx);
     await checkChain();
     const simulation = { from: sender, to: destination, data: transaction.data, value: '0x0' };
     await rpc('eth_call', [simulation, 'latest']);
     const estimate = quantity(await rpc('eth_estimateGas', [simulation]), 'gas estimate');
     requireValid(estimate <= transaction.gasLimit, 'Gas limit is below current estimate');
-    const gasPrice = quantity(await rpc('eth_gasPrice', []), 'gas price');
+    const upstreamGasPrice = quantity(await rpc('eth_gasPrice', []), 'gas price');
+    const gasPrice = upstreamGasPrice > gasPriceFloor ? upstreamGasPrice : gasPriceFloor;
     requireValid(gasPrice > 0n && gasPrice <= maxGasPrice, 'Gas price exceeds configured limit');
     const raw = await wallet.signTransaction({ ...transaction, gasPrice });
     const hash = await rpc('eth_sendRawTransaction', [raw]);

@@ -1,12 +1,27 @@
 # Deployment-bound challenge signer
 
 This internal JSON-RPC sidecar supplies `eth_sendTransaction` to
-`zkapi-challenged`. It signs only canonical `challengeEscapeWithdrawal` calls
+`dagon-zkapi-challenged --ledger evm`. It signs only two canonical vault calls:
+`challengeEscapeWithdrawal(noteId, inputs, proof)` (the root-independent defeat
+of a stale escape, with request evidence at its successor nullifier) and
+`raiseEscapeConcession(noteId, inputs, proof, amount)` (a positive concession
+raise, capped on-chain by the evidence's solvency bound). Exits, finalization,
+`claimExpired`, `retireClosedLeaf` and `pause` are never signed. A caller
+`gasPrice` is only a floor (the daemon's fee bump for a nonce that may already
+hold a transaction, such as a defeat replacing an unmined raise) and is still
+bounded by `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI`; give the challenge daemon the
+same value so its bumps stay within the cap. The signer signs
 for one configured vault and explicitly configured chain (Mainnet 1 or
 Sepolia 11155111), from its dedicated key, with
 zero ETH value. It decodes the complete ABI, checks the proof's deployment,
 simulates the call again, and checks current gas and fee bounds before signing
 with ethers. It does not expose generic signing or raw-transaction forwarding.
+It never signs a generic call; there is no restore transaction, because exits
+never remove a leaf.
+
+The read-only RPC allowlist includes `eth_gasPrice`: the daemon reads the
+upstream fee through this same sidecar before persisting and submitting each
+nonce reservation. Forwarding the quote does not relax signing fee caps.
 
 Required environment, supplied only to this container:
 
