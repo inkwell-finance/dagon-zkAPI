@@ -24,13 +24,13 @@ protocol semantics.
   replacement failures. The shared atomic checkpoint writer now uses native
   replace-existing semantics; the complete server library suite passes 94/94
   on Windows.
-- WSL has Rust 1.97.1, Solana CLI 3.1.11, Anchor 0.32.1, and Forge 2.1.0.
+- WSL has Rust 1.97.1, Solana CLI 3.1.11 and Anchor 0.32.1.
 
 ## Decisions
 
 1. Fork upstream rather than rewrite the browser prover, circuits, server state
    machine, or lease settlement.
-2. Replace only the Ethereum chain boundary: vault program, RPC/indexer,
+2. Replace only the upstream chain boundary: vault program, RPC/indexer,
    challenger transaction writer, wallet transaction builders, and billing
    asset adapter.
 3. Keep circuit revision `zkapi-v2-note-bound-v1` and its 12/14 public fields.
@@ -54,8 +54,8 @@ protocol semantics.
 - Withdrawal statement: 16 public inputs (registration, packed note fields,
   final balance, destination binding, withdrawal nullifier, has-clearance,
   next nullifier, conceded amount, `valid_until`; no Merkle path, root or
-  withdrawal tag), currently including a 20-byte EVM destination. This field
-  is reinterpreted as the Solana destination binding.
+  withdrawal tag), including a 20-byte destination field inherited from
+  upstream. This field is reinterpreted as the Solana destination binding.
 - Proof wire encoding is 256 bytes of big-endian BN254 coordinates and matches
   the input expected by `groth16-solana` after negating proof A.
 - `groth16-solana` 0.2.0 is available and uses Solana BN254 syscalls.
@@ -96,7 +96,7 @@ protocol semantics.
 - The object-safe asynchronous `CreditLedger` boundary covers state, paths,
   nullifiers, deposits, close/escape/challenge/finalize/expiry operations,
   signed submission, and transaction status. The Solana backend implements the
-  full boundary; EVM remains an explicit compatibility backend.
+  full boundary and is the only backend.
 - Solana cluster/deployment/destination binding helpers and deterministic test
   vectors are shared by the host and program without changing the v2 proof
   statements.
@@ -109,14 +109,14 @@ protocol semantics.
   trusted path because even a leaf hash exceeded the program compute ceiling.
 - The Solana ledger builds every vault operation and the finalized snapshot
   indexer reconstructs state only when its root matches the vault.
-- Solana-default server startup verifies the immutable deployment, finalized
+- Server startup verifies the immutable deployment, finalized
   vault metadata and pinned finalized Pyth source before opening SQLite. SOL
   quote arithmetic and settlement stay behind separate ledger/price boundaries.
-- The challenge daemon now defaults to Solana, discovers canonical finalized
+- The challenge daemon discovers canonical finalized
   pending PDAs through `CreditLedger`, derives paths from privacy-safe whole-tree
   snapshots, signs prepared staged operations with a restricted keypair, and
   durably recovers deterministic transaction signatures across lost responses
-  and restarts. EVM challenge operation is explicit compatibility mode.
+  and restarts.
 - Challenges are concession exits. The leaf stays in the tree on exit, so there
   is no restore. The challenger submits a defeat
   (`execute_challenge`, root-independent, request nullifier equal to the pending
@@ -127,7 +127,55 @@ protocol semantics.
   Live note and pending scans ignore System-owned, data-less accounts at
   program PDAs, since anyone can fund a PDA address.
 
-## Release-gate evidence (2026-10-02)
+## Solana-only cutover
+
+Solana is the only ledger: the inherited upstream chain backend, its billing
+adapter, signer sidecar and local client have been removed (see the README for
+the upstream pointer). Every shared parameter is compiled in from
+`solana/profile/shared.json`, and deployments differ only by network identity
+(see [the Solana profile](solana-profile.md)).
+
+Release gates are now:
+
+1. Verifiable program build: `bash scripts/build-verifiable-program.sh --check`
+   rebuilds the SBF program in the pinned Docker image and requires its
+   executable hash to equal `program.executable_sha256` in the profile.
+2. Local-validator parity stack: the validator preloads that verifiable program
+   at the declared program id as canonical loader-v3 accounts with upgrade
+   authority `None` (the state after a final authority revocation), clones the
+   mainnet Pyth receiver/oracle accounts, keeps the price account fresh only
+   through the operator pusher (`dagon-zkapi-pyth-pusher`) fed recorded real
+   signed Hermes updates, initializes the vault with `dagon-zkapi-deploy init-vault`, and must pass
+   `scripts/check-solana-parity.mjs` against the mainnet reference before the
+   full end-to-end lifecycle runs. The validator is the pinned, isolated Agave
+   4.4.1 release (`scripts/localnet/install-validator.sh`) with mainnet's
+   feature set cloned. The parity check requires equal activation for every
+   feature ID 4.4.1 knows, lists the reviewed retired (hardwired) mainnet IDs
+   explicitly, and fails closed on any unclassified active ID (see
+   [runtime feature parity](solana-profile.md#runtime-feature-parity)).
+
+### Cutover gate evidence (2026-11-06)
+
+- Verifiable build: executable hash
+  `a61192ae477628c499f35069d39be91f2964f5c39df08d22f65b657f4cb67115`, pinned
+  in the profile; two independent Docker build paths produced it.
+- Parity stack on the pinned validator: local `getVersion` 4.4.1, mainnet
+  4.4.0, both reporting feature set 2681577653. The 252 known active feature IDs
+  matched on both sides (0 missing, 0 extra), with the 59 retired IDs listed
+  explicitly. `check-solana-parity.mjs` reported
+  `Solana parity PASS (only explicit network identity may differ)`.
+- Billing against the replayed mainnet price account: the server returned HTTP
+  200 for two `/v2/billing/quote` requests 5.5 s apart (publish time
+  1793966005, ages 10 s and 15 s). Later replayed updates arrived at ages 6 s
+  and 8 s.
+- Lifecycle:
+  `cargo test --release -p dagon-zkapi-solana-ledger --test localnet -- --ignored --nocapture`
+  passed 1/1 in 105.51 s.
+- `dagon-zkapi-deploy init-vault` needs an explicit 1.4M compute-unit limit
+  (the same as the lifecycle test). The default 200k limit was exhausted in
+  one run, and the CLI now sets the higher limit.
+
+## Earlier release-gate evidence (2026-10-02)
 
 - Solana browser/native wallet transport is complete. It preserves derived
   `u64` chain IDs as canonical decimal strings, validates the exact signer,
@@ -188,8 +236,8 @@ request API, vault protocol, or `CreditLedger` boundary.
   recoverable without changing the generic `CreditLedger` contract.
 - The focused Solana-ledger library suite now passes 8/8 with canonical pending
   escape PDA discovery. The server library passes 94/94, including durable
-  accepted-but-response-lost Solana recovery and all formerly failing Windows
-  EVM checkpoint tests.
+  accepted-but-response-lost Solana recovery and the formerly failing Windows
+  checkpoint tests.
 
 ## Challenger package verification
 

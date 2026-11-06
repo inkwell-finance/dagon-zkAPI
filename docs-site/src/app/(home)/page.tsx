@@ -11,7 +11,7 @@ export default function HomePage() {
         zkAPI
       </h1>
       <p className="mt-6 max-w-2xl text-balance text-lg text-fd-muted-foreground md:text-xl">
-        Fund a private note with native ETH, prove authorization in your browser,
+        Fund a private note with native SOL, prove authorization in your browser,
         and pay for API usage from a private balance. Each authorization consumes
         one state; settlement returns a fresh signed balance bound to your note.
       </p>
@@ -29,7 +29,7 @@ export default function HomePage() {
           Protocol overview
         </Link>
         <a
-          href="https://github.com/ethereum/zkapi"
+          href="https://github.com/inkwell-finance/dagon-zkAPI"
           className="inline-flex h-11 items-center rounded-md border border-fd-border bg-fd-card px-6 text-sm font-medium hover:bg-fd-accent"
         >
           GitHub
@@ -46,8 +46,8 @@ export default function HomePage() {
             body: 'Short-lived OpenRouter keys keep prompts and responses between your app and OpenRouter.',
           },
           {
-            title: 'Native ETH settlement',
-            body: 'Only actual usage reduces your balance. Close the note to withdraw the unspent ETH.',
+            title: 'Native SOL settlement',
+            body: 'Only actual usage reduces your balance. Close the note to withdraw the unspent SOL.',
           },
         ].map((f) => (
           <div

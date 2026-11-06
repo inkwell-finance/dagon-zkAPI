@@ -18,11 +18,13 @@ revealing a selected note ID.
 | `GET /v1/tree/notes/{note_id}/zero-path` | Empty-leaf path for insertion |
 
 The root, leaf, and siblings use canonical BN254 field encodings. Duplicate,
-wrong-owner, malformed or root-inconsistent Solana accounts fail closed. The
-explicit `--ledger ethereum` compatibility mode retains event replay and its
-cursor checkpoint.
+wrong-owner, malformed or root-inconsistent Solana accounts fail closed.
 
-An indexer cannot forge membership: clients and contracts recompute roots from
+Run it with the network identity file and a finalized RPC:
+`dagon-zkapi-indexerd --solana-identity PATH --rpc-url URL [--listen ADDR] [--poll-interval-ms N]`
+(or `dagon-zkapi indexer` with the same options).
+
+An indexer cannot fake membership: clients and the vault recompute roots from
 the supplied paths. Incorrect or stale paths can cause proving or transaction
 failure. The deployment pins the vault and network independently of indexer
 responses.

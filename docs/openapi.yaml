@@ -3,12 +3,12 @@ info:
   title: Dagon zkAPI v2
   version: 2.0.0-testnet
   description: >-
-    Solana-default native-SOL lease, settlement, prepared-operation and
-    withdrawal Groth16 protocol API. Native ETH is explicit compatibility mode.
-    Sepolia deployments may require a shared password, advertised by public
+    Solana native-SOL lease, settlement, prepared-operation and withdrawal
+    Groth16 protocol API.
+    Non-mainnet deployments may require a shared password, advertised by public
     /health testnet_password_required. All service routes then require the
     TestnetPassword header and return 401 testnet_password_required when absent
-    or incorrect. Mainnet does not use this gate.
+    or incorrect. mainnet-beta refuses this gate.
 security:
   - TestnetPassword: []
   - {}
@@ -22,7 +22,7 @@ paths:
           description: Public health, including chain_id and testnet_password_required
   /v2/auth:
     get:
-      summary: Validate the Sepolia service password without side effects
+      summary: Validate the testnet service password without side effects
       responses:
         "200":
           description: Password accepted, or service access is not password-gated
@@ -36,9 +36,13 @@ paths:
         "401": {$ref: "#/components/responses/TestnetPasswordRequired"}
   /v2/billing/quote:
     get:
-      summary: Read the pinned finalized ledger billing quote
+      summary: Read a finalized Pyth SOL/USD billing quote observed by the server
       responses:
-        "200": {description: Native SOL/Pyth quote with exact deployment binding, or explicit EVM compatibility quote}
+        "200":
+          description: Native SOL/Pyth quote with exact deployment binding
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SolBillingQuote"}
   /v2/ledger/deposits/prepare:
     post:
       summary: Prepare ordered Solana deposit messages for Wallet Standard signing
@@ -117,7 +121,7 @@ components:
       type: apiKey
       in: header
       name: X-ZKAPI-Testnet-Password
-      description: Required only when Sepolia health reports testnet_password_required.
+      description: Required only when health reports testnet_password_required.
   responses:
     TestnetPasswordRequired:
       description: Missing or invalid shared password; no request processing occurred.
@@ -131,9 +135,35 @@ components:
             required: [error_code, error, retriable]
             properties:
               error_code: {const: testnet_password_required}
-              error: {const: "Sepolia password required or invalid"}
+              error: {const: "testnet password required or invalid"}
               retriable: {const: false}
   schemas:
+    SolBillingQuote:
+      type: object
+      description: >-
+        Accepted in a request authorization only while fresh and only if the
+        server itself observed it from the finalized price account.
+      additionalProperties: false
+      required: [asset, source, credit_unit, base_units_per_asset, chain_id, deployment_binding, backend, network, vault, feed_id, feed_account, receiver_program, price, exponent, confidence, publish_time, expires_at, posted_slot]
+      properties:
+        asset: {const: native_sol}
+        source: {type: string}
+        credit_unit: {const: lamports}
+        base_units_per_asset: {const: 1000000000}
+        chain_id: {type: string, pattern: "^[0-9]+$", description: Exact decimal u64}
+        deployment_binding: {type: string}
+        backend: {const: dagon.solana.groth16.v1}
+        network: {type: string}
+        vault: {type: string, description: Base58 vault-state PDA}
+        feed_id: {type: string}
+        feed_account: {type: string}
+        receiver_program: {type: string}
+        price: {type: string, pattern: "^[1-9][0-9]*$"}
+        exponent: {type: integer}
+        confidence: {type: string, pattern: "^[0-9]+$"}
+        publish_time: {type: integer}
+        expires_at: {type: integer}
+        posted_slot: {type: integer}
     Groth16Proof:
       type: object
       required: [backend, proof]

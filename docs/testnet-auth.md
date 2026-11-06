@@ -1,10 +1,13 @@
-# EVM compatibility: Sepolia shared password
+# Testnet shared password
 
-The protocol server can require one shared password on Sepolia (chain ID
-`11155111`). This is an additional service access gate, independent of note
-proofs and provider credentials. Configure only the Sepolia server process with
-`ZKAPI_TESTNET_PASSWORD`; an unset variable leaves the service ungated. Empty,
-invalid, or non-Sepolia configurations fail startup before opening the database.
+The protocol server can require one shared password on any non-mainnet
+deployment (any identity network other than `mainnet-beta`). This is an
+additional service access gate, independent of note proofs and provider
+credentials. Configure only the test server process with
+`ZKAPI_TESTNET_PASSWORD`; an unset variable leaves the service ungated. Empty or
+invalid values fail startup before opening the database, and supplying the
+variable on `mainnet-beta` fails startup with `ZKAPI_TESTNET_PASSWORD is not
+allowed on mainnet-beta`.
 The password must contain 16–1024 visible ASCII characters without whitespace;
 generate a random password and distribute it privately. Do not reuse an OA-org,
 OpenRouter, signing, or personal account credential.
@@ -12,7 +15,7 @@ OpenRouter, signing, or personal account credential.
 The public `GET /health` response reports `chain_id` and
 `testnet_password_required`. Clients validate a supplied password with
 `GET /v2/auth` and header `X-ZKAPI-Testnet-Password`; success returns
-`{"authenticated":true}`. Send this header to the configured Sepolia protocol
+`{"authenticated":true}`. Send this header to the configured test protocol
 server for every `/v2/*` call, including quotes, lease status/retirement,
 settlement recovery, expiry recovery and withdrawal clearance. Never send it
 to an RPC, indexer, verifier, OA org, provider, or another network. Clients
@@ -21,7 +24,7 @@ must not follow cross-origin redirects with this header.
 Missing or incorrect credentials return HTTP `401` and:
 
 ```json
-{"error_code":"testnet_password_required","error":"Sepolia password required or invalid","retriable":false}
+{"error_code":"testnet_password_required","error":"testnet password required or invalid","retriable":false}
 ```
 
 Authentication runs before body parsing, proof verification, database reads or
@@ -38,9 +41,9 @@ routes, including operator dashboards and unknown future routes, are gated.
 Gate-enabled API responses and authentication failures use `Cache-Control:
 no-store`. Browser preflight permits the password header and JSON content type
 without cookies. Mainnet's protocol access policy is unchanged; supplying this
-server environment variable on Mainnet is a startup error.
+server environment variable on `mainnet-beta` is a startup error.
 
-Put the password only in the root-owned mode-0600 Sepolia `server.env`, never
+Put the password only in the root-owned mode-0600 test `server.env`, never
 in public `config.json`, deployment metadata, a Docker image or CLI arguments.
 Keep TLS at the public edge and disable API caching. An upstream proxy must
 forward `X-ZKAPI-Testnet-Password`, `Origin`, `Access-Control-Request-Method`,
@@ -52,7 +55,7 @@ and the request headers to the server. Only the server container receives
 
 Rotate the password by replacing this one environment value and recreating the
 server with its existing data, seeds, vault, oracle and proof pins. No database
-migration or contract change is needed. Every new API call then requires the
+migration or vault change is needed. Every new API call then requires the
 replacement password; already-issued provider keys retain their existing
 bounded expiry. The same password is shared by everyone, so it adds no unique
 user identity or account cookie, but it proves membership in this test group.

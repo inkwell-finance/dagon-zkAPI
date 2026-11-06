@@ -20,9 +20,10 @@ protocol/                       # Tracked directly; no submodule checkout
     zkapi-proof/src/compact.rs   # Native prover, verifier, commitments, Schnorr
     zkapi-client/src/wallet.rs  # Native wallet library and request journal
     zkapi-browser               # WASM interface to the same v2 proof code
-  contracts/                    # Explicit EVM compatibility vault and verifier
   setup/v2/                     # Note-bound development keys and verifier
 crates/
+  dagon-zkapi-profile          # Compiled-in shared profile and network identity
+  dagon-zkapi-deploy           # Identity, vault init and parity tooling
   dagon-zkapi-ledger           # Generic CreditLedger boundary
   dagon-zkapi-solana-ledger    # Finalized RPC and prepared-operation adapter
   dagon-zkapi-solana           # Solana Groth16 verification wrapper
@@ -30,6 +31,7 @@ crates/
   zkapi-indexerd                # Finalized Solana account tree reconstruction
   zkapi-cli                     # dagon-zkapi operator command
 solana/programs/dagon-zkapi-vault/ # Anchor native-SOL vault
+solana/profile/                 # shared.json and network identity files
 sdk/                            # Browser wallet, Wallet Standard transport and journals
 ```
 

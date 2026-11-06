@@ -7,12 +7,7 @@ node_modules
 dist
 target
 protocol/rust/target
-protocol/contracts/cache
-protocol/contracts/out
 docs-site/.next
-demo/contracts/broadcast
-demo/contracts/cache
-demo/contracts/out
 demo-state
 tmp
 *.db

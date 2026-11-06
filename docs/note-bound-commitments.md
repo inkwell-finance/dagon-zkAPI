@@ -34,25 +34,25 @@ The circuit identifier is `zkapi-v2-concession-v1`. Proving and verifying key
 files carry that header; loaders reject files without the expected circuit header
 before decoding. Public deployment manifests must advertise
 `proof_setup.circuit_id`, and clients must
-pin the matching key hashes and vault address. The header guards against
+pin the matching key hashes and vault state. The header guards against
 accidental mismatches; it does not establish setup provenance or replace
 independently pinned key hashes.
 
 The checked-in `protocol/setup/v2` directory contains a single-party Groth16
-setup. The matching Solidity verifier and SDK WASM/proving keys must travel
-together. Artifact hashes identify setup files but do not establish that setup
+setup. The matching Solana verifier constants and SDK WASM/proving keys must
+travel together. Artifact hashes identify setup files but do not establish that setup
 secrets were destroyed. See [setup provenance](../protocol/setup/v2/README.md)
 for the trust assumptions.
 
 The vault has an immutable verifier and signing keys. Its circuit, proof
 artifacts, denomination, and client pins must match exactly. Wallet state and
 recovery journals are bound to that configuration. See
-[native ETH billing](native-eth-billing.md) for asset and quote configuration.
+[the Solana server](SOLANA_SERVER.md) for asset and quote configuration.
 
 ## Challenge and settlement requirements
 
 Operate `dagon-zkapi-challenged` alongside the server and indexer, with durable retries
-and an explicit restricted signer. Defeat and raise preserve the historical request
+and a dedicated challenge payer keypair. Defeat and raise preserve the historical request
 root and need no Merkle path; there is no restore step. The concession rule
 (G1/G2/G3), challenger policy and bounded pause are in
 [service operation](challenge-service.md).

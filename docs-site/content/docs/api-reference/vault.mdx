@@ -153,5 +153,7 @@ and mismatched staged payloads.
 
 The proof statement is `zkapi-v2-concession-v1`; the selected proving
 keys, generated Solana verifier constants and browser WASM must share the same
-artifact hashes. The legacy Solidity `ZkApiVault` is documented and shipped only
-as the explicit EVM compatibility backend.
+artifact hashes. Vault policy (version, request charge cap, note TTL, challenge
+period, pause bounds) comes from the shared profile in
+`solana/profile/shared.json` and is initialized by `dagon-zkapi-deploy
+init-vault`; the server refuses a vault whose policy differs from the profile.

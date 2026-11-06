@@ -194,11 +194,12 @@ The checked-in `protocol/setup/v2` artifacts are a **single-party setup
 generated with OS randomness**. No multiparty ceremony has been conducted.
 Matching hashes identify the artifacts; they do not establish that setup
 secrets were destroyed. The circuit, generator derivation and setup require
-independent review before production. The generated Solana verifier constants,
-legacy Solidity verifier, native keys and browser WASM/proving-key assets must
-match the same revision and setup.
+independent review before production. The generated Solana verifier constants
+(embedded in the vault program), native keys and browser WASM/proving-key
+assets must match the same revision and setup.
 
-The vault's proof adapter and signing keys are immutable. Configure the server,
+The vault program is immutable and its verifying keys and signing keys are fixed
+at deployment. Configure the server,
 client, verifier and proof assets to match the deployed vault, and verify the
 client's deployment pins before funding a wallet.
 

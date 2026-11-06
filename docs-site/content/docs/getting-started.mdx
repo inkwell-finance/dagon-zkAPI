@@ -4,7 +4,7 @@ description: Build Dagon zkAPI and integrate the Solana browser wallet
 ---
 
 The repository contains the Anchor native-SOL vault, Rust proof/runtime code,
-browser SDK, operator services and explicit EVM compatibility implementation.
+browser SDK and operator services.
 Use Node 24+, Rust, Solana CLI and Anchor 0.32.1.
 
 ## Build and verify
@@ -16,12 +16,14 @@ npm run verify:assets
 npm run verify:solana-vk
 cargo test --locked --workspace
 cargo test --locked --manifest-path protocol/rust/Cargo.toml --workspace
-anchor build --manifest-path solana/Anchor.toml
+bash scripts/build-verifiable-program.sh --check
 ```
 
-The unit suites do not prove deployment readiness. Complete the funded
-local-validator deposit/request/settlement/mutual-close/escape/challenge/finalize
-lifecycle before release.
+The unit suites do not prove deployment readiness. The release gates are the
+verifiable program build above and the local-validator parity stack, which runs
+the mainnet configuration (differing only in network identity) through the
+funded deposit/request/settlement/mutual-close/escape/challenge/finalize
+lifecycle.
 
 ## Browser integration
 
@@ -44,7 +46,7 @@ const unsubscribe = client.subscribe(snapshot => renderBalance(snapshot));
 For Solana, the host supplies a Wallet Standard account with
 `solana:signTransaction`. The deployment configuration pins the finalized RPC,
 genesis hash, immutable program, vault-state PDA, exact decimal-string chain ID,
-Pyth identities, signer keys and proof hashes. The SDK owns private note state,
+Pyth identities, signing keys and proof hashes. The SDK owns private note state,
 proof generation, signed-transaction journals and recovery.
 
 Never log note secrets, proof witnesses, provider credentials or signed
@@ -56,17 +58,18 @@ transactions. Do not clear a durable stage journal from UI state.
 cargo build --release --locked \
   -p zkapi-cli --bin dagon-zkapi \
   -p zkapi-indexerd --bin dagon-zkapi-indexerd \
-  -p zkapi-serverd --bin dagon-zkapi-challenged
+  -p zkapi-serverd --bin dagon-zkapi-challenged \
+  -p dagon-zkapi-deploy --bin dagon-zkapi-deploy
 
 ./target/release/dagon-zkapi --help
 ./target/release/dagon-zkapi-indexerd --help
 ./target/release/dagon-zkapi-challenged --help
 ```
 
-All ledger-facing commands default to Solana. `--ledger evm` (or
-`--ledger ethereum` for the indexer) is compatibility-only. Use the
-Solana-default examples in `docker/aws/` and keep populated secret files mode
-`0600`.
+Shared parameters are compiled in from `solana/profile/shared.json`. Each
+ledger-facing command takes only a network identity file
+(`--solana-identity`), an RPC URL and secrets. Use the examples in
+`docker/aws/` and keep populated secret files mode `0600`.
 
 ## Proof setup
 
@@ -81,5 +84,5 @@ Only when creating a new incompatible deployment:
 ./target/release/dagon-zkapi setup --output-dir protocol/setup/new-deployment
 ```
 
-The vault's verifier and signer keys are immutable. Independently verify every
+The vault's verifier and signing keys are immutable. Independently verify every
 deployed identity before funding a wallet.

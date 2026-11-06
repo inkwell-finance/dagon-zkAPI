@@ -8,9 +8,8 @@ usage with Groth16 proofs generated in the browser. Each accepted authorization
 consumes a nullifier; after usage settles, the server signs the next private
 balance and anchor.
 
-The production-default ledger is the immutable Solana Anchor vault. The original
-EVM/native-ETH path remains only as an explicit compatibility backend. Encrypt
-and other FHE systems are outside the trusted money path.
+The ledger is the immutable Solana Anchor vault. Encrypt and other FHE systems
+are outside the trusted money path.
 
 These docs cover protocol v2 and circuit `zkapi-v2-concession-v1`: Groth16 over
 BN254, Poseidon, note-bound Baby-JubJub commitments, and Schnorr signatures.

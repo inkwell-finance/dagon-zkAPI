@@ -35,9 +35,8 @@ See [Cryptography](/docs/cryptography) for the exact primitives and public input
 4. The wallet initializes `B = D`, `τ = 1`, and a random blinding `r`. Genesis
    requires no server signature; the circuit enforces the initial balance and anchor.
 
-The Solana-default vault uses integer lamports and requires exactly `D`
-lamports. The proof statement treats credits as integers and does not embed an
-asset conversion. EVM compatibility interprets one credit as one gwei.
+The vault uses integer lamports and requires exactly `D` lamports. The proof
+statement treats credits as integers and does not embed an asset conversion.
 
 ## Why the commitment includes the note
 
@@ -127,8 +126,7 @@ signature as a private witness to the withdrawal proof, then submits the
 `execute_close` instruction with `next_nullifier = 0` and `conceded = 0`. The
 vault checks its immutable deployment keys, note fields and the Groth16 proof,
 consumes the nullifier, pays out and marks the note `Closed`. The leaf stays
-until the permissionless, `Closed`-only `retire_closed_leaf` (EVM
-`retireClosedLeaf`) removes it.
+until the permissionless, `Closed`-only `retire_closed_leaf` removes it.
 
 **Escape hatch.** Without clearance, the wallet submits `execute_escape`. The
 vault consumes the state nullifier `N` and the derived successor nullifier
@@ -189,8 +187,7 @@ with `execute_claim_expired` (no transition proof) after `claimable_at`.
 Use matching note-bound circuits, proving/verifying keys, browser WASM, and
 deployed verifiers. The vault's proof adapter and signing keys are immutable;
 client configuration must pin their deployed values. The SDK supports native
-SOL by default, keeps EVM/native-ETH state explicitly tagged as compatibility
-data, and rejects incompatible wallet formats without relabeling them.
+SOL and rejects incompatible wallet formats without relabeling them.
 
 The current elliptic-curve construction is **not post-quantum**. The checked-in
 setup is single-party; no multiparty ceremony has been conducted.
