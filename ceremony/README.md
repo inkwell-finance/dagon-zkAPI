@@ -54,7 +54,7 @@ The command prints your **attestation hash** and the contribution hash of each c
 
 ### How long does it take?
 
-Current round-zero key sizes are 35,970,228 / 41,807,844 / 49,791,336 bytes (request / withdrawal / transition): **127,569,408 bytes total**, downloaded and uploaded per contribution. Allow several minutes or more; no full-size browser/Railway latency guarantee is established. Earlier 25/40-second estimates did not describe this artifact set. Slots last 25 minutes; expired clients may rejoin. Uploads have a real 15-minute cancellation deadline, including stalled reads and EOF.
+Current round-zero key sizes are 37,140,200 / 17,978,808 / 49,791,336 bytes (request / withdrawal / transition): **104,910,344 bytes total**, downloaded and uploaded per contribution. Allow several minutes or more; no full-size browser/Railway latency guarantee is established. Slots last 25 minutes; expired clients may rejoin. Uploads have a real 15-minute cancellation deadline, including stalled reads and EOF.
 
 ## Privacy and secret-memory lifetime
 

@@ -30,14 +30,14 @@ Pick one way. All three do the same computation.
 1. Open <https://ceremony.dagon.so> on a laptop or phone you own.
 2. Optionally type a name to appear in the public list (or stay anonymous).
 3. Press **Contribute my randomness**. You may wait in a short queue.
-4. Keep the tab open until it says **Done**. It downloads about 120 MB, computes, and uploads about 120 MB.
+4. Keep the tab open until it says **Done**. It downloads about 105 MB, computes, and uploads about 105 MB.
 5. Copy the **attestation hash** and post it publicly (X, Farcaster, a GitHub gist, your blog).
 
 ### 2. Terminal, checked against published pins (recommended; needs Node.js 24+)
 
 ```sh
 curl -fsSL https://ceremony.dagon.so/contribute.mjs -o contribute.mjs
-curl -fsSL https://raw.githubusercontent.com/inkwell-finance/dagon-zkAPI/99371a7/ceremony/ceremony.json -o ceremony.json
+curl -fsSL https://raw.githubusercontent.com/inkwell-finance/dagon-zkAPI/ccc634b/ceremony/ceremony.json -o ceremony.json
 sha256sum contribute.mjs ceremony.json
 ```
 
@@ -46,7 +46,7 @@ The two hashes must equal the ones published at
 
 ```
 8d87e42f22d3b4b2a6732f4c7b6b56852b7645896e21d59b0e0ca7c75624e32b  contribute.mjs
-a9644620cd7322815eb2a47996596223b6caa5e821a381cc6795491742dafb3a  ceremony.json
+fa188c5cb0e15827626cfce1e168321839a65e452a93a89602fab4349e076c5e  ceremony.json
 ```
 
 Then:
@@ -60,7 +60,7 @@ It prints your attestation hash and saves a receipt file. Keep the receipt and p
 ### 3. Build it yourself (strongest; removes any need to trust us)
 
 ```sh
-git clone https://github.com/inkwell-finance/dagon-zkAPI && cd dagon-zkAPI && git checkout 99371a7
+git clone https://github.com/inkwell-finance/dagon-zkAPI && cd dagon-zkAPI && git checkout ccc634b
 cd ceremony && npm ci && node build.mjs
 node web/dist/contribute.mjs --server https://ceremony.dagon.so --ceremony ceremony.json --name "Your name"
 ```
@@ -85,7 +85,9 @@ reads the code, the "you must trust the server's code" caveat below disappears.
   removes that risk; the browser path cannot fully remove it.
 - **Erasing memory is best effort.** The program discards your randomness when it finishes, but no program can
   guarantee the OS never swapped it to disk. Close the tab or process afterwards.
-- This code was audited internally, by several independent AI review passes, not by an external audit firm.
+- The ceremony tooling and the circuits were reviewed internally through several independent AI audit passes (the
+  circuits, both vaults and the server were hardened as a result), not by an external audit firm. A circuit change
+  after the ceremony would void it; we fixed known issues before opening it for that reason.
 
 ## How you can check your contribution was used
 
@@ -105,12 +107,13 @@ reads the code, the "you must trust the server's code" caveat below disappears.
 ## Technical summary (for reviewers and AI assistants)
 
 - Groth16 phase 2 on BN254 using snarkjs 0.7.6, over the public Hermez Perpetual Powers of Tau (power 16, pinned
-  blake2b-512 hash). Three circuits: `request`, `withdrawal`, `transition`, with r1cs pinned by sha256.
+  blake2b-512 hash). Three circuits of `zkapi-v2-concession-v1`: `request`, `withdrawal`, `transition`, with r1cs
+  pinned by sha256 and reproducible from source (`ceremony_export`, see `ceremony/README.md`).
 - Each upload must extend the previous round by exactly one contribution and is fully re-verified
   (`snarkjs zkey verify` against the r1cs and Powers of Tau) before it is accepted.
 - Attestation = sha256 of `dagon-zkapi-ceremony-v1\nround:<n>\n` followed by `<circuit>:<contribution hash>\n` for
   each circuit in order.
-- Source: <https://github.com/inkwell-finance/dagon-zkAPI/tree/99371a7/ceremony>. Design and operator guide:
+- Source: <https://github.com/inkwell-finance/dagon-zkAPI/tree/ccc634b/ceremony>. Design and operator guide:
   `ceremony/README.md`.
 
 Questions: reply to whoever sent you this link. Thank you for helping.
