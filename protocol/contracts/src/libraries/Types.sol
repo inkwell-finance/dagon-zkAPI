@@ -7,7 +7,9 @@ library Types {
         Uninitialized,
         Active,
         PendingWithdrawal,
-        Closed
+        Closed,
+        /// @dev Value 4 is reserved (the deleted two-phase `Challenged` status); never assigned.
+        ReservedChallenged
     }
 
     struct Note {
@@ -15,12 +17,18 @@ library Types {
         uint128 depositAmount;
         uint64 expiryTs;
         NoteStatus status;
+        /// @notice Set by a defeat: an expiry sweep waits until at least this time (plus pause time).
+        uint64 claimableAfter;
+        /// @notice totalPausedDuration when the note was deposited.
+        uint64 pausedOffset;
     }
 
     struct PendingWithdrawalData {
         bool exists;
-        uint256 activeRoot;
         uint256 withdrawalNullifier;
+        uint256 nextNullifier;
+        uint128 stateBalance;
+        uint128 conceded;
         uint128 finalBalance;
         address destination;
         uint64 challengeDeadline;
@@ -42,21 +50,26 @@ library Types {
         uint256 anonymousCommitmentY;
     }
 
-    /// @dev Field order is the exact Groth16 public-input order.
+    /// @dev Field order is the exact Groth16 public-input order, except that the adapter packs
+    /// (noteId, depositAmount, expiryTs) into the single input `noteId * 2^192 + depositAmount * 2^64 + expiryTs`.
     struct WithdrawalPublicInputs {
         uint16 protocolVersion;
         uint64 chainId;
         address contractAddress;
-        uint256 activeRoot;
+        uint256 registration;
         uint256 stateSigningKeyX;
         uint256 stateSigningKeyY;
         uint256 clearanceSigningKeyX;
         uint256 clearanceSigningKeyY;
         uint32 noteId;
+        uint128 depositAmount;
+        uint64 expiryTs;
         uint128 finalBalance;
         address destination;
         uint256 withdrawalNullifier;
         bool hasClearance;
-        uint256 withdrawalTag;
+        uint256 nextNullifier;
+        uint128 conceded;
+        uint64 validUntil;
     }
 }

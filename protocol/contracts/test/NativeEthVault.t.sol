@@ -6,6 +6,7 @@ import {IZkApiProofAdapter} from "../src/interfaces/IZkApiProofAdapter.sol";
 import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
 import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
+import {Events} from "../src/libraries/Events.sol";
 
 contract NativeProofFixture is IZkApiProofAdapter {
     function assertValidRequest(Types.RequestPublicInputs calldata, bytes calldata) external pure {}
@@ -28,6 +29,39 @@ contract ReenterNativePayout {
 
     receive() external payable {
         (reentered,) = address(vault).call(abi.encodeCall(vault.finalizeEscapeWithdrawal, (0)));
+    }
+}
+
+/// Refuses ETH until switched on.
+contract ToggleNativePayout {
+    bool public accepting;
+
+    function setAccepting(bool value) external {
+        accepting = value;
+    }
+
+    receive() external payable {
+        if (!accepting) revert();
+    }
+}
+
+/// Burns all gas it is given, or (once switched) accepts ETH by writing three fresh slots,
+/// which fits within ESCAPE_PAYOUT_GAS but not within a starved call.
+contract GasHungryPayout {
+    bool public burning = true;
+    uint256 public count;
+    mapping(uint256 => uint256) public slots;
+
+    function setBurning(bool value) external {
+        burning = value;
+    }
+
+    receive() external payable {
+        if (burning) {
+            while (true) {}
+        }
+        slots[++count] = 1;
+        slots[++count] = 1;
     }
 }
 
@@ -60,22 +94,27 @@ contract NativeEthVaultTest is Test {
         view
         returns (Types.WithdrawalPublicInputs memory)
     {
-        return Types.WithdrawalPublicInputs(
-            2,
-            uint64(block.chainid),
-            address(vault),
-            vault.currentRoot(),
-            11,
-            12,
-            13,
-            14,
-            0,
-            700_000,
-            destination,
-            99,
-            clearance,
-            100
-        );
+        (bytes32 commitment, uint128 amount, uint64 expiryTs,,,) = vault.notes(0);
+        return Types.WithdrawalPublicInputs({
+            protocolVersion: 2,
+            chainId: uint64(block.chainid),
+            contractAddress: address(vault),
+            registration: uint256(commitment),
+            stateSigningKeyX: 11,
+            stateSigningKeyY: 12,
+            clearanceSigningKeyX: 13,
+            clearanceSigningKeyY: 14,
+            noteId: 0,
+            depositAmount: amount,
+            expiryTs: expiryTs,
+            finalBalance: 700_000,
+            destination: destination,
+            withdrawalNullifier: 99,
+            hasClearance: clearance,
+            nextNullifier: clearance ? 0 : 100,
+            conceded: 0,
+            validUntil: uint64(block.timestamp + 1 days)
+        });
     }
 
     function test_nativeDepositAndMutualPayout() public {
@@ -86,9 +125,9 @@ contract NativeEthVaultTest is Test {
         assertEq(vault.nativeAssetWeiPerUnit(), 1 gwei);
         assertEq(address(vault).balance, uint256(UNITS) * 1 gwei);
         uint256 initial = user.balance;
-        vault.mutualClose(withdrawal(user, true), "", siblings);
+        vault.mutualClose(withdrawal(user, true), "");
         assertEq(user.balance - initial, 700_000 gwei);
-        assertEq(treasury.balance, 300_000 gwei);
+        assertEq(_treasuryPaid(), 300_000 gwei);
         assertEq(address(vault).balance, 0);
         assertTrue(vault.usedNullifiers(99));
     }
@@ -123,73 +162,127 @@ contract NativeEthVaultTest is Test {
         Types.WithdrawalPublicInputs memory inputs = withdrawal(address(recipient), true);
         uint256 root = vault.currentRoot();
         vm.expectRevert(Errors.NativeTransferFailed.selector);
-        vault.mutualClose(inputs, "", siblings);
+        vault.mutualClose(inputs, "");
         assertEq(vault.currentRoot(), root);
         assertEq(address(vault).balance, uint256(UNITS) * 1 gwei);
         assertFalse(vault.usedNullifiers(99));
-        (,,, Types.NoteStatus status) = vault.notes(0);
+        (,,, Types.NoteStatus status,,) = vault.notes(0);
         assertEq(uint256(status), uint256(Types.NoteStatus.Active));
     }
 
-    function test_rejectedTreasuryPayoutRollsBackUserPayout() public {
+    /// Threat: the owner points the treasury at a contract that refuses ETH to hold payouts hostage.
+    function test_rejectingTreasuryDoesNotBlockUserPayout() public {
         deposit();
         vault.setTreasury(address(new RejectNativePayout()));
-        uint256 root = vault.currentRoot();
         uint256 userBalance = user.balance;
-        Types.WithdrawalPublicInputs memory inputs = withdrawal(user, true);
+        vault.mutualClose(withdrawal(user, true), "");
+        assertEq(user.balance - userBalance, 700_000 gwei);
+        assertEq(vault.treasuryAccrued(), 300_000);
+        assertEq(address(vault).balance, 300_000 gwei);
         vm.expectRevert(Errors.NativeTransferFailed.selector);
-        vault.mutualClose(inputs, "", siblings);
-        assertEq(user.balance, userBalance);
-        assertEq(vault.currentRoot(), root);
-        assertEq(address(vault).balance, uint256(UNITS) * 1 gwei);
-        assertFalse(vault.usedNullifiers(99));
-        (,,, Types.NoteStatus status) = vault.notes(0);
-        assertEq(uint256(status), uint256(Types.NoteStatus.Active));
+        vault.withdrawTreasury();
+        assertEq(vault.treasuryAccrued(), 300_000);
+        vault.setTreasury(treasury);
+        assertEq(_treasuryPaid(), 300_000 gwei);
+        assertEq(address(vault).balance, 0);
     }
 
-    function test_rejectedEscapePayoutPreservesPendingWithdrawal() public {
+    /// Threat: a user escapes to a destination that refuses ETH so finalization reverts forever,
+    /// locking the operator's share (everything already served) in the vault at the cost of one
+    /// gwei unit. The payout is credited instead; the share accrues and the note closes.
+    function test_rejectingEscapeDestinationCannotLockOperatorShare() public {
         deposit();
-        RejectNativePayout recipient = new RejectNativePayout();
-        vault.initiateEscapeWithdrawal(withdrawal(address(recipient), false), "", siblings);
-        uint256 root = vault.currentRoot();
-        (,,,,, uint64 deadline) = vault.pendingWithdrawals(0);
-        vm.warp(deadline);
-        vm.expectRevert(Errors.NativeTransferFailed.selector);
+        ToggleNativePayout recipient = new ToggleNativePayout();
+        vault.initiateEscapeWithdrawal(withdrawal(address(recipient), false), "");
+        (,,,,,,, uint64 deadline) = vault.pendingWithdrawals(0);
+        vm.warp(deadline + 1);
+        vm.expectEmit(true, true, false, true, address(vault));
+        emit Events.EscapePayoutDeferred(0, address(recipient), 700_000);
+        vm.prank(address(0xbeef));
         vault.finalizeEscapeWithdrawal(0);
-        assertEq(vault.currentRoot(), root);
-        assertEq(address(vault).balance, uint256(UNITS) * 1 gwei);
-        assertEq(treasury.balance, 0);
-        assertTrue(vault.usedNullifiers(99));
-        (,,, Types.NoteStatus status) = vault.notes(0);
-        assertEq(uint256(status), uint256(Types.NoteStatus.PendingWithdrawal));
-        (bool exists,, uint256 nullifier, uint128 balance, address destination, uint64 retainedDeadline) =
-            vault.pendingWithdrawals(0);
-        assertTrue(exists);
-        assertEq(nullifier, 99);
-        assertEq(balance, 700_000);
-        assertEq(destination, address(recipient));
-        assertEq(retainedDeadline, deadline);
+        (,,, Types.NoteStatus status,,) = vault.notes(0);
+        assertEq(uint256(status), uint256(Types.NoteStatus.Closed));
+        (bool exists,,,,,,,) = vault.pendingWithdrawals(0);
+        assertFalse(exists);
+        assertEq(vault.escapePayoutCredits(address(recipient)), 700_000);
+        assertEq(_treasuryPaid(), 300_000 gwei);
+        vm.expectRevert(Errors.NativeTransferFailed.selector);
+        vault.claimEscapePayout(address(recipient));
+        assertEq(vault.escapePayoutCredits(address(recipient)), 700_000);
+        recipient.setAccepting(true);
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit Events.EscapePayoutClaimed(address(recipient), 700_000);
+        vm.prank(address(0xbeef));
+        vault.claimEscapePayout(address(recipient));
+        assertEq(address(recipient).balance, 700_000 gwei);
+        assertEq(vault.escapePayoutCredits(address(recipient)), 0);
+        assertEq(address(vault).balance, 0);
+        vm.expectRevert(Errors.ZeroAmount.selector);
+        vault.claimEscapePayout(address(recipient));
+    }
+
+    /// A destination that burns all gas it is given costs at most ESCAPE_PAYOUT_GAS, and a caller
+    /// cannot starve an accepting destination into a credit: every gas limit pays it or reverts.
+    function test_escapePayoutGasIsBoundedAndCannotBeStarved() public {
+        deposit();
+        GasHungryPayout recipient = new GasHungryPayout();
+        vault.initiateEscapeWithdrawal(withdrawal(address(recipient), false), "");
+        (,,,,,,, uint64 deadline) = vault.pendingWithdrawals(0);
+        vm.warp(deadline + 1);
+        bytes memory finalize = abi.encodeCall(vault.finalizeEscapeWithdrawal, (0));
+        uint256 snapshot = vm.snapshotState();
+        // 5M gas offered; an uncapped push would burn 63/64 of it.
+        uint256 before = gasleft();
+        vault.finalizeEscapeWithdrawal{gas: 5_000_000}(0);
+        assertLt(before - gasleft(), vault.ESCAPE_PAYOUT_GAS() + 150_000);
+        assertEq(vault.escapePayoutCredits(address(recipient)), 700_000);
+        vm.revertToState(snapshot);
+        recipient.setBurning(false);
+        snapshot = vm.snapshotState();
+        uint256 paid;
+        uint256 reverted;
+        for (uint256 limit = 30_000; limit <= 400_000; limit += 5_000) {
+            (bool ok,) = address(vault).call{gas: limit}(finalize);
+            assertEq(vault.escapePayoutCredits(address(recipient)), 0);
+            (,,, Types.NoteStatus status,,) = vault.notes(0);
+            if (ok) {
+                ++paid;
+                assertEq(address(recipient).balance, 700_000 gwei);
+            } else {
+                ++reverted;
+                assertEq(uint256(status), uint256(Types.NoteStatus.PendingWithdrawal));
+            }
+            vm.revertToState(snapshot);
+        }
+        assertGt(paid, 0);
+        assertGt(reverted, 0);
     }
 
     function test_nativeEscapeAndReentrancyGuard() public {
         deposit();
         ReenterNativePayout recipient = new ReenterNativePayout(vault);
-        vault.initiateEscapeWithdrawal(withdrawal(address(recipient), false), "", siblings);
-        (bool exists,,,,, uint64 deadline) = vault.pendingWithdrawals(0);
+        vault.initiateEscapeWithdrawal(withdrawal(address(recipient), false), "");
+        (bool exists,,,,,,, uint64 deadline) = vault.pendingWithdrawals(0);
         assertTrue(exists);
-        vm.warp(deadline);
+        vm.warp(deadline + 1);
         vault.finalizeEscapeWithdrawal(0);
         assertFalse(recipient.reentered());
         assertEq(address(recipient).balance, 700_000 gwei);
-        assertEq(treasury.balance, 300_000 gwei);
+        assertEq(_treasuryPaid(), 300_000 gwei);
     }
 
     function test_nativeExpiryPayout() public {
         deposit();
-        (,, uint64 expiry,) = vault.notes(0);
+        (,, uint64 expiry,,,) = vault.notes(0);
         vm.warp(expiry);
-        vault.claimExpired(0, siblings);
-        assertEq(treasury.balance, uint256(UNITS) * 1 gwei);
+        vault.claimExpired(0);
+        assertEq(_treasuryPaid(), uint256(UNITS) * 1 gwei);
         assertEq(address(vault).balance, 0);
+    }
+
+    /// @dev Pays whatever the vault accrued for the treasury and returns the treasury's balance.
+    function _treasuryPaid() internal returns (uint256) {
+        if (vault.treasuryAccrued() != 0) vault.withdrawTreasury();
+        return treasury.balance;
     }
 }

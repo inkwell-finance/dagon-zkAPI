@@ -75,7 +75,7 @@ contract DeployScript is Script {
         string memory manifest = "deployment";
         vm.serializeUint(manifest, "chainId", block.chainid);
         vm.serializeUint(manifest, "protocolVersion", 2);
-        vm.serializeString(manifest, "circuitId", "zkapi-v2-note-bound-v1");
+        vm.serializeString(manifest, "circuitId", "zkapi-v2-concession-v1");
         vm.serializeAddress(manifest, "owner", deployer);
         vm.serializeAddress(manifest, "vault", address(vault));
         vm.serializeAddress(manifest, "billingToken", vault.billingToken());
