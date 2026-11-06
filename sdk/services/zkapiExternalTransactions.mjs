@@ -9,7 +9,7 @@ export function externalRecoveryContext(recovery, funding, deploymentId) {
         version: 1,
         kind: recovery?.kind || null,
         deploymentId,
-        chainId: Number(funding?.chain_id),
+        chainId: losslessChainId(funding?.chain_id),
         contractAddress: funding?.contract_address
     };
     for (const key of PUBLIC_RECOVERY_FIELDS) {
@@ -56,3 +56,4 @@ export function hasDurableTransactionHash(record, hash) {
         ...(record.finalizeAttempts || []).map(attempt => attempt.hash)]
         .some(value => String(value || '').toLowerCase() === expected);
 }
+import { losslessChainId } from './zkapiLedgerIdentity.mjs';

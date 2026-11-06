@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 const sdk = path.resolve(process.argv[2]);
 const wasm = await import(pathToFileURL(path.join(sdk, 'wasm/zkapi_browser.js')));
 await wasm.default({ module_or_path: fs.readFileSync(path.join(sdk, 'wasm/zkapi_browser_bg.wasm')) });
-assert.equal(wasm.browser_circuit_id(), 'zkapi-v2-note-bound-v1');
+assert.equal(wasm.browser_circuit_id(), 'zkapi-v2-concession-v1');
 const fixture = JSON.parse(fs.readFileSync(0, 'utf8'));
 const config = JSON.stringify(fixture.config);
 const state = wasm.browser_confirm_deposit(config, JSON.stringify(fixture.deposit));

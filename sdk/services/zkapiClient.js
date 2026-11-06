@@ -1,5 +1,7 @@
 import walletCodec from '../wallet.js';
-import { isNativeEthFunding, validateNativeFunding, assertNativeVault, validateNativeQuote, readNativeQuote, nativeUnitsForUsd, nativeUsdMicros, nativeDepositValue, parseUnits, formatUnits } from './zkapiNativeEth.mjs';
+import { isNativeEthFunding, isNativeSolFunding, validateNativeFunding, assertNativeVault, validateNativeQuote, readNativeQuote, nativeUnitsForUsd, nativeUsdMicros, nativeDepositValue, parseUnits, formatUnits } from './zkapiNativeBilling.mjs';
+import { base58Decode, base58Encode } from './zkapiSolanaTransport.mjs';
+import { assertSolanaDepositsOpen, solanaRpc } from './zkapiNativeSol.mjs';
 import { beginBrowserSdkInitialization } from '../configure.js';
 import browserWalletRuntime from './browserWalletRuntime.js';
 import { contractEstimateError, contractRevertSelector } from './zkapiContractError.mjs';
@@ -9,6 +11,7 @@ import { backgroundWithdrawalClaims, isUnsubmittedParkedMutualWithdrawal } from 
 import { deriveExpiryRecords, readFinalizedExpiryClaims } from './zkapiExpiryHistory.mjs';
 import { externalRecoveryContext, sameAddress, externalTransactionNonce, assertExternalTransaction,
     hasDurableTransactionHash } from './zkapiExternalTransactions.mjs';
+import { matchEscapePayout } from './zkapiExitPolicy.mjs';
 
 const WITHDRAWAL_STORAGE_KEY = 'zkapi-withdrawal-v2';
 // Ethereum's `finalized` block tag is authoritative when the wallet RPC
@@ -19,6 +22,7 @@ const CLOSE_FINALITY_FALLBACK_BLOCKS = 64;
 // One provider is retained across all nested/concurrent asynchronous client
 // operations. In particular a manual signing prompt can outlive many RPCs.
 const walletProviders = new WeakMap();
+const solanaWalletProviders = new WeakMap();
 
 const {
     ABI,
@@ -27,6 +31,7 @@ const {
     callData,
     encodeDeposit,
     encodeFinalizeEscape,
+    NULLIFIER_STATE,
     encodeWithdrawal,
     escapePeriodBadge,
     escapePeriodLabel,
@@ -36,20 +41,29 @@ const {
 } = walletCodec;
 
 function readStoredWithdrawal() {
-    if (typeof window === 'undefined' || typeof localStorage === 'undefined') return null;
+    if (typeof window === 'undefined' || typeof localStorage === 'undefined'
+        || typeof localStorage.getItem !== 'function') return null;
     try {
         const stored = JSON.parse(localStorage.getItem(WITHDRAWAL_STORAGE_KEY) || 'null');
         return stored?.noteId != null && ['prepared', 'submitted', 'pending'].includes(stored.phase)
             ? stored
             : null;
     } catch {
-        localStorage.removeItem(WITHDRAWAL_STORAGE_KEY);
+        localStorage.removeItem?.(WITHDRAWAL_STORAGE_KEY);
         return null;
     }
 }
 
 function normalizeWithdrawalDestination(destination, funding) {
     if (destination === undefined) return null;
+    if (isNativeSolFunding(funding)) {
+        const decoded = base58Decode(destination, 32, 'Solana withdrawal address');
+        const normalized = base58Encode(decoded);
+        if (normalized === funding.vault_state) {
+            throw new TypeError('The withdrawal address cannot be the vault state account.');
+        }
+        return normalized;
+    }
     if (typeof destination !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(destination)
         || /^0x0{40}$/i.test(destination)) {
         throw new TypeError('Choose a valid nonzero Ethereum withdrawal address.');
@@ -147,6 +161,7 @@ class ZkapiClient extends EventTarget {
     constructor() {
         super();
         walletProviders.set(this, { override: null, active: null, operations: 0 });
+        solanaWalletProviders.set(this, { wallet: null, account: null });
         this.config = null;
         this.wallet = null;
         this.walletAddress = null;
@@ -380,6 +395,32 @@ class ZkapiClient extends EventTarget {
         return this.ethereum;
     }
 
+    get solanaWallet() {
+        return solanaWalletProviders.get(this)?.wallet || null;
+    }
+
+    get solanaAccount() {
+        return solanaWalletProviders.get(this)?.account || null;
+    }
+
+    setSolanaWallet(wallet = null, account = null) {
+        if (wallet !== null && (typeof wallet !== 'object' || !wallet.features)) {
+            throw new TypeError('The Solana wallet must implement Wallet Standard features.');
+        }
+        if (account !== null && (!account?.address || !account?.publicKey)) {
+            throw new TypeError('The Solana wallet account is invalid.');
+        }
+        if (this.depositPromise || this.withdrawPromise || this.finalizePromise) {
+            const error = new Error('Wait for the current wallet action to finish before changing payment methods.');
+            error.code = 'wallet_provider_busy';
+            throw error;
+        }
+        solanaWalletProviders.set(this, { wallet, account });
+        this.walletAddress = account?.address || null;
+        this.emitChange('wallet-provider');
+        return wallet;
+    }
+
     detachWalletEvents() {
         const attached = this.walletEventHandlers;
         if (!attached) return;
@@ -554,9 +595,10 @@ class ZkapiClient extends EventTarget {
             this.withdrawals = browserSnapshot.withdrawals || [];
             this.deposits = browserSnapshot.deposits || [];
             this.lastError = null;
-            if (this.isNativeEthFunding && (!this.ethUsdCheckedAt || Date.now() - this.ethUsdCheckedAt > 60_000)) {
+            if ((this.isNativeEthFunding || this.isNativeSolFunding)
+                && (!this.ethUsdCheckedAt || Date.now() - this.ethUsdCheckedAt > 60_000)) {
                 this.ethUsdCheckedAt = Date.now();
-                void this.refreshEthUsdPrice().catch(() => {});
+                void this.refreshNativePrice().catch(() => {});
             }
 
             const prepared = this.config?.prepared_withdrawal;
@@ -598,6 +640,10 @@ class ZkapiClient extends EventTarget {
         return isNativeEthFunding(this.config?.funding);
     }
 
+    get isNativeSolFunding() {
+        return isNativeSolFunding(this.config?.funding);
+    }
+
     get nativePriceQuote() {
         for (const quote of [this.ethUsdQuote, browserWalletRuntime.ethUsdQuote]) {
             try { return validateNativeQuote(quote, this.config?.funding); }
@@ -619,20 +665,58 @@ class ZkapiClient extends EventTarget {
         return quote;
     }
 
+    async refreshNativePrice({ signal } = {}) {
+        if (this.isNativeEthFunding) return this.refreshEthUsdPrice({ signal });
+        if (!this.isNativeSolFunding) throw new Error('This deployment has no supported native billing asset.');
+        const funding = this.config.funding;
+        const quote = await readNativeQuote(funding, { signal });
+        if (funding !== this.config.funding
+            && funding.contract_address !== this.config.funding.contract_address) {
+            throw new Error('The payment deployment changed while checking the SOL price.');
+        }
+        this.ethUsdQuote = quote;
+        this.ethUsdCheckedAt = Date.now();
+        this.emitChange('price');
+        return quote;
+    }
+
     async quoteDepositUsd(usd, { signal } = {}) {
-        const price = await this.refreshEthUsdPrice({ signal });
+        const price = await this.refreshNativePrice({ signal });
         const amount = nativeUnitsForUsd(usd, price);
         return Object.freeze({ amount: String(amount), ethAmount: formatUnits(amount, 9),
-            depositWei: String(nativeDepositValue(amount, this.config.funding)),
-            usdAmount: formatUnits(parseUnits(usd, 6), 6), priceUpdatedAt: price.updated_at,
+            billingAmount: formatUnits(amount, 9),
+            depositWei: this.isNativeEthFunding
+                ? String(nativeDepositValue(amount, this.config.funding)) : null,
+            usdAmount: formatUnits(parseUnits(usd, 6), 6),
+            priceUpdatedAt: price.updated_at ?? price.published_at,
             price, chainId: this.config.funding.chain_id, contractAddress: this.config.funding.contract_address });
     }
 
     async prepareDepositQuote(amountInput, { from } = {}) {
         if (!this.initialized) await this.init();
         await this.ensureTestnetAccess();
+        if (this.isNativeSolFunding) {
+            base58Decode(from, 32, 'Solana funding address');
+            const funding = this.config.funding;
+            const amount = parseUnits(amountInput, 9);
+            if (amount <= 0n || amount > BigInt(Number.MAX_SAFE_INTEGER)) {
+                throw new Error('Choose a smaller positive deposit amount.');
+            }
+            const vault = assertSolanaDepositsOpen(await assertNativeVault(funding));
+            const plan = await browserWalletRuntime.prepareDepositQuote(Number(amount), vault.root);
+            return Object.freeze({
+                operationId: plan.operationId,
+                commitment: plan.commitment,
+                amount: String(amount),
+                depositLamports: String(amount),
+                chainId: funding.chain_id,
+                contractAddress: funding.contract_address,
+                payer: from,
+                transaction: null
+            });
+        }
         if (!this.isNativeEthFunding) {
-            throw new Error('Prefunding deposit quotes require a native ETH browser wallet.');
+            throw new Error('Prefunding deposit quotes require a supported native browser wallet.');
         }
         if (typeof from !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(from) || /^0x0{40}$/i.test(from)) {
             throw new Error('Choose a valid funding address before estimating this deposit.');
@@ -662,7 +746,7 @@ class ZkapiClient extends EventTarget {
 
     get creditsPerUsd() {
         const quote = this.nativePriceQuote;
-        return quote ? 1e9 * (10 ** quote.decimals) / Number(quote.answer) : Number.NaN;
+        return quote ? Number(nativeUnitsForUsd('1', quote)) : Number.NaN;
     }
 
     get hasNote() {
@@ -978,6 +1062,40 @@ class ZkapiClient extends EventTarget {
         await this.loadChallengePeriod();
         this.emitChange('wallet-connected');
         return this.walletAddress;
+    }
+
+    async connectSolanaWallet() {
+        if (!this.isNativeSolFunding) {
+            throw new Error('This deployment does not accept a Wallet Standard Solana account.');
+        }
+        const state = solanaWalletProviders.get(this);
+        const wallet = state?.wallet;
+        if (!wallet) {
+            throw new Error('Choose a Solana wallet before continuing.');
+        }
+        const connect = wallet.features?.['standard:connect'];
+        if (!connect || typeof connect.connect !== 'function') {
+            throw new Error('The selected Solana wallet cannot connect through Wallet Standard.');
+        }
+        await connect.connect();
+        const chain = this.config.funding.wallet_standard_chain;
+        const accounts = Array.isArray(wallet.accounts) ? wallet.accounts : [];
+        const selected = (state.account && accounts.find(account => account.address === state.account.address))
+            || accounts.find(account => account.chains?.includes?.(chain)
+                && account.features?.includes?.('solana:signTransaction'));
+        if (!selected) {
+            throw new Error(`The selected wallet has no account that can sign on ${chain}.`);
+        }
+        const publicKey = selected.publicKey instanceof Uint8Array
+            ? selected.publicKey : Uint8Array.from(selected.publicKey || []);
+        base58Decode(selected.address, 32, 'Solana wallet address');
+        if (base58Encode(publicKey) !== selected.address) {
+            throw new Error('The Solana wallet address does not match its public key.');
+        }
+        state.account = selected;
+        this.walletAddress = selected.address;
+        this.emitChange('wallet-connected');
+        return { wallet, account: selected, address: selected.address };
     }
 
     async readContractUint(to, data, blockTag = 'latest') {
@@ -1486,9 +1604,9 @@ class ZkapiClient extends EventTarget {
             if (note.status !== 1) {
                 throw new Error('The recovered deposit exists, but its private note is no longer active.');
             }
-            // Wait for the privacy-preserving whole-tree mirror before making
-            // the recovered note available to chat requests.
-            await browserWalletRuntime.treePath(Number(plan.next_note_id), true);
+            // No indexer read here: exits are leaf-bound and root-free, so an
+            // operator withholding its tree mirror must not keep a landed
+            // deposit from becoming exitable. Requests read the mirror later.
             let receiptMetadata = null;
             let confirmedReceipt = null;
             const hashes = plan.transactionHashes || (plan.transactionHash ? [plan.transactionHash] : []);
@@ -1786,6 +1904,9 @@ class ZkapiClient extends EventTarget {
         if (this.hasNote) throw new Error('This client already has an active private note.');
         const funding = this.config?.funding;
         validateNativeFunding(funding);
+        if (this.isNativeSolFunding) {
+            return this.performSolanaDeposit(amountInput, onStatus, { preparedOperationId });
+        }
         await assertNativeVault(funding);
         onStatus('Connecting to MetaMask…');
         const address = await this.connectWallet();
@@ -1910,7 +2031,93 @@ class ZkapiClient extends EventTarget {
         return this.confirmBrowserDepositReceipt(plan, receipt, vaultAddress, onStatus);
     }
 
-    async withdraw(mode, onStatus = () => {}, { destination } = {}) {
+    async performSolanaDeposit(amountInput, onStatus = () => {}, { preparedOperationId = null } = {}) {
+        const funding = this.config.funding;
+        const amount = parseUnits(amountInput, 9);
+        if (amount <= 0n || amount > BigInt(Number.MAX_SAFE_INTEGER)) {
+            throw new Error('Choose a smaller positive deposit amount.');
+        }
+        onStatus('Checking the finalized Dagon vault…');
+        let vault = await assertNativeVault(funding);
+        onStatus('Connecting to your Solana wallet…');
+        const { wallet, account, address } = await this.connectSolanaWallet();
+        const balance = await solanaRpc(funding, 'getBalance', [address, {
+            commitment: 'finalized'
+        }], AbortSignal.timeout(20_000));
+        if (!Number.isSafeInteger(balance?.value) || balance.value < 0) {
+            throw new Error('The Solana RPC returned an invalid wallet balance.');
+        }
+        if (BigInt(balance.value) < amount) {
+            throw new Error('Your Solana wallet needs more SOL for this deposit and its network fees.');
+        }
+
+        let plan = await browserWalletRuntime.pendingDeposit();
+        if (plan) {
+            if (preparedOperationId && plan.operationId !== preparedOperationId) {
+                throw new Error('The deposit quote changed in another tab. Check the pending deposit before continuing.');
+            }
+            if (Number(plan.amount) !== Number(amount)) {
+                throw new Error('A previous Solana deposit is unfinished. Recover it before changing the amount.');
+            }
+            const journal = await browserWalletRuntime.currentSolanaOperationJournal('deposit');
+            if (journal?.operationId !== plan.operationId && journal) {
+                throw new Error('The saved Solana deposit journal belongs to a different operation.');
+            }
+            if (journal && (await browserWalletRuntime.resumeSolanaOperation('deposit')).completed) {
+                onStatus('Every Solana stage finalized. Verifying the private note…');
+                const confirmed = await browserWalletRuntime.confirmSolanaDeposit();
+                await this.refresh({ quiet: true });
+                onStatus('Private SOL balance is ready.');
+                return confirmed;
+            }
+        }
+
+        if (!plan) {
+            onStatus('Generating the private note commitment locally…');
+            plan = await browserWalletRuntime.prepareDeposit(Number(amount), { preparedOperationId });
+        }
+        if (!await browserWalletRuntime.currentSolanaOperationJournal('deposit')) {
+            // Freeze a path against the finalized vault root before asking the
+            // server to prepare any transaction bytes.
+            vault = assertSolanaDepositsOpen(await assertNativeVault(funding));
+            plan = await browserWalletRuntime.refreshPendingDeposit(
+                Number(amount),
+                vault.root,
+                { expectedOperationId: plan.operationId }
+            );
+        }
+
+        onStatus('Signing and finalizing the ordered Solana vault transactions…');
+        await browserWalletRuntime.submitSolanaOperation('deposit', {
+            wallet,
+            account,
+            onProgress: progress => {
+                const number = progress.index + 1;
+                const total = progress.total;
+                const action = {
+                    signing: 'Confirm',
+                    resuming: 'Resuming',
+                    submitting: 'Submitting',
+                    confirming: 'Finalizing'
+                }[progress.phase] || 'Processing';
+                onStatus(`${action} Solana transaction ${number} of ${total}…`);
+            }
+        });
+        onStatus('Verifying the finalized Solana note and Merkle root…');
+        const confirmed = await browserWalletRuntime.confirmSolanaDeposit();
+        await this.refresh({ quiet: true });
+        onStatus('Private SOL balance is ready.');
+        return confirmed;
+    }
+
+    /**
+     * Withdraw the selected balance. `mode` 'mutual' closes cooperatively;
+     * 'escape' exits unilaterally, conceding what the exit rules choose (0
+     * from a fresh state, at most the last request's bound otherwise).
+     * `earlyConcession` ('zero' | 'bound') forces an escape while that request
+     * may still be settling.
+     */
+    async withdraw(mode, onStatus = () => {}, { destination, earlyConcession = null } = {}) {
         // The password dialog must not transfer an earlier withdrawal click
         // to a successor note installed by another tab while it was open.
         const expectedNoteId = this.note?.note_id;
@@ -1921,12 +2128,12 @@ class ZkapiClient extends EventTarget {
             throw new Error('The private balance changed while withdrawal was opening. Review the current balance before continuing.');
         }
         const requestedDestination = normalizeWithdrawalDestination(destination, this.config?.funding);
-        const operationKey = `${mode}:${requestedDestination || ''}`;
+        const operationKey = `${mode}:${requestedDestination || ''}:${earlyConcession || ''}`;
         if (this.withdrawPromise) {
             if (this.withdrawPromiseKey === operationKey) return this.withdrawPromise;
             throw new Error('A different withdrawal action is already running.');
         }
-        const operation = this.performWithdrawal(mode, onStatus, { destination });
+        const operation = this.performWithdrawal(mode, onStatus, { destination, earlyConcession });
         this.withdrawPromise = operation;
         this.withdrawPromiseKey = operationKey;
         try {
@@ -1939,14 +2146,22 @@ class ZkapiClient extends EventTarget {
         }
     }
 
-    async performWithdrawal(mode, onStatus = () => {}, { destination: requested } = {}) {
+    async performWithdrawal(mode, onStatus = () => {}, { destination: requested, earlyConcession = null } = {}) {
         const requestedDestination = normalizeWithdrawalDestination(requested, this.config?.funding);
         const note = this.note;
         if (!note) throw new Error('There is no active private note to withdraw.');
         if (!['mutual', 'escape'].includes(mode)) throw new Error('Choose a valid withdrawal mode.');
         await this.assertBalanceNotClaimed(note.note_id);
 
-        await this.settleActiveLease(onStatus);
+        await this.settleActiveLease(onStatus, { allowUnresolved: mode === 'escape' });
+
+        if (this.isNativeSolFunding) {
+            return this.performSolanaWithdrawal(mode, onStatus, {
+                destination: requestedDestination,
+                noteId: Number(note.note_id),
+                earlyConcession
+            });
+        }
 
         onStatus('Connecting to MetaMask…');
         const from = await this.connectWallet();
@@ -1986,30 +2201,25 @@ class ZkapiClient extends EventTarget {
         let submittedHash = prepared?.transaction_hash || null;
         let submission = null;
         let submissionMetadata = null;
-        const attempts = 3;
         try {
             if (submittedHash) {
-                // A broadcast hash owns recovery. Never read a new root or
-                // replace its proof while the receipt is unknown: doing so can
-                // sever the only durable link to a transaction already in the
-                // mempool.
+                // A broadcast hash owns recovery. Never replace its proof while
+                // the receipt is unknown: doing so can sever the only durable
+                // link to a transaction already in the mempool.
                 plan = durablePrepared;
                 if (!plan?.public_inputs) {
                     throw new Error('The submitted withdrawal proof is missing from this browser.');
                 }
                 onStatus(`Checking submitted transaction ${this.compact(submittedHash)}…`);
                 receipt = await this.waitForReceipt(submittedHash);
-            } else for (let attempt = 0; attempt < attempts; attempt += 1) {
-                onStatus(attempt === 0
-                    ? (mode === 'mutual'
-                        ? 'Requesting server clearance and generating the withdrawal proof…'
-                        : 'Generating a unilateral escape proof locally…')
-                    : 'The vault changed during preparation. Refreshing the Merkle path and proof…');
-                const expectedActiveRoot = await this.readContractUint(
-                        this.config.funding.contract_address,
-                        `0x${ABI.currentRoot}`
-                    );
-                plan = await browserWalletRuntime.prepareWithdrawal(mode, destination, { expectedActiveRoot });
+            } else {
+                onStatus(mode === 'mutual'
+                    ? 'Requesting server clearance and generating the withdrawal proof…'
+                    : 'Generating a unilateral escape proof locally…');
+                // Exits are leaf-bound: the proof names the note's registration
+                // and fields, never a root, so a concurrent deposit cannot
+                // invalidate it.
+                plan = await browserWalletRuntime.prepareWithdrawal(mode, destination, { earlyConcession });
                 if (Number(plan.public_inputs?.note_id) !== Number(note.note_id)) {
                     throw new Error('The private wallet returned a withdrawal for a different note.');
                 }
@@ -2042,12 +2252,10 @@ class ZkapiClient extends EventTarget {
                 if (submittedHash) {
                     onStatus(`Checking submitted transaction ${this.compact(submittedHash)}…`);
                     receipt = await this.waitForReceipt(submittedHash);
-                    break;
-                }
-                onStatus(mode === 'mutual'
-                    ? 'Confirm the mutual close in MetaMask…'
-                    : 'Confirm the escape-hatch start in MetaMask…');
-                try {
+                } else {
+                    onStatus(mode === 'mutual'
+                        ? 'Confirm the mutual close in MetaMask…'
+                        : 'Confirm the escape-hatch start in MetaMask…');
                     receipt = await this.sendContractTransaction(
                         from,
                         this.config.funding.contract_address,
@@ -2085,12 +2293,6 @@ class ZkapiClient extends EventTarget {
                         null,
                         { kind: 'withdrawal', submission }
                     );
-                    break;
-                } catch (error) {
-                    if (error?.code !== 'stale_root' || attempt + 1 >= attempts) throw error;
-                    await browserWalletRuntime.markPreparedWithdrawalRetryable(null, submission);
-                    submission = null;
-                    submissionMetadata = null;
                 }
             }
         } catch (failure) {
@@ -2112,9 +2314,12 @@ class ZkapiClient extends EventTarget {
             if (!receipt) throw error;
         }
         const event = parseWithdrawalReceipt(receipt, this.config.funding.contract_address, mode);
+        const plannedConceded = BigInt(plan.public_inputs.conceded ?? 0);
         if (!event || event.noteId !== BigInt(note.note_id)
             || event.destination.toLowerCase() !== destination.toLowerCase()
-            || event.finalBalance !== BigInt(plan.public_inputs.final_balance)) {
+            || event.finalBalance !== BigInt(plan.public_inputs.final_balance)
+            || (mode === 'escape' && (event.conceded !== plannedConceded
+                || event.nextNullifier !== BigInt(plan.public_inputs.next_nullifier)))) {
             throw new Error('The transaction succeeded, but its withdrawal event did not match the prepared note.');
         }
 
@@ -2146,10 +2351,19 @@ class ZkapiClient extends EventTarget {
         if (confirmed.status !== 'pending_withdrawal' || !deadline) {
             throw new Error('The escape transaction mined, but the vault did not report its safety deadline.');
         }
+        // The vault may already show a raise; the record keeps both the
+        // declared and the current concession so the payout can be matched.
+        const stateBalance = event.finalBalance + plannedConceded;
         const record = await browserWalletRuntime.detachEscapeWithdrawal({
             noteId: Number(note.note_id),
             destination,
-            finalBalance: Number(event.finalBalance),
+            finalBalance: Number(confirmed.final_balance ?? event.finalBalance),
+            stateBalance: Number(stateBalance),
+            concededAtInit: Number(plannedConceded),
+            conceded: Number(confirmed.conceded ?? plannedConceded),
+            boundAtState: Number(plan.boundAtState ?? 0),
+            nextNullifier: plan.public_inputs.next_nullifier,
+            concessionRule: plan.concessionRule || null,
             challengeDeadline: deadline,
             transactionHash: submittedHash || receipt?.transactionHash || null,
             startBlockNumber: Number(BigInt(receipt?.blockNumber || '0x0')),
@@ -2158,7 +2372,9 @@ class ZkapiClient extends EventTarget {
         });
         this.rememberWithdrawal(null);
         await this.refresh();
-        onStatus('Escape started. You can add a new private balance while the safety window runs.');
+        onStatus(plannedConceded > 0n
+            ? `Escape started, conceding ${this.formatBillingAmount(Number(plannedConceded))} ${this.config?.funding?.billing_token_symbol || ''} for the last request. You can add a new private balance while the safety window runs.`
+            : 'Escape started. You can add a new private balance while the safety window runs.');
         return {
             status: 'pending_withdrawal',
             deadline,
@@ -2166,10 +2382,54 @@ class ZkapiClient extends EventTarget {
             receipt,
             recordId: record.recordId
         };
-        this.rememberWithdrawal({ ...withdrawal, phase: 'pending', challengeDeadline: deadline });
-        await this.refresh();
-        onStatus('Escape started. Return after the safety window to finalize.');
-        return { status: 'pending_withdrawal', deadline, event, receipt };
+    }
+
+    async performSolanaWithdrawal(mode, onStatus = () => {}, { destination: requested, noteId, earlyConcession = null } = {}) {
+        let plan = await browserWalletRuntime.currentPreparedWithdrawal();
+        if (plan && Number(plan.noteId ?? plan.public_inputs?.note_id) !== Number(noteId)) {
+            throw new Error('The prepared Solana withdrawal belongs to a different private balance.');
+        }
+        if (requested && plan?.destination && requested !== plan.destination) {
+            throw new Error('This withdrawal is already bound to a different Solana destination.');
+        }
+        const savedJournal = await browserWalletRuntime.currentSolanaOperationJournal('withdrawal');
+        if (savedJournal && (await browserWalletRuntime.resumeSolanaOperation('withdrawal')).completed) {
+            onStatus('Every Solana stage finalized. Verifying the withdrawal state…');
+            const result = await browserWalletRuntime.confirmSolanaWithdrawal();
+            await this.refresh({ quiet: true });
+            return result;
+        }
+
+        onStatus('Connecting to your Solana wallet…');
+        const { wallet, account, address } = await this.connectSolanaWallet();
+        const destination = plan?.destination || requested || address;
+        if (!savedJournal) {
+            onStatus(mode === 'mutual'
+                ? 'Requesting clearance and generating the withdrawal proof…'
+                : 'Generating the unilateral escape proof locally…');
+            plan = await browserWalletRuntime.prepareWithdrawal(mode, destination, { earlyConcession });
+        }
+        onStatus('Signing and finalizing the ordered Solana withdrawal transactions…');
+        await browserWalletRuntime.submitSolanaOperation('withdrawal', {
+            wallet,
+            account,
+            onProgress: progress => {
+                const action = {
+                    signing: 'Confirm',
+                    resuming: 'Resuming',
+                    submitting: 'Submitting',
+                    confirming: 'Finalizing'
+                }[progress.phase] || 'Processing';
+                onStatus(`${action} Solana transaction ${progress.index + 1} of ${progress.total}…`);
+            }
+        });
+        onStatus('Verifying the finalized Solana vault and payout state…');
+        const result = await browserWalletRuntime.confirmSolanaWithdrawal();
+        await this.refresh({ quiet: true });
+        onStatus(result.status === 'closed'
+            ? 'The private SOL balance was returned.'
+            : 'Escape started. The balance is secured for finalization after its challenge window.');
+        return result;
     }
 
     async recoverFailedWithdrawalSubmission({
@@ -2287,11 +2547,21 @@ class ZkapiClient extends EventTarget {
                 ? remaining.transactionHashes
                 : remaining?.transactionHash ? [remaining.transactionHash] : [];
             if (!remainingHashes.length) {
-                await browserWalletRuntime.clearPreparedWithdrawal();
-                this.rememberWithdrawal(null, { emit: false });
-                error.shortMessage = rejectedBeforeSubmission
-                    ? 'MetaMask canceled the escape. No funds moved, and your private balance is ready to use.'
-                    : 'The wallet refused the escape before broadcast. No funds moved, and your private balance is ready to use.';
+                try {
+                    await browserWalletRuntime.clearPreparedWithdrawal();
+                    this.rememberWithdrawal(null, { emit: false });
+                    error.shortMessage = rejectedBeforeSubmission
+                        ? 'MetaMask canceled the escape. No funds moved, and your private balance is ready to use.'
+                        : 'The wallet refused the escape before broadcast. No funds moved, and your private balance is ready to use.';
+                } catch (clearError) {
+                    if (clearError?.code !== 'exit_proof_live') throw clearError;
+                    // C3: the escape proof reached the wallet, so it could
+                    // still land until its validity deadline. Keep the balance
+                    // reserved for exit; the escape can be retried as is.
+                    error.exitProofLiveUntil = clearError.liveUntil;
+                    error.withdrawalNeedsAction = true;
+                    error.shortMessage = 'MetaMask canceled the escape. No funds moved, but the escape proof stays valid for a few hours, so this balance stays reserved for withdrawal until then. Retry the escape to finish it.';
+                }
             } else {
                 error.shortMessage = 'MetaMask canceled this prompt. Another submitted withdrawal is still being checked.';
             }
@@ -2435,72 +2705,63 @@ class ZkapiClient extends EventTarget {
         let receipt;
         let plan;
         let submittedHash = null;
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-            let submission = null;
-            let metadata = null;
-            try {
-                const canonical = await this.readBrowserWithdrawalStatus(noteId);
-                if (canonical.status !== 'active' || Number(canonical.observed_block || 0)
-                    < Math.max(Number(record.startBlockNumber || 0), Number(record.lastObservedBlock || 0))) {
-                    await this.syncEscapeWithdrawals(() => {}, recordId);
-                    throw new Error('The vault state changed. Check this withdrawal’s status before retrying.');
-                }
-                onStatus(attempt === 0
-                    ? 'Preparing the old balance’s withdrawal proof…'
-                    : 'The vault changed. Updating the old balance’s proof…', 'preparing');
-                const expectedActiveRoot = await this.readContractUint(
-                    this.config.funding.contract_address, `0x${ABI.currentRoot}`
-                );
-                plan = await browserWalletRuntime.prepareBackgroundWithdrawal(recordId, { expectedActiveRoot });
-                if (plan.mode !== 'mutual' || Number(plan.public_inputs?.note_id) !== noteId
-                    || plan.destination?.toLowerCase() !== destination?.toLowerCase()
-                    || Number(plan.public_inputs?.final_balance) !== Number(record.finalBalance)) {
-                    throw new Error('The withdrawal proof does not match this set-aside balance.');
-                }
-                const calldata = encodeWithdrawal(plan, 'mutual', destination, this.config.funding.contract_address);
-                submission = await browserWalletRuntime.claimBackgroundWithdrawalSubmission(recordId, plan.operationId);
-                onStatus('Confirm the set-aside withdrawal in MetaMask. Your current balance is unchanged.', 'wallet');
-                receipt = await this.sendContractTransaction(
-                    from, this.config.funding.contract_address, calldata,
-                    async hash => {
-                        submittedHash = hash;
-                        await browserWalletRuntime.rememberBackgroundWithdrawalTransaction(hash, submission, metadata);
-                        onStatus('Withdrawal submitted. Checking confirmation…', 'confirming');
-                    },
-                    async value => {
-                        metadata = value;
-                        await browserWalletRuntime.rememberBackgroundWithdrawalSubmissionMetadata(submission, value);
-                    },
-                    null,
-                    { kind: 'background-withdrawal', submission }
-                );
-                break;
-            } catch (failure) {
-                const error = normalizeWalletError(failure);
-                submittedHash = submittedHash || error.transactionHash || null;
-                if (submission && submittedHash) {
-                    // A returned hash owns recovery even if its first journal
-                    // write or the receipt poll failed. Never prepare a new
-                    // proof/nonce after this boundary.
-                    try {
-                        await browserWalletRuntime.rememberBackgroundWithdrawalTransaction(submittedHash, submission, metadata);
-                    } catch (journalError) {
-                        error.journalRecoveryError = journalError;
-                    }
-                    error.shortMessage = 'The submitted withdrawal is saved for recovery. Check its status; your current balance is unchanged.';
-                } else if (submission && (error.broadcastPossible === false || isWalletRejection(error))) {
-                    await browserWalletRuntime.releaseBackgroundWithdrawalSubmission(submission);
-                    if (error.code === 'stale_root' && attempt < 2) continue;
-                    if (isWalletRejection(error)) {
-                        error.shortMessage = 'Canceled. The old balance is still set aside and can be withdrawn later.';
-                    }
-                } else if (submission) {
-                    await browserWalletRuntime.markBackgroundWithdrawalAmbiguous(submission, error.message);
-                    error.shortMessage = 'MetaMask did not return a transaction ID. Check this withdrawal’s status before retrying; your current balance is unchanged.';
-                }
-                await this.refresh({ quiet: true });
-                throw error;
+        let submission = null;
+        let metadata = null;
+        try {
+            const canonical = await this.readBrowserWithdrawalStatus(noteId);
+            if (canonical.status !== 'active' || Number(canonical.observed_block || 0)
+                < Math.max(Number(record.startBlockNumber || 0), Number(record.lastObservedBlock || 0))) {
+                await this.syncEscapeWithdrawals(() => {}, recordId);
+                throw new Error('The vault state changed. Check this withdrawal’s status before retrying.');
             }
+            onStatus('Preparing the old balance’s withdrawal proof…', 'preparing');
+            plan = await browserWalletRuntime.prepareBackgroundWithdrawal(recordId);
+            if (plan.mode !== 'mutual' || Number(plan.public_inputs?.note_id) !== noteId
+                || plan.destination?.toLowerCase() !== destination?.toLowerCase()
+                || Number(plan.public_inputs?.final_balance) !== Number(record.finalBalance)) {
+                throw new Error('The withdrawal proof does not match this set-aside balance.');
+            }
+            const calldata = encodeWithdrawal(plan, 'mutual', destination, this.config.funding.contract_address);
+            submission = await browserWalletRuntime.claimBackgroundWithdrawalSubmission(recordId, plan.operationId);
+            onStatus('Confirm the set-aside withdrawal in MetaMask. Your current balance is unchanged.', 'wallet');
+            receipt = await this.sendContractTransaction(
+                from, this.config.funding.contract_address, calldata,
+                async hash => {
+                    submittedHash = hash;
+                    await browserWalletRuntime.rememberBackgroundWithdrawalTransaction(hash, submission, metadata);
+                    onStatus('Withdrawal submitted. Checking confirmation…', 'confirming');
+                },
+                async value => {
+                    metadata = value;
+                    await browserWalletRuntime.rememberBackgroundWithdrawalSubmissionMetadata(submission, value);
+                },
+                null,
+                { kind: 'background-withdrawal', submission }
+            );
+        } catch (failure) {
+            const error = normalizeWalletError(failure);
+            submittedHash = submittedHash || error.transactionHash || null;
+            if (submission && submittedHash) {
+                // A returned hash owns recovery even if its first journal
+                // write or the receipt poll failed. Never prepare a new
+                // proof/nonce after this boundary.
+                try {
+                    await browserWalletRuntime.rememberBackgroundWithdrawalTransaction(submittedHash, submission, metadata);
+                } catch (journalError) {
+                    error.journalRecoveryError = journalError;
+                }
+                error.shortMessage = 'The submitted withdrawal is saved for recovery. Check its status; your current balance is unchanged.';
+            } else if (submission && (error.broadcastPossible === false || isWalletRejection(error))) {
+                await browserWalletRuntime.releaseBackgroundWithdrawalSubmission(submission);
+                if (isWalletRejection(error)) {
+                    error.shortMessage = 'Canceled. The old balance is still set aside and can be withdrawn later.';
+                }
+            } else if (submission) {
+                await browserWalletRuntime.markBackgroundWithdrawalAmbiguous(submission, error.message);
+                error.shortMessage = 'MetaMask did not return a transaction ID. Check this withdrawal’s status before retrying; your current balance is unchanged.';
+            }
+            await this.refresh({ quiet: true });
+            throw error;
         }
         const event = parseWithdrawalReceipt(receipt, this.config.funding.contract_address, 'mutual');
         if (!event || event.noteId !== BigInt(noteId)
@@ -2619,7 +2880,7 @@ class ZkapiClient extends EventTarget {
             || { status: 'submitted', transaction_hash: submittedHash };
     }
 
-    async settleActiveLease(onStatus = () => {}, { sessionId = null } = {}) {
+    async settleActiveLease(onStatus = () => {}, { sessionId = null, allowUnresolved = false } = {}) {
         const hasPendingRequest = Boolean(this.activeLease || this.wallet?.pending_request);
         const activityId = hasPendingRequest ? this.beginActivity('settlement', {
             phase: 'settling',
@@ -2638,10 +2899,10 @@ class ZkapiClient extends EventTarget {
         try {
             const settled = sessionId
                 ? await browserWalletRuntime.settleSessionLease(sessionId, report)
-                : await browserWalletRuntime.settleActiveLease(report);
+                : await browserWalletRuntime.settleActiveLease(report, { allowUnresolved });
             await this.refresh({ quiet: true });
             if (sessionId ? await this.getPendingLeaseOwner() === sessionId
-                : this.activeLease || this.wallet?.pending_request) {
+                : this.activeLease || (this.wallet?.pending_request && !allowUnresolved)) {
                 throw new Error('The private key usage is still settling. Try again shortly.');
             }
             if (hasPendingRequest) {
@@ -3483,9 +3744,14 @@ class ZkapiClient extends EventTarget {
                 return { ...result, status: ambiguous ? 'ambiguous' : 'awaiting_wallet' };
             }
             if (durableMode === 'escape' && !clearanceReserved) {
-                await browserWalletRuntime.clearPreparedWithdrawal();
-                onStatus('No escape transaction was submitted. Your private balance is ready to use.');
-                this.rememberWithdrawal(null);
+                try {
+                    await browserWalletRuntime.clearPreparedWithdrawal();
+                    onStatus('No escape transaction was submitted. Your private balance is ready to use.');
+                    this.rememberWithdrawal(null);
+                } catch (error) {
+                    if (error?.code !== 'exit_proof_live') throw error;
+                    onStatus('No escape transaction is moving, but its proof stays valid until its deadline. The balance stays reserved for withdrawal until then.');
+                }
             } else if (successfulAttempts.length) {
                 onStatus('A mutual-close transaction mined, but the latest vault state has not caught up yet. Check again shortly.');
             } else {
@@ -3828,7 +4094,8 @@ class ZkapiClient extends EventTarget {
 
     async syncEscapeWithdrawals(onStatus = () => {}, recordId = null) {
 
-        const records = this.withdrawals.filter(record => (record.phase !== 'closed'
+        // A defeated escape is final for this device: its state is superseded.
+        const records = this.withdrawals.filter(record => ((record.phase !== 'closed' && record.phase !== 'defeated')
                 || record.finalizeTransactionHash
                 || record.finalizeSubmissionId)
             && (!recordId || record.recordId === recordId));
@@ -3845,6 +4112,8 @@ class ZkapiClient extends EventTarget {
             try {
                 let status = await this.readBrowserWithdrawalStatus(record.noteId);
                 let payoutVerified = false;
+                // E5: the finalized payout, which a raise may have lowered.
+                let finalizedPayout = null;
                 let minimumObservedBlock = Math.max(
                     Number(record.startBlockNumber || 0),
                     Number(record.lastObservedBlock || 0)
@@ -3916,7 +4185,7 @@ class ZkapiClient extends EventTarget {
                         );
                         if (!event || event.noteId !== BigInt(record.noteId)
                             || event.destination.toLowerCase() !== record.destination.toLowerCase()
-                            || event.finalBalance !== BigInt(record.finalBalance)) {
+                            || event.finalBalance !== this.initialFinalBalance(record)) {
                             // Keep the recovery record, but do not let one bad
                             // audit hash suppress canonical status recovery.
                             startReceipt = null;
@@ -4152,9 +4421,10 @@ class ZkapiClient extends EventTarget {
                             this.config.funding.contract_address,
                             'finalize'
                         );
+                        const payout = event && this.escapePayout(record, event.finalBalance);
                         if (!event || event.noteId !== BigInt(record.noteId)
                             || event.destination.toLowerCase() !== record.destination.toLowerCase()
-                            || event.finalBalance !== BigInt(record.finalBalance)) {
+                            || !payout.accepted) {
                             await browserWalletRuntime.releaseWithdrawalFinalization(record.recordId, {
                                 transactionHash: hash
                             });
@@ -4169,6 +4439,7 @@ class ZkapiClient extends EventTarget {
                             && status.status === 'closed') {
                             successfulFinalizeHashes.push(hash);
                             payoutVerified = true;
+                            finalizedPayout = { amount: event.finalBalance, deferred: event.payoutDeferred, ...payout };
                         }
                     }
                 }
@@ -4222,6 +4493,7 @@ class ZkapiClient extends EventTarget {
                                 phase: 'closed_unconfirmed',
                                 chainStatus: 'closed',
                                 payoutVerified,
+                                ...this.escapePayoutPatch(finalizedPayout),
                                 closedAt: Number(record.closedAt || Date.now()),
                                 closeBlockNumber,
                                 lastObservedBlock: Math.max(
@@ -4249,6 +4521,7 @@ class ZkapiClient extends EventTarget {
                             phase: 'closed',
                             chainStatus: 'closed',
                             payoutVerified,
+                            ...this.escapePayoutPatch(finalizedPayout),
                             closedAt: Date.now(),
                             closeBlockNumber,
                             finalizedBlockNumber: Number(finality.checkedBlock),
@@ -4277,6 +4550,14 @@ class ZkapiClient extends EventTarget {
                         challengeDeadline: Number(status.challenge_deadline),
                         destination: status.destination || record.destination,
                         finalBalance: Number(status.final_balance ?? record.finalBalance),
+                        // A raise by the operator's request evidence lowers
+                        // f in place; show it while the window is still open.
+                        ...(status.conceded != null ? {
+                            stateBalance: Number(status.state_balance),
+                            conceded: Number(status.conceded),
+                            concessionRaised: record.concededAtInit != null
+                                && Number(status.conceded) > Number(record.concededAtInit)
+                        } : {}),
                         lastObservedBlock: Math.max(
                             minimumObservedBlock,
                             Number(status.observed_block || 0)
@@ -4409,6 +4690,37 @@ class ZkapiClient extends EventTarget {
                             changed = true;
                             continue;
                         }
+                        // A defeat returns the note to Active but flags the
+                        // escaped nullifier Challenged: a request from this
+                        // state's successor exists, so this copy is outdated
+                        // and can never request or exit again. The newest
+                        // state lives on the device (or backup) that spent it.
+                        const escapedNullifier = record.withdrawalNullifier
+                            || record.preparedWithdrawal?.public_inputs?.withdrawal_nullifier;
+                        if (record.mode === 'escape' && escapedNullifier != null
+                            && await this.readNullifierState(escapedNullifier, status.observed_block)
+                                === NULLIFIER_STATE.challenged) {
+                            if (record.phase !== 'defeated') {
+                                try {
+                                    await browserWalletRuntime.updateWithdrawal(record.recordId, {
+                                        phase: 'defeated',
+                                        chainStatus: 'active',
+                                        defeatedAt: Date.now(),
+                                        finalizedBlockNumber: Number(finality.checkedBlock),
+                                        finalitySource: finality.source,
+                                        lastObservedBlock: Math.max(
+                                            minimumObservedBlock,
+                                            Number(status.observed_block || 0)
+                                        ),
+                                        error: 'The escape was defeated: the vault saw a request from this balance’s newer state. This copy is outdated; withdraw from the device or backup that holds the newest state.'
+                                    }, { expectedRevision: record.revision });
+                                    changed = true;
+                                } catch (error) {
+                                    if (!/changed|different phase|completed withdrawal/i.test(error.message)) throw error;
+                                }
+                            }
+                            continue;
+                        }
                         const phase = withdrawalOnly ? 'parked' : 'restored';
                         if (record.phase !== phase || record.chainStatus !== 'active') {
                             try {
@@ -4423,7 +4735,7 @@ class ZkapiClient extends EventTarget {
                                         Number(status.observed_block || 0)
                                     ),
                                     error: withdrawalOnly && record.mode === 'escape'
-                                        ? 'The escape was challenged. This balance remains withdrawal-only because its close authorization was already reserved.'
+                                        ? 'The escape did not land. This balance remains withdrawal-only because its close authorization was already reserved.'
                                         : null
                                 }, { expectedRevision: record.revision });
                                 changed = true;
@@ -4682,6 +4994,10 @@ class ZkapiClient extends EventTarget {
             throw new Error(`The safety window has ${this.formatExpiry(withdrawal.challengeDeadline)} remaining.`);
         }
 
+        if (this.isNativeSolFunding) {
+            return this.performSolanaFinalizeEscape(withdrawal, onStatus);
+        }
+
         onStatus('Connecting to MetaMask for finalization…');
         const from = await this.connectWallet();
         let submittedHash = withdrawal.finalizeTransactionHash || null;
@@ -4802,9 +5118,10 @@ class ZkapiClient extends EventTarget {
             throw error;
         }
         const event = parseWithdrawalReceipt(receipt, this.config.funding.contract_address, 'finalize');
+        const payout = event && this.escapePayout(withdrawal, event.finalBalance);
         if (!event || event.noteId !== BigInt(withdrawal.noteId)
             || event.destination.toLowerCase() !== withdrawal.destination.toLowerCase()
-            || event.finalBalance !== BigInt(withdrawal.finalBalance)) {
+            || !payout.accepted) {
             throw new Error('The finalization event did not match the pending withdrawal.');
         }
         const confirmed = await this.confirmMinedWithdrawalStatus(withdrawal.noteId, receipt);
@@ -4815,14 +5132,44 @@ class ZkapiClient extends EventTarget {
             phase: 'closed_unconfirmed',
             chainStatus: 'closed',
             payoutVerified: true,
+            ...this.escapePayoutPatch({ amount: event.finalBalance, deferred: event.payoutDeferred, ...payout }),
             closedAt: Date.now(),
             closeBlockNumber: Number(BigInt(receipt?.blockNumber || '0x0')),
             lastObservedBlock: Number(confirmed.observed_block || 0),
             error: null
         });
         await this.refresh();
-        onStatus('Escape withdrawal returned. Finality is being checked safely in the background.');
+        onStatus(event.payoutDeferred
+            ? `The escape finalized, but the destination refused the vault's gas-bounded payout. ${this.formatBillingAmount(Number(event.finalBalance))} is credited to it; anyone can release it with claimEscapePayout(destination).`
+            : payout.raised
+                ? 'Escape withdrawal returned. The operator raised its concession with your last request’s evidence; finality is being checked in the background.'
+                : 'Escape withdrawal returned. Finality is being checked safely in the background.');
         return { status: 'closed', event, receipt };
+    }
+
+    async performSolanaFinalizeEscape(withdrawal, onStatus = () => {}) {
+        onStatus('Connecting to your Solana wallet for finalization…');
+        const { wallet, account } = await this.connectSolanaWallet();
+        const result = await browserWalletRuntime.submitSolanaFinalization(
+            withdrawal.recordId,
+            {
+                wallet,
+                account,
+                onProgress: progress => {
+                    const action = {
+                        signing: 'Confirm',
+                        resuming: 'Resuming',
+                        submitting: 'Submitting',
+                        confirming: 'Finalizing'
+                    }[progress.phase] || 'Processing';
+                    onStatus(`${action} the Solana escape finalization…`);
+                }
+            }
+        );
+        await this.refresh({ quiet: true });
+        this.rememberWithdrawal(null);
+        onStatus('Escape finalized. The private SOL balance was returned.');
+        return result;
     }
 
     async confirmMinedWithdrawalStatus(noteId, receipt) {
@@ -4854,36 +5201,95 @@ class ZkapiClient extends EventTarget {
             method: 'eth_call',
             params: [{
                 to: this.config.funding.contract_address,
-                data: `0x9f18e4ed${abiWord(noteId)}`
+                data: callData(ABI.notes, [abiWord(noteId)])
             }, blockTag]
         });
         const words = String(encodedNote || '').replace(/^0x/, '').match(/.{64}/g) || [];
         if (words.length < 4) throw new Error('The vault returned a truncated note record.');
         const status = Number(BigInt(`0x${words[3]}`));
         if (status === 3) return { status: 'closed', note_id: Number(noteId), challenge_deadline: null, observed_block: observedBlock };
-        if (status === 1) return { status: 'active', note_id: Number(noteId), challenge_deadline: null, observed_block: observedBlock };
+        // A defeated escape returns its note to Active; status 4 is reserved.
+        if (status === 1) {
+            return { status: 'active', note_id: Number(noteId), challenge_deadline: null, observed_block: observedBlock };
+        }
         if (status !== 2) throw new Error(`The vault returned unknown note status ${status}.`);
         await this.assertFundingChain();
         const encodedPending = await this.ethereum.request({
             method: 'eth_call',
             params: [{
                 to: this.config.funding.contract_address,
-                data: `0xa2f9f1ce${abiWord(noteId)}`
+                data: callData(ABI.pendingWithdrawals, [abiWord(noteId)])
             }, blockTag]
         });
+        // exists, withdrawalNullifier, nextNullifier, stateBalance, conceded,
+        // finalBalance, destination, challengeDeadline
         const pendingWords = String(encodedPending || '').replace(/^0x/, '').match(/.{64}/g) || [];
-        if (pendingWords.length < 6 || BigInt(`0x${pendingWords[0]}`) !== 1n) {
+        if (pendingWords.length < 8 || BigInt(`0x${pendingWords[0]}`) !== 1n) {
             throw new Error('The vault pending-withdrawal record is missing.');
         }
         return {
             status: 'pending_withdrawal',
             note_id: Number(noteId),
-            active_root: `0x${pendingWords[1]}`,
-            withdrawal_nullifier: `0x${pendingWords[2]}`,
-            final_balance: Number(BigInt(`0x${pendingWords[3]}`)),
-            destination: `0x${pendingWords[4].slice(-40)}`,
-            challenge_deadline: Number(BigInt(`0x${pendingWords[5]}`)),
+            withdrawal_nullifier: `0x${pendingWords[1]}`,
+            next_nullifier: `0x${pendingWords[2]}`,
+            state_balance: Number(BigInt(`0x${pendingWords[3]}`)),
+            conceded: Number(BigInt(`0x${pendingWords[4]}`)),
+            final_balance: Number(BigInt(`0x${pendingWords[5]}`)),
+            destination: `0x${pendingWords[6].slice(-40)}`,
+            challenge_deadline: Number(BigInt(`0x${pendingWords[7]}`)),
             observed_block: observedBlock
+        };
+    }
+
+    /** nullifierState(N) at a block: 0 unused or released, 1 consumed, 2 challenged. */
+    async readNullifierState(nullifier, observedBlock = null) {
+        await this.assertFundingChain();
+        const blockTag = observedBlock == null ? 'latest' : `0x${Number(observedBlock).toString(16)}`;
+        const encoded = await this.ethereum.request({
+            method: 'eth_call',
+            params: [{
+                to: this.config.funding.contract_address,
+                data: callData(ABI.nullifierState, [abiWord(BigInt(nullifier))])
+            }, blockTag]
+        });
+        const word = String(encoded || '').replace(/^0x/, '').slice(0, 64);
+        if (!/^[0-9a-fA-F]{64}$/.test(word)) throw new Error('The vault returned an invalid nullifier state.');
+        return Number(BigInt(`0x${word}`));
+    }
+
+    /** The f an escape started with: a later raise lowers record.finalBalance. */
+    initialFinalBalance(record) {
+        if (record?.stateBalance != null) {
+            return BigInt(record.stateBalance) - BigInt(record.concededAtInit ?? 0);
+        }
+        return BigInt(record?.finalBalance ?? -1);
+    }
+
+    /**
+     * E5: whether a finalized escape payout matches its record. A record with
+     * concession terms accepts any payout up to its initial f (raises only
+     * lower it); a record without them must match exactly.
+     */
+    escapePayout(record, paid) {
+        if (record?.stateBalance == null) {
+            return { accepted: BigInt(paid) === BigInt(record?.finalBalance ?? -1), raised: false, alert: null };
+        }
+        return matchEscapePayout({
+            stateBalance: record.stateBalance,
+            concededAtInit: record.concededAtInit ?? 0,
+            boundAtState: record.boundAtState ?? null,
+            paid
+        });
+    }
+
+    escapePayoutPatch(payout) {
+        if (!payout) return {};
+        return {
+            finalBalance: Number(payout.amount),
+            ...(payout.concededFinal != null ? { conceded: Number(payout.concededFinal) } : {}),
+            concessionRaised: payout.raised === true,
+            ...(payout.deferred ? { payoutDeferred: true } : {}),
+            ...(payout.alert ? { payoutAlert: payout.alert } : {})
         };
     }
 

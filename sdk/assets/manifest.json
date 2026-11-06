@@ -1,14 +1,14 @@
 {
   "schema": 1,
-  "protocolRevision": "8b2d4e3da921f956e1eb6b93afbf722a877c060c",
+  "protocolRevision": "19cd0b89118526eb46b5035993963bc7a2d717d0",
   "extractedFromRevision": "f7e3d089b32cd85954d9db268228c7bf640174e9",
   "files": {
-    "wasm/zkapi_browser.js": "3323660f250368f897b3e52778550017e2c3bea32cf9f556c53cea1697d0ff70",
-    "wasm/zkapi_browser_bg.wasm": "1fc6a86221720b1eb2b7f500a2ecedd71c3b4fb9c1adb8d9814a150817b42d78",
-    "assets/proofs/request.pk": "c894b261a13f571d0df36be29734aabf2a8cd7162baddc5e08a50341aa076584",
-    "assets/proofs/withdrawal.pk": "8e41398092fdd02b9ff86c6ccbecbd7ce2402e6f22ec162e6124d1d04fe0a668",
-    "assets/config/sepolia.json": "f6e3aa400ac8cc98d5bb474e0548a35aee12a3d13931d44e1a1af7474148d69a",
-    "assets/config/mainnet.json": "4bd04be1fa28ea5906d0e2eabc6d7c9dc66c129e2f01f1d292add50f0b34e22c"
+    "wasm/zkapi_browser.js": "95a510fe67db994c090a53912449a4b99136db088b866797e9a2704c7619f3a0",
+    "wasm/zkapi_browser_bg.wasm": "2634e58e47b88a92e4cafd94ebd344864a0469ee9f926fbd6de27c9efb0338b4",
+    "assets/proofs/request.pk": "28db26517500ebd2376b88fe729820912ebcbc2f92830e816ea894e968ad8591",
+    "assets/proofs/withdrawal.pk": "30c7cccf1b0fc2ab136b37273c5c19e84e90bf388a35088157dccc053efb479a",
+    "assets/config/sepolia.json": "8ac7001dac22d0593f60ac696d87cc8a68378077e80ce644acca6bc0f9891e56",
+    "assets/config/mainnet.json": "2e161db8dd20ee0a6b6edf82a7962196ae1f1af31297fc09622cd31aa431cefb"
   },
-  "circuitId": "zkapi-v2-note-bound-v1"
+  "circuitId": "zkapi-v2-concession-v1"
 }

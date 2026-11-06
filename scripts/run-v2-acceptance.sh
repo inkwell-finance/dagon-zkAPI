@@ -26,8 +26,14 @@ fi
 
 npm ci --prefix docker/aws/signer --ignore-scripts --no-audit --no-fund
 cargo build --locked --release --target-dir target \
-    -p zkapi-cli --bin zkapi \
-    -p zkapi-serverd --bin zkapi-challenged --example v2_acceptance_wallet \
-    -p zkapi-indexerd --bin zkapi-indexerd
+    -p zkapi-cli --bin dagon-zkapi \
+    -p zkapi-serverd --bin dagon-zkapi-challenged --example v2_acceptance_wallet \
+    -p zkapi-indexerd --bin dagon-zkapi-indexerd
+# The withheld-successor scenario needs a server that settles requests but
+# never signs their successors. That test mode exists only with the
+# `adversary` feature and is refused in release builds, so build it in debug.
+cargo build --locked --target-dir target/adversary \
+    -p zkapi-cli --bin dagon-zkapi --features adversary
 (cd protocol/contracts && forge build)
-exec node scripts/v2-acceptance.mjs --bin-dir target/release "$@"
+exec node scripts/v2-acceptance.mjs --bin-dir target/release \
+    --adversary-bin target/adversary/debug/dagon-zkapi "$@"

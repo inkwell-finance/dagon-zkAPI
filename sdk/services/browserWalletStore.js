@@ -1,4 +1,6 @@
 import { isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
+import { losslessChainId, sameChainId } from './zkapiLedgerIdentity.mjs';
+import { sameFelt as sameFeltValue } from './zkapiActiveRoot.mjs';
 
 const DB_NAME = 'zkapi-browser-wallet-v1';
 const DB_VERSION = 3;
@@ -443,8 +445,11 @@ export async function putBrowserWithdrawal(record) {
 
 /**
  * Move a chain-confirmed escape out of the selected wallet slot atomically.
- * The complete private state stays in the recovery record because a challenge
- * can reactivate this note before the safety deadline.
+ * The complete private state stays in the recovery record: a defeat returns
+ * the note to Active, and the record must still prove what this device held.
+ * An escape may leave with the request it made at the same state still in
+ * flight (its successor withheld); that journal moves into the record, since
+ * the escape's concession already pays for it.
  */
 export async function detachBrowserEscapeWithdrawal(record) {
     if (!record?.recordId || record.noteId == null) {
@@ -458,7 +463,13 @@ export async function detachBrowserEscapeWithdrawal(record) {
         transaction.abort();
         throw new Error('The selected private note changed before the escape could be saved.');
     }
-    if (current.journal || current.lease || current.pendingDeposit) {
+    const withdrawalNullifier = current.preparedWithdrawal?.withdrawalNullifier
+        || current.preparedWithdrawal?.public_inputs?.withdrawal_nullifier
+        || record.withdrawalNullifier
+        || null;
+    const journalAtEscapedState = Boolean(current.journal) && withdrawalNullifier != null
+        && sameFeltValue(current.journal.nullifier, withdrawalNullifier);
+    if ((current.journal && !journalAtEscapedState) || (current.lease && !current.journal) || current.pendingDeposit) {
         transaction.abort();
         throw new Error('Finish the other private-balance operation before saving this escape.');
     }
@@ -468,12 +479,10 @@ export async function detachBrowserEscapeWithdrawal(record) {
         deploymentId: record.deploymentId || current.deploymentId,
         state: current.state,
         preparedWithdrawal: current.preparedWithdrawal,
+        ...(current.journal ? { inFlightJournal: current.journal } : {}),
         clearanceReserved: current.preparedWithdrawal?.clearanceReserved === true
             || record.clearanceReserved === true,
-        withdrawalNullifier: current.preparedWithdrawal?.withdrawalNullifier
-            || current.preparedWithdrawal?.public_inputs?.withdrawal_nullifier
-            || record.withdrawalNullifier
-            || null,
+        withdrawalNullifier,
         revision: 1,
         createdAt: Number(record.createdAt || now),
         updatedAt: now
@@ -576,7 +585,7 @@ export async function transferBrowserLateWithdrawalAttempt(identity, record) {
         attempt.operationId === identity.operationId
         && String(attempt.transactionHash || '').toLowerCase() === normalizedHash
         && attempt.deploymentId === identity.deploymentId
-        && Number(attempt.chainId) === Number(identity.chainId)
+        && sameChainId(attempt.chainId, identity.chainId)
         && String(attempt.contractAddress || '').toLowerCase()
             === String(identity.contractAddress || '').toLowerCase()
         && Number(attempt.noteId) === Number(identity.noteId));
@@ -689,7 +698,7 @@ export async function transferBrowserLateWithdrawalAttempt(identity, record) {
         delete preparedWithdrawal.submissionError;
     }
     const sameLateNote = entry => entry.deploymentId === identity.deploymentId
-        && Number(entry.chainId) === Number(identity.chainId)
+        && sameChainId(entry.chainId, identity.chainId)
         && String(entry.contractAddress || '').toLowerCase()
             === String(identity.contractAddress || '').toLowerCase()
         && Number(entry.noteId) === Number(identity.noteId);
@@ -739,7 +748,7 @@ export async function transferBrowserLateWithdrawalAttempt(identity, record) {
         ...(existing || {}),
         ...record,
         deploymentId: identity.deploymentId,
-        chainId: Number(identity.chainId),
+        chainId: losslessChainId(identity.chainId),
         contractAddress: identity.contractAddress,
         noteId: Number(identity.noteId),
         state: existing?.state || current.state,
@@ -865,7 +874,7 @@ export async function transferBrowserLateWithdrawalAttempt(identity, record) {
 function backgroundIdentityMatches(record, identity) {
     return record && identity?.recordId === record.recordId
         && identity.deploymentId === record.deploymentId
-        && Number(identity.chainId) === Number(record.chainId)
+        && sameChainId(identity.chainId, record.chainId)
         && String(identity.contractAddress || '').toLowerCase() === String(record.contractAddress || '').toLowerCase()
         && Number(identity.noteId) === Number(record.noteId)
         && identity.mode === record.mode
@@ -901,7 +910,7 @@ export function assertBrowserBackgroundWithdrawalAvailable(record, runtime, iden
     if ((runtime.lateWithdrawalAttempts || []).some(attempt =>
         !LATE_WITHDRAWAL_TERMINAL_STATUSES.has(attempt.status)
         && attempt.deploymentId === record.deploymentId
-        && Number(attempt.chainId) === Number(record.chainId)
+        && sameChainId(attempt.chainId, record.chainId)
         && String(attempt.contractAddress || '').toLowerCase() === String(record.contractAddress || '').toLowerCase()
         && Number(attempt.noteId) === Number(record.noteId))) {
         throw new Error('A transaction for this saved withdrawal still needs reconciliation.');
@@ -1386,7 +1395,7 @@ export async function claimBrowserWithdrawalStartReplacement(
             || nextPrepared.public_inputs.withdrawal_nullifier
             || null,
         deploymentId: current.deploymentId,
-        chainId: Number(current.chainId),
+        chainId: losslessChainId(current.chainId),
         contractAddress: current.contractAddress,
         replacementFrom: from,
         replacementNonce: nonce,
@@ -1439,7 +1448,7 @@ export async function releaseBrowserWithdrawalStartSubmission(recordId, submissi
         && (current.startOperationId || current.preparedWithdrawal?.operationId)
             === submission?.operationId
         && current.deploymentId === submission?.deploymentId
-        && Number(current.chainId) === Number(submission?.chainId)
+        && sameChainId(current.chainId, submission?.chainId)
         && String(current.contractAddress || '').toLowerCase()
             === String(submission?.contractAddress || '').toLowerCase()
         && Number(backgroundClaimPlan?.noteId
@@ -1710,7 +1719,7 @@ export async function restoreBrowserWithdrawal(recordId, identity = {}, expected
         throw new Error('The withdrawal changed before this balance could be selected. Check its status again.');
     }
     const sameDeployment = record.deploymentId === identity.deploymentId
-        && Number(record.chainId) === Number(identity.chainId)
+        && sameChainId(record.chainId, identity.chainId)
         && String(record.contractAddress || '').toLowerCase()
             === String(identity.contractAddress || '').toLowerCase();
     if (!sameDeployment) {
@@ -1729,7 +1738,7 @@ export async function restoreBrowserWithdrawal(recordId, identity = {}, expected
     const unresolvedLateStart = (current.lateWithdrawalAttempts || []).some(attempt =>
         !LATE_WITHDRAWAL_TERMINAL_STATUSES.has(attempt.status)
         && attempt.deploymentId === record.deploymentId
-        && Number(attempt.chainId) === Number(record.chainId)
+        && sameChainId(attempt.chainId, record.chainId)
         && String(attempt.contractAddress || '').toLowerCase()
             === String(record.contractAddress || '').toLowerCase()
         && Number(attempt.noteId) === Number(record.noteId));
@@ -1885,13 +1894,17 @@ export async function updateBrowserWithdrawal(recordId, changes = {}, {
         delete next.finalizeSubmissionFrom;
         delete next.finalizeSubmissionNonce;
         delete next.finalizeSubmissionError;
+        delete next.solanaFinalizeOperationId;
+        delete next.solanaFinalizationJournal;
     }
     store.put(next);
     await transactionDone(transaction);
     return next;
 }
 
-const FINALIZATION_TERMINAL_PHASES = new Set(['closed', 'restored', 'parked']);
+// 'defeated': the escape lost to a request from the escaped state's successor;
+// it can never finalize.
+const FINALIZATION_TERMINAL_PHASES = new Set(['closed', 'restored', 'parked', 'defeated']);
 
 function finalizationReference(value) {
     if (!value || typeof value !== 'object') return null;
@@ -1901,7 +1914,7 @@ function finalizationReference(value) {
         operationId: value.operationId || null,
         generation: Number(value.generation || 0),
         deploymentId: value.deploymentId || null,
-        chainId: Number(value.chainId),
+        chainId: losslessChainId(value.chainId),
         contractAddress: value.contractAddress || null,
         noteId: Number(value.noteId),
         destination: value.destination || null
@@ -1912,7 +1925,7 @@ function finalizationIdentity(record) {
     return {
         recordId: record.recordId,
         deploymentId: record.deploymentId,
-        chainId: Number(record.chainId),
+        chainId: losslessChainId(record.chainId),
         contractAddress: record.contractAddress,
         noteId: Number(record.noteId),
         destination: record.destination
@@ -1927,7 +1940,7 @@ function matchesFinalizationClaim(record, reference) {
         && reference.operationId === record.finalizeOperationId
         && Number(reference.generation) === Number(record.finalizeGeneration || 0)
         && reference.deploymentId === record.deploymentId
-        && Number(reference.chainId) === Number(record.chainId)
+        && sameChainId(reference.chainId, record.chainId)
         && String(reference.contractAddress || '').toLowerCase()
             === String(record.contractAddress || '').toLowerCase()
         && Number(reference.noteId) === Number(record.noteId)

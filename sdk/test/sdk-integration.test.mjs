@@ -3,6 +3,7 @@ import test from 'node:test';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 import { buildBrowserSdkAssets, verifyBrowserSdkAssets } from '../build.mjs';
 import { configureBrowserSdk, browserSdkOptions, browserSdkTransport, beginBrowserSdkInitialization } from '../configure.js';
@@ -15,6 +16,15 @@ test('SDK imports without a host UI, codec global, wallet connection or network 
     assert.equal(sdk.zkapiClient.initialized, false);
     assert.equal(sdk.browserWalletRuntime.worker, null);
     assert.deepEqual(sdk.CHAT_SPENDING_TIER_USD, [1, 2, 3, 4.5, 6]);
+});
+
+test('operator-free Solana exits bundle for browsers without Node polyfills', async () => {
+    const result = await build({
+        entryPoints: [fileURLToPath(new URL('../index.js', import.meta.url))],
+        bundle: true, platform: 'browser', format: 'esm', write: false,
+    });
+    assert.equal(result.outputFiles.length, 1);
+    assert.ok(result.outputFiles[0].contents.length > 0);
 });
 
 test('transport omits account credentials for both direct and opt-in host proxy requests', async () => {

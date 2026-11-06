@@ -67,6 +67,8 @@ test('browser build contains every wallet WASM operation', () => {
         'browserrequestprover_prepare_request',
         'browser_complete_response',
         'browser_withdrawal_nullifier',
+        'browser_successor_nullifier',
+        'browser_check_unrecoverable_response',
         'browser_prepare_withdrawal'
     ]) {
         assert.ok(exports.has(name), `missing WASM export ${name}`);
@@ -106,14 +108,14 @@ test('browser worker retains the decoded request prover and retries failed initi
     );
 });
 
-test('static proving keys match the note-bound development setup hashes', () => {
+test('static proving keys match the concession-exit development setup hashes', () => {
     assert.equal(
         sha256(path.join(root, 'assets/proofs/request.pk')),
-        'c894b261a13f571d0df36be29734aabf2a8cd7162baddc5e08a50341aa076584'
+        '28db26517500ebd2376b88fe729820912ebcbc2f92830e816ea894e968ad8591'
     );
     assert.equal(
         sha256(path.join(root, 'assets/proofs/withdrawal.pk')),
-        '8e41398092fdd02b9ff86c6ccbecbd7ce2402e6f22ec162e6124d1d04fe0a668'
+        '30c7cccf1b0fc2ab136b37273c5c19e84e90bf388a35088157dccc053efb479a'
     );
 });
 
@@ -127,7 +129,7 @@ test('browser config pins the fresh native ETH note-bound Sepolia deployment', (
     assert.equal(config.trusted_deployment.billing_token_address, null);
     assert.equal(config.trusted_deployment.protocol_server_url, 'https://zkapi-sepolia.openanonymity.ai');
     assert.equal(config.trusted_deployment.indexer_url, config.trusted_deployment.protocol_server_url);
-    assert.equal(config.trusted_deployment.circuit_id, 'zkapi-v2-note-bound-v1');
+    assert.equal(config.trusted_deployment.circuit_id, 'zkapi-v2-concession-v1');
     assert.equal(config.deployment_status, undefined);
     assert.equal(config.trusted_deployment.request_proving_key_sha256, sha256(path.join(root, 'assets/proofs/request.pk')));
     assert.equal(config.trusted_deployment.withdrawal_proving_key_sha256, sha256(path.join(root, 'assets/proofs/withdrawal.pk')));
@@ -155,7 +157,7 @@ test('mainnet browser config pins the finalized native ETH note-bound deployment
     assert.equal(config.trusted_deployment.deployment_id, 'zkapi-native-eth-mainnet-note-bound-v1-fresh-20260930');
     assert.equal(config.trusted_deployment.chain_id, 1);
     assert.equal(config.deployment_status, undefined);
-    assert.equal(config.trusted_deployment.circuit_id, 'zkapi-v2-note-bound-v1');
+    assert.equal(config.trusted_deployment.circuit_id, 'zkapi-v2-concession-v1');
     assert.equal(config.trusted_deployment.contract_address.toLowerCase(), '0x4386fdbda35d995beb3bf8625118ec5982ec81fe');
     assert.equal(config.trusted_deployment.protocol_server_url, 'https://zkapi-mainnet.openanonymity.ai');
     assert.equal(config.trusted_deployment.indexer_url, config.trusted_deployment.protocol_server_url);
@@ -265,21 +267,24 @@ test('published vault challenge-period getter is probed before the reverting fal
     );
 });
 
-test('browser withdrawal refreshes stale Merkle roots before retrying', () => {
+test('browser exits are leaf-bound: no root read, Merkle path or root retry', () => {
     const runtime = fs.readFileSync(path.join(__dirname, 'services/browserWalletRuntime.js'), 'utf8');
-    const rootSync = fs.readFileSync(path.join(__dirname, 'services/zkapiWithdrawalRoot.mjs'), 'utf8');
     const client = fs.readFileSync(path.join(__dirname, 'services/zkapiClient.js'), 'utf8');
-    assert.match(runtime, /expectedActiveRoot/);
-    assert.match(runtime, /waitForExpectedActiveRoot/);
-    assert.match(runtime, /sameFelt\(existing\.public_inputs\?\.active_root, path\.active_root\)/);
-    assert.match(rootSync, /indexer_root_lag/);
-    assert.match(client, /`0x\$\{ABI\.currentRoot\}`/);
-    assert.match(client, /const attempts = 3/);
-    assert.match(client, /Refreshing the Merkle path and proof/);
+    for (const marker of ['async prepareWithdrawal(mode,', 'async prepareBackgroundWithdrawal(']) {
+        const method = sourceMethodAt(runtime, marker);
+        assert.doesNotMatch(method, /treePath|active_root|merkle_siblings|expectedActiveRoot/, marker);
+        assert.match(method, /valid_until: String\(validUntil\)/, marker);
+    }
+    for (const marker of ['async performWithdrawal(', 'async performBackgroundWithdrawal(', 'async performSolanaWithdrawal(']) {
+        const method = sourceMethodAt(client, marker);
+        assert.doesNotMatch(method, /currentRoot|expectedActiveRoot|stale_root|restoreChallenged|restore_required/, marker);
+    }
+    assert.doesNotMatch(client, /restoreChallengedNote|restore_required/);
+    assert.doesNotMatch(runtime, /challenges\/restore\/prepare|siblings: plan\.siblings/);
 });
 
-test('withdrawal root synchronization waits for the indexer and fails closed', async () => {
-    const roots = await import(pathToFileURL(path.join(__dirname, 'services/zkapiWithdrawalRoot.mjs')));
+test('active root synchronization waits for the indexer and fails closed', async () => {
+    const roots = await import(pathToFileURL(path.join(__dirname, 'services/zkapiActiveRoot.mjs')));
     let calls = 0;
     const current = await roots.waitForExpectedActiveRoot(async () => {
         calls += 1;

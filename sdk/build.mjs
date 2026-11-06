@@ -9,7 +9,7 @@ const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 /** Read and verify the package's public artifacts without building protocol source. */
 export async function verifyBrowserSdkAssets() {
     const manifest = JSON.parse(await fs.readFile(path.join(sdkRoot, 'assets/manifest.json'), 'utf8'));
-    if (manifest.circuitId !== 'zkapi-v2-note-bound-v1') throw new Error('Incompatible SDK circuit artifacts.');
+    if (manifest.circuitId !== 'zkapi-v2-concession-v1') throw new Error('Incompatible SDK circuit artifacts.');
     for (const [relative, expected] of Object.entries(manifest.files)) {
         const resolved = path.resolve(sdkRoot, relative);
         if (!resolved.startsWith(`${sdkRoot}${path.sep}`)) throw new Error('Invalid SDK asset path.');

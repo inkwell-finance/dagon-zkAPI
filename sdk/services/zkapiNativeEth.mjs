@@ -124,6 +124,25 @@ export async function assertNativeVault(funding, { signal = AbortSignal.timeout(
     }
 }
 
+/**
+ * The pinned RPC's finalized block timestamp (seconds). The exit freeze
+ * compares it with a released proof's valid_until: the vault checks that
+ * deadline against block time, not this device's clock.
+ */
+export async function readFinalizedChainTime(funding, { signal = AbortSignal.timeout(20_000) } = {}) {
+    validateNativeFunding(funding);
+    if (BigInt(await rpc(funding, 'eth_chainId', [], signal)) !== BigInt(funding.chain_id)) {
+        throw new Error('The native ETH RPC is on the wrong chain.');
+    }
+    const block = await rpc(funding, 'eth_getBlockByNumber', ['finalized', false], signal);
+    if (!/^0x[0-9a-f]+$/i.test(block?.timestamp || '')) {
+        throw new Error('The native ETH RPC returned an invalid finalized block.');
+    }
+    const timestamp = Number(BigInt(block.timestamp));
+    if (!Number.isSafeInteger(timestamp)) throw new Error('The native ETH RPC returned an invalid block time.');
+    return timestamp;
+}
+
 // Reads only: no injected provider, wallet connection, note preparation, or signing.
 // One finalized block pins all feed reads. New server quotes must match its
 // latest round; saved requests and settlements retain their original quote.

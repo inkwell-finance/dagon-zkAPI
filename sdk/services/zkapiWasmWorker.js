@@ -21,7 +21,7 @@ function bytesToHex(bytes) {
 async function ensureInitialized() {
     if (!initialized) {
         initialized = init(new URL('../wasm/zkapi_browser_bg.wasm', import.meta.url)).then(result => {
-            if (browser_circuit_id() !== 'zkapi-v2-note-bound-v1') {
+            if (browser_circuit_id() !== 'zkapi-v2-concession-v1') {
                 throw new Error('The loaded proof WASM uses an incompatible circuit revision.');
             }
             return result;

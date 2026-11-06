@@ -14,7 +14,7 @@ if (process.argv.includes('--check')) {
     const manifest = JSON.parse(await fs.readFile(manifestFile, 'utf8'));
     const protocolRevision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: path.join(root, 'protocol'), encoding: 'utf8' }).trim();
     const setup = JSON.parse(await fs.readFile(path.join(root, 'protocol/setup/v2/manifest.json'), 'utf8'));
-    if (setup.circuit_id !== 'zkapi-v2-note-bound-v1') throw new Error('Incompatible protocol setup circuit.');
+    if (setup.circuit_id !== 'zkapi-v2-concession-v1') throw new Error('Incompatible protocol setup circuit.');
     manifest.circuitId = setup.circuit_id;
     for (const network of ['sepolia', 'mainnet']) {
         const config = JSON.parse(await fs.readFile(path.join(root, `sdk/assets/config/${network}.json`), 'utf8'));

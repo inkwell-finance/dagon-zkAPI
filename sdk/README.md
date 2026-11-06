@@ -1,9 +1,13 @@
-# zkAPI browser SDK
+# Dagon zkAPI browser SDK
 
-`@openanonymity/zkapi-browser-sdk` owns the browser wallet, local proof worker,
+`@dagon/zkapi-browser-sdk` owns the browser wallet, local proof worker,
 private-note journal, short-lived key issuance and settlement, deposit/withdrawal
 recovery, and public payment-history reconciliation. It has no UI,
 model-catalog, or chat-storage dependency. The host owns chat and payment UI.
+
+The production-default ledger is native SOL through Wallet Standard. Native ETH
+and EIP-1193 remain explicit EVM compatibility paths. Both use the same Groth16
+request/proof API; ledger transport is selected from the pinned deployment.
 
 Install a reviewed immutable Git revision, or install its `npm pack` tarball.
 No Rust compiler, setup ceremony, or npm publish step is needed to
@@ -11,8 +15,8 @@ consume this package. The public proving keys and WASM are included and hashed
 in `sdk/assets/manifest.json`; these are public artifacts, not wallet secrets.
 
 ```js
-import { configureBrowserSdk } from '@openanonymity/zkapi-browser-sdk';
-import client from '@openanonymity/zkapi-browser-sdk/client';
+import { configureBrowserSdk } from '@dagon/zkapi-browser-sdk';
+import client from '@dagon/zkapi-browser-sdk/client';
 
 configureBrowserSdk({
   configUrl: '/zkapi/browser-config.json',
@@ -27,8 +31,8 @@ await client.init();
 const unsubscribe = client.subscribe(snapshot => renderBalance(snapshot));
 ```
 
-Configuration must precede the first initialization. The SDK runs only the
-native ETH browser wallet; `mode: 'auto'` and `mode: 'daemon'` are unsupported.
+Configuration must precede the first initialization. `mode: 'auto'` and
+`mode: 'daemon'` are unsupported.
 The host config URL supplies the pinned network, vault, server signing keys,
 proof hashes, and approved deployment manifest URLs. Runtime URL overrides
 remain restricted to that allowlist. Configure the same-origin
@@ -74,12 +78,80 @@ endpoints and provider inference never receive this password. A 401 clears
 the rejected credential without replaying a protocol operation; recovery
 journals remain authoritative. Mainnet does no password discovery or prompting.
 
-This SDK requires `proof_setup.circuit_id: "zkapi-v2-note-bound-v1"` in the
+This SDK requires `proof_setup.circuit_id: "zkapi-v2-concession-v1"` in the
 deployment manifest and matching `trusted_deployment.circuit_id` in the host
 config. The vault's immutable verifier, proving keys, and signing-key pins must
 match this circuit. Configuration mismatches are rejected before funding.
 
-## External wallets and manual signing
+## Solana wallets and durable staged operations
+
+Solana deployments pin `ledger_backend: "solana"`, `billing_asset:
+"native_sol"`, an exact decimal-string chain ID, cluster genesis hash, immutable
+program ID, vault-state PDA, Pyth receiver/price/feed identities and finalized
+RPC. The SDK revalidates those identities before wallet mutation.
+
+The host supplies a Wallet Standard account with `solana:signTransaction`.
+Prepared legacy messages must contain exactly one instruction for the pinned
+program, optionally preceded by bounded Compute Budget heap-frame and compute-unit
+limit instructions. Priority-fee instructions, other prefix programs and duplicate
+budget settings are rejected. The pinned vault must be account zero of the actual
+vault instruction, and the selected account must be the exact fee payer. The transport
+checks recent blockhash lifetime and packet size, persists signed bytes and the
+deterministic signature before broadcast, and then submits and finalizes each
+stage in order. Restart resumes from the stored bytes without prompting the
+wallet to sign again.
+
+Deposit, mutual close, escape initiation and escape finalization each have an
+independent durable journal. The runtime mutates private wallet state only after
+the transaction is finalized and the program-owned note/pending accounts plus
+finalized vault root match the expected operation. Never clear or synthesize a
+journal from UI state.
+
+A challenged escape never removes the note leaf and there is no restore step: a
+defeated escape returns the note to `active`, and a concession raise lowers the
+pending payout while it stays `pending_withdrawal`. Exit rules in the wallet:
+the note is frozen once an exit starts (no new requests); the client chooses a
+concession (fresh state: `c = 0`; request in flight: wait until the settlement
+deadline plus margin or `expiry - 12h`, then concede the recorded bound `b_k`
+or the smaller reported charge); one bound is released per state, and
+re-proving an unfinished lease reuses the recorded bound. The exit proof is
+leaf-bound and root-free with a short `valid_until` TTL. A signed successor
+state that fails the derived-anchor check (`next_anchor == H(d_anchor, N)`) or
+the commitment recomputation is treated as withheld. With these rules the
+honest user is paid at least `B_k - b_k` from the newest installed state without
+operator cooperation (guarantee G1); see [the concession rule](../protocol/SPEC.md).
+
+Escape recovery is best-effort and bounded: an offline/refusing operator or a
+malformed successor cannot prevent proving an escape. Failed recovery retains
+the durable request journal and its bound; the same local settlement deadline,
+concession choice and exit-proof freeze apply. Mutual close still requires a
+valid operator clearance.
+
+A released exit proof freezes its balance (no successor install, request,
+cancel or restore) until both this device's clock and the finalized block time
+read from the host-pinned RPC are past `valid_until + 900 s`; the vault checks
+`valid_until` against block time, so a fast device clock alone never thaws the
+balance. An unreadable RPC keeps it frozen; exits and finalization are never
+blocked by the freeze.
+
+If the operator's deployment manifest is unavailable or no longer matches the
+host's trusted pins, initialization uses those pins in **exit-only** mode
+(`config.exit_only`). New deposits and requests remain disabled; existing
+balances and recovery stay available. Reload once the operator recovers.
+Solana close, escape and finalization transactions are constructed locally
+from the pinned RPC's canonical vault/note accounts and recent blockhash.
+They never call the operator's `/v2/ledger/*/prepare` endpoints. Deposits still
+use the staged operator preparation route.
+
+A deposit that landed on-chain is installed from the vault's note record alone
+(EVM receipt or vault read; Solana finalized note account). Neither confirmation
+nor reload recovery reads the operator's indexer, so withholding the tree mirror
+cannot keep a landed deposit from being exited; requests still read and verify
+the mirror. A Solana vault whose pause flag is set still loads: the program
+reopens exits after the bounded pause, and only new deposits are refused while
+the flag stays set.
+
+## EVM compatibility: external wallets and manual signing
 
 `client.setWalletProvider(provider)` selects an instance-scoped EIP-1193
 provider. The default is the browser's injected `globalThis.ethereum`;
@@ -99,8 +171,18 @@ for reads, and display the exact `eth_sendTransaction` payload for submission
 with the user's own wallet. The connected address funds deposits and pays
 withdrawal gas. By default it is also the destination of a newly prepared
 withdrawal. To choose an independent payout address, call
-`client.withdraw(mode, onStatus, { destination })`, where `mode` is `mutual` or
-`escape`. The destination must be a nonzero Ethereum address, distinct from the
+`client.withdraw(mode, onStatus, { destination, earlyConcession })`, where
+`mode` is `mutual` or `escape`. `earlyConcession` (`'zero'` or `'bound'`) forces
+an escape while the last request may still be settling; without it the SDK
+refuses with `escape_wait` (and `escapeAt`) until the settlement window ends. A
+successor the operator settled but withheld, or one failing the S3-S5 checks,
+freezes the balance for requests (`successor_withheld`); escaping then concedes
+at most that request's bound. Withdrawal records expose `stateBalance`,
+`concededAtInit`, `conceded` and `concessionRaised` so hosts can show raises;
+a defeated escape ends in phase `defeated`. An EVM finalize pushes the payout
+with a bounded gas stipend; a destination that rejects it is credited in the
+vault instead, and the record then carries `payoutDeferred: true` until someone
+calls the permissionless `claimEscapePayout(destination)`. The destination must be a nonzero Ethereum address, distinct from the
 configured vault. The host must confirm the intended address
 and network with the user. The SDK binds it into the durable proof; an explicit
 different destination on a later call is rejected. Omitting the option when
@@ -148,7 +230,7 @@ In the host build:
 
 ```js
 import { build } from 'esbuild';
-import { buildBrowserSdkAssets } from '@openanonymity/zkapi-browser-sdk/build';
+import { buildBrowserSdkAssets } from '@dagon/zkapi-browser-sdk/build';
 
 await buildBrowserSdkAssets({
   outDir: 'dist/zkapi',
@@ -174,11 +256,11 @@ exact balance. The SDK settles/rekeys when a selected cap changes; only actual
 usage is charged. Expiry and withdrawal contract behavior are unchanged.
 
 Run `npm run test:sdk` in this checkout. For an installed package, run
-`node --test node_modules/@openanonymity/zkapi-browser-sdk/sdk/test/*.test.mjs`
+`node --test node_modules/@dagon/zkapi-browser-sdk/sdk/test/*.test.mjs`
 from a host that provides esbuild as a development dependency. The tests use
 local fixtures and do not connect a wallet or broadcast transactions.
 
-## Native ETH deployments
+## EVM compatibility: native ETH deployments
 
 Native ETH requires a trusted native vault and billing-server configuration.
 Token manifests are unsupported and rejected before wallet mutation. Notes and
@@ -295,7 +377,7 @@ payload hash. Local wall-clock expiry, a changed market price, or a missing
 nullifier alone never clears a proof. Wallet balances continue to display their
 current USD value independently of a running key's frozen conversion.
 
-## Default deployments
+## Legacy EVM deployment profiles
 
 The packaged mainnet and Sepolia configurations use
 `https://zkapi-mainnet.openanonymity.ai` and

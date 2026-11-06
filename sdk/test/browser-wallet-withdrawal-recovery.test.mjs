@@ -323,17 +323,13 @@ function withdrawalReceipt({
     const topic = mode === 'mutual'
         ? globalThis.zkapiWallet.ABI.mutualCloseEvent
         : globalThis.zkapiWallet.ABI.escapeInitiatedEvent;
-    const words = [
-        globalThis.zkapiWallet.abiWord(99n),
-        globalThis.zkapiWallet.abiWord(BigInt(finalBalance)),
-        globalThis.zkapiWallet.addressWord(destination)
-    ];
-    if (mode === 'escape') {
-        words.push(
-            globalThis.zkapiWallet.abiWord(BigInt(challengeDeadline)),
-            globalThis.zkapiWallet.abiWord(101n)
-        );
-    }
+    const word = globalThis.zkapiWallet.abiWord;
+    // MutualClose: nullifier, f, destination. EscapeWithdrawalInitiated:
+    // nullifier, N⁺, f, c, destination, deadline.
+    const words = mode === 'escape'
+        ? [word(99n), word(100n), word(BigInt(finalBalance)), word(0n),
+            globalThis.zkapiWallet.addressWord(destination), word(BigInt(challengeDeadline))]
+        : [word(99n), word(BigInt(finalBalance)), globalThis.zkapiWallet.addressWord(destination)];
     return {
         status: '0x1',
         blockNumber: `0x${Number(blockNumber).toString(16)}`,
@@ -895,7 +891,6 @@ test('browser withdrawal recovery invariants', async t => {
         attachDurableRuntime(browserWalletRuntime, durable);
         browserWalletRuntime.settleActiveLease = async () => null;
         browserWalletRuntime.recoverPending = async () => false;
-        browserWalletRuntime.treePath = async () => ({ active_root: '0x1', siblings: [] });
         browserWalletRuntime.remoteJson = async () => ({ signature: 'server-clearance' });
         browserWalletRuntime.worker = {
             async call(operation, payload) {
@@ -905,7 +900,9 @@ test('browser withdrawal recovery invariants', async t => {
                     mode: payload.args.mode,
                     proof: 'proof-before-wallet',
                     public_inputs: {
-                        active_root: payload.args.active_root,
+                        valid_until: Number(payload.args.valid_until),
+                        conceded: Number(payload.args.conceded),
+                        has_clearance: payload.args.mode === 'mutual',
                         note_id: 7,
                         final_balance: 1_000_000,
                         withdrawal_nullifier: '0x777'
@@ -990,13 +987,12 @@ test('browser withdrawal recovery invariants', async t => {
         }
     });
 
-    await t.test('canceling an unsubmitted escape removes every selected-note withdrawal lock', async () => {
+    await t.test('a canceled escape keeps its released proof frozen until the proof is dead (C3)', async () => {
         localStorage.clear();
         const durable = durableState(baseRuntime());
         attachDurableRuntime(browserWalletRuntime, durable);
         browserWalletRuntime.settleActiveLease = async () => null;
         browserWalletRuntime.recoverPending = async () => false;
-        browserWalletRuntime.treePath = async () => ({ active_root: '0x1', siblings: [] });
         browserWalletRuntime.worker = {
             async call(operation, payload) {
                 if (operation === 'withdrawalNullifier') return '0x777';
@@ -1005,7 +1001,9 @@ test('browser withdrawal recovery invariants', async t => {
                     mode: payload.args.mode,
                     proof: 'escape-proof-before-wallet',
                     public_inputs: {
-                        active_root: payload.args.active_root,
+                        valid_until: Number(payload.args.valid_until),
+                        conceded: Number(payload.args.conceded),
+                        has_clearance: payload.args.mode === 'mutual',
                         note_id: 7,
                         final_balance: 1_000_000,
                         withdrawal_nullifier: '0x777'
@@ -1053,12 +1051,32 @@ test('browser withdrawal recovery invariants', async t => {
                     return error.code === 4001;
                 }
             );
-            assert.match(rejection.shortMessage, /no funds moved/i);
-            assert.equal(durable.value.preparedWithdrawal, null);
-            assert.equal(zkapiClient.withdrawal, null);
-            assert.equal(zkapiClient.config.prepared_withdrawal, null);
-            assert.equal(zkapiClient.withdrawalBlocksChat, false);
+            assert.match(rejection.shortMessage, /no funds moved.*stays reserved for withdrawal/i);
+            assert.equal(rejection.code, 4001);
+            const frozen = durable.value.preparedWithdrawal;
+            assert.equal(frozen.mode, 'escape');
+            assert.ok(frozen.releasedValidUntil >= Number(frozen.public_inputs.valid_until));
+            assert.ok(rejection.exitProofLiveUntil > frozen.releasedValidUntil);
+            // No new request proof, cancel or reselection while the proof can land.
+            await assert.rejects(browserWalletRuntime.clearPreparedWithdrawal(), { code: 'exit_proof_live' });
+            await assert.rejects(browserWalletRuntime.prepareLeaseRequest(), /Finish the prepared withdrawal/);
 
+            // Once valid_until + 900 s has passed on this device's clock but the
+            // pinned RPC's finalized block time still accepts the proof (the
+            // device clock runs fast), or the RPC cannot be read, cancel stays refused.
+            const deviceDead = Math.floor(Date.now() / 1000) - 901;
+            durable.value = { ...durable.value, preparedWithdrawal: { ...frozen,
+                releasedValidUntil: deviceDead } };
+            browserWalletRuntime.readFinalizedChainTime = async () => deviceDead;
+            await assert.rejects(browserWalletRuntime.clearPreparedWithdrawal(), { code: 'exit_proof_live' });
+            browserWalletRuntime.readFinalizedChainTime = async () => { throw new TypeError('Failed to fetch'); };
+            await assert.rejects(browserWalletRuntime.clearPreparedWithdrawal(), { code: 'exit_proof_live' });
+            assert.equal(durable.value.preparedWithdrawal.releasedValidUntil, deviceDead);
+            // When both clocks are past it, cancel releases every lock.
+            browserWalletRuntime.readFinalizedChainTime = async () => deviceDead + 901;
+            await browserWalletRuntime.clearPreparedWithdrawal();
+            delete browserWalletRuntime.readFinalizedChainTime;
+            assert.equal(durable.value.preparedWithdrawal, null);
             const reloadedRuntime = attachDurableRuntime(new BrowserWalletRuntime(), durable);
             await reloadedRuntime.reload();
             assert.equal(reloadedRuntime.snapshot().config.prepared_withdrawal, null);

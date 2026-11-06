@@ -1,3 +1,5 @@
+// Deposit and request proofs carry a Merkle path to the vault's active root;
+// exits are leaf-bound and never read a root.
 export function sameFelt(left, right) {
     try {
         return BigInt(left) === BigInt(right);

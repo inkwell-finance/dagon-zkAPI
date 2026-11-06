@@ -2,12 +2,14 @@
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
 export const __wbg_browserrequestprover_free: (a: number, b: number) => void;
+export const browser_check_unrecoverable_response: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const browser_circuit_id: () => [number, number];
 export const browser_complete_response: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const browser_confirm_deposit: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const browser_generate_deposit: () => [number, number, number, number];
 export const browser_prepare_request: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
 export const browser_prepare_withdrawal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
+export const browser_successor_nullifier: (a: number, b: number) => [number, number, number, number];
 export const browser_tree_path: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const browser_wallet_status: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const browser_withdrawal_nullifier: (a: number, b: number) => [number, number, number, number];

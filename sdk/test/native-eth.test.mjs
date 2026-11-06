@@ -221,7 +221,7 @@ test('native lease proves a fixed USD tier with its exact feed quote and keeps p
     runtime.worker = { call: async (_operation, inputs) => {
         proof = inputs;
         const request = { payload: inputs.args.payload, public_inputs: { solvency_bound: inputs.config.request_charge_cap } };
-        return { request, journal: { prepared_request: request } };
+        return { request, journal: { prepared_request: request }, state: { ...inputs.state, bound_at_state: inputs.config.request_charge_cap } };
     } };
     const result = await runtime.prepareLeaseRequest(undefined, null, 4.5);
     assert.equal(result.public_inputs.solvency_bound, 1_500_000);
@@ -229,7 +229,8 @@ test('native lease proves a fixed USD tier with its exact feed quote and keeps p
     runtime.nativeBillingQuote = async () => assert.fail('Never reprice an unfinished proof');
     assert.equal(await runtime.prepareLeaseRequest(undefined, null, 1), result);
     runtime.runtime.journal = null;
-    runtime.runtime.state.current_balance = 1;
+    // A different (fresh) state with too little balance: no bound released yet.
+    runtime.runtime.state = { note_id: 1, current_balance: 1 };
     runtime.nativeBillingQuote = async () => q;
     await assert.rejects(runtime.prepareLeaseRequest(undefined, null, 1), error => error.code === 'insufficient_chat_balance');
 });
@@ -249,7 +250,7 @@ test('checksummed feed pins produce a canonical lowercase quote in the actual pr
     runtime.commit = async next => { runtime.runtime = next; };
     runtime.worker = { call: async (_operation, input) => {
         const request = { payload: input.args.payload, public_inputs: { solvency_bound: input.config.request_charge_cap } };
-        return { request, journal: { prepared_request: request } };
+        return { request, journal: { prepared_request: request }, state: { ...input.state, bound_at_state: input.config.request_charge_cap } };
     } };
     const request = await runtime.prepareLeaseRequest(undefined, null, 1);
     const authorized = JSON.parse(request.payload).billing_quote;
@@ -369,7 +370,11 @@ test('a finalized price update cannot reprice a pending proof until exact supers
     runtime.worker = { call: async (_operation, input) => {
         const request = { client_request_id: `request-${++proofs}`, payload_hash: `0x${proofs}`,
             payload: input.args.payload, public_inputs: { request_nullifier: '0x42', solvency_bound: input.config.request_charge_cap } };
-        return { request, journal: { nullifier: '0x42', prepared_request: request } };
+        // The wallet fixes one bound per state (C2), as the WASM does.
+        const recorded = Number(input.state.bound_at_state || 0);
+        if (recorded && recorded !== input.config.request_charge_cap) throw new Error('bound_fixed_at_state: test');
+        return { request, journal: { nullifier: '0x42', prepared_request: request },
+            state: { ...input.state, bound_at_state: input.config.request_charge_cap } };
     } };
     const original = await runtime.prepareLeaseRequest(undefined, null, 1);
     current = quote({ round_id: '124', answer: '400000000000' });
@@ -387,9 +392,13 @@ test('a finalized price update cannot reprice a pending proof until exact supers
     const fresh = await runtime.prepareLeaseRequest(undefined, null, 1);
     assert.equal(quoteReads, 2);
     assert.equal(proofs, 2);
-    assert.equal(fresh.public_inputs.solvency_bound, 250_000);
+    // C2: the discarded proof already released a bound at this state, so the
+    // fresh proof carries that same bound at the new quote; issueLease settles
+    // its key unused and proves the selected budget at the next state.
+    assert.equal(fresh.public_inputs.solvency_bound, original.public_inputs.solvency_bound);
+    assert.equal(fresh.public_inputs.solvency_bound, 333_334);
     assert.deepEqual(JSON.parse(fresh.payload).billing_quote, current);
-    assert.equal(runtime.runtime.state, note);
+    assert.deepEqual(runtime.runtime.state, { ...note, bound_at_state: 333_334 });
 });
 
 for (const rejection of ['expired', 'superseded']) for (const selectedTier of [1, 4.5]) test(`${rejection} native issuance at selected tier ${selectedTier} attempts once then requests authoritative recovery`, { timeout: 2_000 }, async () => {
@@ -618,4 +627,183 @@ test('token funding never reaches a wallet connection or note preparation', asyn
     client.connectWallet = async () => assert.fail('unsupported funding must fail before wallet connection');
     await assert.rejects(client.performDeposit('1'), /only native ETH deployments are supported/);
     assert.throws(() => nativeDepositValue(1n, client.config.funding), /only native ETH deployments are supported/);
+});
+
+function successorHarness({ response = null, worker = null, preparedWithdrawal = null } = {}) {
+    const runtime = new BrowserWalletRuntime();
+    const q = quote();
+    const request = { client_request_id: 'withheld-request', payload: JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1, billing_quote: q }),
+        public_inputs: { request_nullifier: '0x42', solvency_bound: 50_000 } };
+    runtime.config = { funding, wallet_core: {}, proving_keys: { request: {} } };
+    runtime.runtime = { state: { note_id: 1, current_balance: 2_000_000, current_anchor: '0x7', bound_at_state: 50_000 },
+        journal: { nullifier: '0x42', created_at_ms: Date.now(), prepared_request: request }, preparedWithdrawal };
+    runtime.commit = async next => { runtime.runtime = next; };
+    runtime.remoteJson = async url => {
+        assert.match(url, /\/v2\/requests\/withheld-request$/);
+        return { nullifier_status: 'reserved', request_response: response
+            && { ...response, response_payload: JSON.stringify({ billing_quote: q }) } };
+    };
+    runtime.worker = { call: worker || (async () => assert.fail('a withheld successor is never installed')) };
+    return runtime;
+}
+
+test('a settled request whose successor is withheld freezes requests and is never re-sent', async () => {
+    const runtime = successorHarness();
+    // Not yet settled: nothing is concluded.
+    assert.equal(await runtime.installRecoveredResponse('withheld-request'), false);
+    assert.equal(runtime.runtime.journal.withheldObservedAt, undefined);
+    // Settled (lease finalized) without a signed successor: withheld.
+    assert.equal(await runtime.installRecoveredResponse('withheld-request', undefined, { settled: true }), false);
+    assert.ok(runtime.runtime.journal.withheldObservedAt > 0);
+    await assert.rejects(runtime.prepareLeaseRequest(), { code: 'successor_withheld' });
+    assert.equal(runtime.snapshot().config.successor_withheld, true);
+    await runtime.rememberRequestSettlement({ settle_after: 1_800_000_000 });
+    assert.equal(runtime.runtime.journal.settleAfter, 1_800_000_000);
+});
+
+test('a signed successor failing S3-S5 is treated as withheld and records the reported charge', async () => {
+    const runtime = successorHarness({
+        response: { charge_applied: 70_000 },
+        worker: async operation => {
+            assert.equal(operation, 'completeResponse');
+            throw new Error('invalid_successor: S4 next anchor is not next_anchor(N)');
+        }
+    });
+    await assert.rejects(runtime.installRecoveredResponse('withheld-request'), { code: 'successor_withheld' });
+    assert.deepEqual({ ...runtime.runtime.journal.invalidSuccessor, observedAt: 0 },
+        { reason: 'invalid_successor: S4 next anchor is not next_anchor(N)', charge: '70000', observedAt: 0 });
+    assert.equal(runtime.runtime.state.current_anchor, '0x7', 'the state is not replaced');
+    await assert.rejects(runtime.prepareLeaseRequest(), { code: 'successor_withheld' });
+    // Any other failure (e.g. a forged signature) is not withholding.
+    const forged = successorHarness({ response: { charge_applied: 1 },
+        worker: async () => { throw new Error('successor_signature_invalid: S6'); } });
+    await assert.rejects(forged.installRecoveredResponse('withheld-request'), /successor_signature_invalid/);
+    assert.equal(forged.runtime.journal.invalidSuccessor, undefined);
+});
+
+test('a successor arriving after an exit proof left the device is not installed while that proof can land (E4.6)', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const runtime = successorHarness({ response: { charge_applied: 1 },
+        preparedWithdrawal: { mode: 'escape', releasedValidUntil: now + 3_600 } });
+    assert.equal(await runtime.installRecoveredResponse('withheld-request'), false);
+    assert.equal(runtime.runtime.journal.prepared_request.client_request_id, 'withheld-request');
+    const installed = successorHarness({ response: { charge_applied: 1 },
+        preparedWithdrawal: { mode: 'escape', releasedValidUntil: now - 1_000 },
+        worker: async () => ({ note_id: 1, current_balance: 1_999_999, current_anchor: '0x8', bound_at_state: 0 }) });
+    installed.readFinalizedChainTime = async () => now;
+    assert.equal(await installed.installRecoveredResponse('withheld-request'), true);
+    assert.equal(installed.runtime.state.current_anchor, '0x8');
+    assert.equal(installed.runtime.journal, null);
+});
+
+test('a device clock ahead of the chain keeps a released exit proof frozen until the pinned RPC agrees (C3/E6)', async t => {
+    const now = Math.floor(Date.now() / 1000);
+    // The device clock says valid_until + 900 has passed (it runs ~1 h fast);
+    // the vault checks block time, which still accepts the escape proof.
+    const releasedValidUntil = now - 1_000;
+    const chainStillValid = releasedValidUntil - 2_600;
+    const install = () => successorHarness({ response: { charge_applied: 1 },
+        preparedWithdrawal: { mode: 'escape', releasedValidUntil },
+        worker: async () => ({ note_id: 1, current_balance: 1_999_999, current_anchor: '0x8', bound_at_state: 0 }) });
+    const calls = [];
+    t.mock.method(globalThis, 'fetch', async (url, init) => {
+        assert.equal(url, funding.demo_rpc_url, 'chain time comes only from the pinned RPC');
+        const { method, params } = JSON.parse(init.body);
+        calls.push(method);
+        const result = method === 'eth_chainId' ? '0xaa36a7'
+            : method === 'eth_getBlockByNumber' && params[0] === 'finalized'
+                ? { number: '0x1', hash: HASH, timestamp: `0x${chainStillValid.toString(16)}` }
+                : assert.fail(`Unexpected RPC ${method}`);
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result }));
+    });
+    const fast = install();
+    assert.equal(await fast.installRecoveredResponse('withheld-request'), false);
+    assert.equal(fast.runtime.state.current_anchor, '0x7', 'the successor is not installed');
+    assert.equal(fast.runtime.journal.prepared_request.client_request_id, 'withheld-request');
+    assert.deepEqual(calls, ['eth_chainId', 'eth_getBlockByNumber']);
+    // An unreachable or failing RPC fails closed.
+    const offline = install();
+    offline.readFinalizedChainTime = async () => { throw new TypeError('Failed to fetch'); };
+    assert.equal(await offline.installRecoveredResponse('withheld-request'), false);
+    assert.equal(offline.runtime.state.current_anchor, '0x7');
+    // Once the chain's finalized time is also past valid_until + 900, the successor installs.
+    const dead = install();
+    dead.readFinalizedChainTime = async () => releasedValidUntil + 901;
+    assert.equal(await dead.installRecoveredResponse('withheld-request'), true);
+    assert.equal(dead.runtime.state.current_anchor, '0x8');
+});
+
+test('escape remains available when the operator is offline, refuses recovery, or returns malformed receipts', async t => {
+    for (const failure of [
+        new TypeError('Failed to fetch'),
+        Object.assign(new Error('operator refuses recovery'), { status: 503 }),
+        new Error('successor_signature_invalid: S6'),
+        Object.assign(new Error('recovery deadline expired'), { name: 'TimeoutError' })
+    ]) {
+        await t.test(failure.message, async () => {
+            const runtime = successorHarness();
+            runtime.manifest = { deployment_id: 'offline-escape' };
+            runtime.init = async () => {};
+            runtime.reload = async () => runtime.runtime;
+            runtime.walletStatus = async () => ({ has_note: true });
+            runtime.runtime.state.expiry_ts = Math.floor(Date.now() / 1000) + 86_400;
+            runtime.runtime.journal.created_at_ms = Date.now() - 86_400_000;
+            const journal = structuredClone(runtime.runtime.journal);
+            let recoveries = 0;
+            runtime.remoteJson = async (_url, { signal }) => {
+                assert.ok(signal instanceof AbortSignal, 'operator recovery has a bounded deadline');
+                recoveries++;
+                throw failure;
+            };
+            runtime.worker = { call: async (operation, payload) => {
+                assert.equal(operation, 'prepareWithdrawal');
+                assert.equal(payload.args.mode, 'escape');
+                assert.equal(payload.args.conceded, '50000');
+                return { mode: 'escape', proof: 'offline-proof', public_inputs: {
+                    note_id: 1, has_clearance: false, conceded: 50_000,
+                    final_balance: 1_950_000, valid_until: Number(payload.args.valid_until),
+                    withdrawal_nullifier: '0x42', next_nullifier: '0x43'
+                } };
+            } };
+            const plan = await runtime.prepareWithdrawal('escape', `0x${'12'.repeat(20)}`);
+            assert.equal(plan.public_inputs.final_balance, 1_950_000);
+            assert.equal(plan.concessionRule, 'in_flight');
+            assert.equal(recoveries, 2, 'both pre-settlement and locked recovery are advisory');
+            assert.deepEqual(runtime.runtime.journal, journal, 'no evidence of an unsettled request is discarded');
+            assert.equal(runtime.runtime.state.bound_at_state, 50_000);
+            await runtime.claimPreparedWithdrawalSubmission();
+            assert.ok(runtime.runtime.preparedWithdrawal.releasedValidUntil > 0, 'the offline exit still freezes requests');
+        });
+    }
+});
+
+test('failed operator recovery still blocks mutual close and cannot bypass escape timing', async () => {
+    const runtime = successorHarness();
+    runtime.manifest = { deployment_id: 'offline-escape-timing' };
+    runtime.init = async () => {};
+    runtime.reload = async () => runtime.runtime;
+    runtime.walletStatus = async () => ({ has_note: true });
+    runtime.runtime.state.expiry_ts = Math.floor(Date.now() / 1000) + 30 * 86_400;
+    runtime.remoteJson = async () => { throw new Error('operator offline'); };
+    await assert.rejects(runtime.prepareWithdrawal('mutual', `0x${'12'.repeat(20)}`), /operator offline/);
+    await assert.rejects(runtime.prepareWithdrawal('escape', `0x${'12'.repeat(20)}`), { code: 'escape_wait' });
+    assert.ok(runtime.runtime.journal);
+    assert.equal(runtime.runtime.preparedWithdrawal, null);
+});
+
+test('startup recovery is advisory even when fallback or successor recovery rejects asynchronously', async () => {
+    for (const status of ['missing', 'finalized']) {
+        const runtime = successorHarness();
+        const journal = structuredClone(runtime.runtime.journal);
+        runtime.remoteJson = async url => {
+            if (url.includes('/openrouter/leases/')) {
+                if (status === 'missing') throw Object.assign(new Error('missing lease'), { status: 404 });
+                return { status: 'finalized' };
+            }
+            throw new TypeError('operator recovery unavailable');
+        };
+        assert.equal(await runtime.recoverPendingLocked({ quiet: true }), false);
+        assert.deepEqual(runtime.runtime.journal, journal);
+        await assert.rejects(runtime.recoverPendingLocked(), /operator recovery unavailable/);
+    }
 });

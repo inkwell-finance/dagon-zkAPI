@@ -1,12 +1,14 @@
 {
-  "name": "@openanonymity/zkapi-browser-sdk",
+  "name": "@dagon/zkapi-browser-sdk",
   "version": "0.2.0",
   "private": true,
-  "description": "Browser wallet, proofs, key lifecycle and withdrawals for zkAPI",
+  "description": "Dagon zkAPI browser wallet, Groth16 proofs, native-SOL ledger lifecycle and EVM compatibility",
   "engines": {
     "node": ">=24"
   },
   "scripts": {
+    "generate:solana-vk": "node scripts/generate-solana-verifier.mjs",
+    "verify:solana-vk": "node scripts/generate-solana-verifier.mjs --check",
     "build": "npm run build:browser",
     "build:browser": "node scripts/build-sdk.mjs --network sepolia",
     "build:mainnet": "node scripts/build-sdk.mjs --network mainnet",
@@ -28,14 +30,23 @@
     "./runtime": "./sdk/services/browserWalletRuntime.js",
     "./store": "./sdk/services/browserWalletStore.js",
     "./wallet": "./sdk/wallet.js",
+    "./ledger-identity": "./sdk/services/zkapiLedgerIdentity.mjs",
+    "./solana-transport": "./sdk/services/zkapiSolanaTransport.mjs",
+    "./solana-journal": "./sdk/services/zkapiSolanaJournal.mjs",
     "./build": "./sdk/build.mjs",
     "./request-compat": "./sdk/services/zkapiRequestCompat.mjs",
     "./withdrawal-recovery": "./sdk/services/zkapiWithdrawalRecovery.mjs",
     "./expiry-history": "./sdk/services/zkapiExpiryHistory.mjs",
-    "./withdrawal-root": "./sdk/services/zkapiWithdrawalRoot.mjs",
+    "./active-root": "./sdk/services/zkapiActiveRoot.mjs",
+    "./exit-policy": "./sdk/services/zkapiExitPolicy.mjs",
     "./gas": "./sdk/services/zkapiGas.mjs",
+    "./native-billing": "./sdk/services/zkapiNativeBilling.mjs",
+    "./native-sol": "./sdk/services/zkapiNativeSol.mjs",
     "./contract-error": "./sdk/services/zkapiContractError.mjs",
     "./wallet-error": "./sdk/services/zkapiWalletError.mjs",
     "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "@solana/web3.js": "1.98.4"
   }
 }

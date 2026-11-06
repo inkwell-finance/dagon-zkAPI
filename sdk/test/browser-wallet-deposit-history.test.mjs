@@ -268,7 +268,7 @@ for (const recovery of [false, true]) {
         let result;
         if (recovery) {
             t.mock.method(singleton, 'pendingDeposit', async () => plan());
-            t.mock.method(singleton, 'treePath', async () => ({}));
+            t.mock.method(singleton, 'treePath', async () => assert.fail('deposit recovery never reads the operator indexer'));
             t.mock.method(client, 'readBrowserNote', async () => ({
                 status: 1, amount: 2_000_000n, commitment: '0x123', expiryTs: 9999
             }));
@@ -299,7 +299,28 @@ for (const recovery of [false, true]) {
     });
 }
 
-for (const failure of ['worker', 'storage', 'indexer', 'old-note']) {
+// Threat: an operator that accepted a deposit withholds its tree mirror so the
+// note is never installed, cannot be exited, and is swept at expiry. The vault
+// note alone (Active, matching commitment and amount) confirms the deposit.
+test('vault recovery confirms a landed deposit while the operator indexer is unavailable', async t => {
+    seedRuntime({ pendingDeposit: plan() });
+    const runtime = makeRuntime();
+    const client = confirmationClient(t, runtime);
+    t.mock.method(client, 'refresh', async () => {});
+    t.mock.method(singleton, 'pendingDeposit', async () => plan());
+    const indexer = t.mock.method(singleton, 'treePath', async () => { throw new Error('Indexer unavailable'); });
+    t.mock.method(client, 'readBrowserNote', async () => ({
+        status: 1, amount: 2_000_000n, commitment: '0x123', expiryTs: 9999
+    }));
+    const result = await client.recoverBrowserDeposit();
+    assert.equal(result.status, 'confirmed');
+    assert.equal(indexer.mock.callCount(), 0);
+    const persisted = await readBrowserWalletSnapshot(DEPLOYMENT);
+    assert.equal(persisted.runtime.pendingDeposit, null);
+    assert.equal(persisted.runtime.state.note_id, 7);
+});
+
+for (const failure of ['worker', 'storage', 'old-note']) {
     test(`a ${failure} failure before this deposit commit is never classified as confirmed`, async t => {
         seedRuntime({ pendingDeposit: plan(), ...(failure === 'old-note' ? { state: state(6) } : {}) });
         const runtime = makeRuntime();
@@ -308,18 +329,9 @@ for (const failure of ['worker', 'storage', 'indexer', 'old-note']) {
         t.mock.method(client, 'refresh', async () => { refreshes += 1; });
         if (failure === 'worker') runtime.worker.call = async () => { throw new Error('Invalid confirmation'); };
         if (failure === 'storage') indexedDB.failNextDepositWrite();
-        if (failure === 'indexer') {
-            t.mock.method(singleton, 'pendingDeposit', async () => plan());
-            t.mock.method(singleton, 'treePath', async () => { throw new Error('Indexer unavailable'); });
-            t.mock.method(client, 'readBrowserNote', async () => ({
-                status: 1, amount: 2_000_000n, commitment: '0x123', expiryTs: 9999
-            }));
-            await assert.rejects(client.recoverBrowserDeposit(), /Indexer unavailable/);
-        } else {
-            const { vault, receipt } = depositReceipt();
-            await assert.rejects(client.confirmBrowserDepositReceipt(plan(), receipt, vault, () => {}),
-                failure === 'worker' ? /Invalid confirmation/ : failure === 'storage' ? /history storage failure/ : /already has an active/);
-        }
+        const { vault, receipt } = depositReceipt();
+        await assert.rejects(client.confirmBrowserDepositReceipt(plan(), receipt, vault, () => {}),
+            failure === 'worker' ? /Invalid confirmation/ : failure === 'storage' ? /history storage failure/ : /already has an active/);
         assert.equal(refreshes, 0, 'only an actual successful commit reaches best-effort display refresh');
         const persisted = await readBrowserWalletSnapshot(DEPLOYMENT);
         assert.equal(persisted.runtime.pendingDeposit.operationId, plan().operationId);

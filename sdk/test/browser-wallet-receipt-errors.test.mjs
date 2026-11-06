@@ -190,3 +190,62 @@ test('mutual-close recovery of a mined payment completes through event and vault
     await assert.rejects(client.performWithdrawal('mutual'), /event did not match/);
     assert.equal(detached.length, 1);
 });
+
+test('vault reads: a defeated note is plainly Active, status 4 is reserved, pending escapes expose their concession', async () => {
+    const client = new ZkapiClient();
+    client.config = { funding: { chain_id: 1, contract_address: VAULT } };
+    const word = globalThis.zkapiWallet.abiWord;
+    const chain = { status: 1, nullifierState: 2 };
+    const calls = [];
+    globalThis.ethereum = {
+        async request({ method, params }) {
+            if (method === 'eth_chainId') return '0x1';
+            if (method === 'eth_blockNumber') return '0x10';
+            assert.equal(method, 'eth_call');
+            calls.push(params);
+            const data = params[0].data;
+            if (data === `0x${globalThis.zkapiWallet.ABI.notes}${word(7)}`) {
+                return `0x${[0, 0, 0, chain.status, 0, 0].map(word).join('')}`;
+            }
+            if (data === `0x${globalThis.zkapiWallet.ABI.pendingWithdrawals}${word(7)}`) {
+                return `0x${[1, 0x99, 0x9a, 2_000_000, 70_000, 1_930_000].map(word).join('')}${globalThis.zkapiWallet.addressWord(DESTINATION)}${word(1_900_000_000)}`;
+            }
+            assert.equal(data, `0x${globalThis.zkapiWallet.ABI.nullifierState}${word(0x99)}`);
+            return `0x${word(chain.nullifierState)}`;
+        }
+    };
+    // No restoration step exists: the leaf never left the tree.
+    assert.deepEqual(await client.readBrowserWithdrawalStatus(7),
+        { status: 'active', note_id: 7, challenge_deadline: null, observed_block: 16 });
+    assert.equal(await client.readNullifierState('0x99', 16), 2);
+    assert.equal(calls.at(-1)[1], '0x10');
+    chain.status = 4;
+    await assert.rejects(client.readBrowserWithdrawalStatus(7), /unknown note status 4/);
+    chain.status = 2;
+    assert.deepEqual(await client.readBrowserWithdrawalStatus(7), {
+        status: 'pending_withdrawal', note_id: 7, withdrawal_nullifier: `0x${word(0x99)}`,
+        next_nullifier: `0x${word(0x9a)}`, state_balance: 2_000_000, conceded: 70_000, final_balance: 1_930_000,
+        destination: DESTINATION, challenge_deadline: 1_900_000_000, observed_block: 16
+    });
+    assert.equal(client.restoreChallengedNoteOnChain, undefined);
+});
+
+test('escape payouts accept raises up to the bound and reject payouts above the declared f', () => {
+    const client = new ZkapiClient();
+    const record = { stateBalance: 2_000_000, concededAtInit: 0, boundAtState: 50_000, finalBalance: 2_000_000 };
+    assert.equal(client.initialFinalBalance(record), 2_000_000n);
+    assert.deepEqual(client.escapePayout(record, 2_000_000n), { accepted: true, concededFinal: 0n, raised: false, alert: null, reason: null });
+    const raised = client.escapePayout(record, 1_970_000n);
+    assert.equal(raised.accepted, true);
+    assert.equal(raised.raised, true);
+    assert.equal(raised.concededFinal, 30_000n);
+    assert.deepEqual(client.escapePayoutPatch({ amount: 1_970_000n, ...raised }),
+        { finalBalance: 1_970_000, conceded: 30_000, concessionRaised: true });
+    assert.deepEqual(client.escapePayoutPatch({ amount: 1_970_000n, deferred: true, ...raised }),
+        { finalBalance: 1_970_000, conceded: 30_000, concessionRaised: true, payoutDeferred: true });
+    assert.equal(client.escapePayout(record, 1_900_000n).alert, 'concession_exceeded_bound');
+    assert.equal(client.escapePayout(record, 2_000_001n).accepted, false);
+    // A record without concession terms (another tab's late escape) must match exactly.
+    assert.equal(client.escapePayout({ finalBalance: 5 }, 5n).accepted, true);
+    assert.equal(client.escapePayout({ finalBalance: 5 }, 4n).accepted, false);
+});

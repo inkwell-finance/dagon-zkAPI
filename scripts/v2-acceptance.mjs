@@ -13,14 +13,21 @@ import readline from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const CHAIN_ID = 31337;
+// Use a signer-supported chain ID on a disposable, unforked loopback chain.
+const CHAIN_ID = 11155111;
 const GWEI = 1_000_000_000n;
 const DEPOSIT = 1_000_000;
 const EXTRA_DEPOSIT = 10_000;
 const CAP = 50_000;
 const MOCK_USAGE_MICRO_USD = 1_000;
 const MOCK_PRICE = 250_000_000_000n; // $2,500 / ETH, eight decimal places.
-const WITHDRAWAL_TUPLE = 'tuple(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,bool,uint256)';
+// Types.WithdrawalPublicInputs: leaf-bound, root-free exits (concession exit).
+// 0 version, 1 chain, 2 vault, 3 registration, 4-7 keys, 8 noteId, 9 deposit,
+// 10 expiry, 11 finalBalance, 12 destination, 13 N, 14 hasClearance, 15 N⁺,
+// 16 conceded, 17 validUntil.
+const WITHDRAWAL_TUPLE = 'tuple(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,uint64,uint128,address,uint256,bool,uint256,uint128,uint64)';
+const CHALLENGE_PERIOD = 86400;
+const EXIT_PROOF_TTL = 3 * 3600;
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const json = value => JSON.stringify(value, (_, v) => typeof v === 'bigint' ? v.toString() : v, 2);
 // Explicit agents bypass Node's optional global environment-proxy support.
@@ -145,10 +152,11 @@ export function mockProvider(managementKey = 'local-only-management-key') {
 }
 
 function options(args) {
-    const parsed = { binDir: path.join(ROOT, 'target/release'), outputDir: path.join(ROOT, '.zkapi/acceptance') };
+    const parsed = { binDir: path.join(ROOT, 'target/release'), outputDir: path.join(ROOT, '.zkapi/acceptance'),
+        adversaryBin: path.join(ROOT, 'target/adversary/debug/dagon-zkapi') };
     for (let i = 0; i < args.length; i++) {
         if (args[i] === '--help') return { help: true };
-        const key = { '--bin-dir': 'binDir', '--output-dir': 'outputDir' }[args[i]];
+        const key = { '--bin-dir': 'binDir', '--output-dir': 'outputDir', '--adversary-bin': 'adversaryBin' }[args[i]];
         assert.ok(key && args[i + 1], `Unknown or incomplete option: ${args[i]}`);
         parsed[key] = path.resolve(args[++i]);
     }
@@ -175,11 +183,12 @@ function linkBytecode(artifact, addresses) {
 async function main() {
     const opts = options(process.argv.slice(2));
     if (opts.help) {
-        console.log('Usage: node scripts/v2-acceptance.mjs [--bin-dir target/release] [--output-dir .zkapi/acceptance]\nRuns only disposable loopback services, with mock provider and oracle. See docs/v2-acceptance.md.');
+        console.log('Usage: node scripts/v2-acceptance.mjs [--bin-dir target/release] [--adversary-bin target/adversary/debug/dagon-zkapi] [--output-dir .zkapi/acceptance]\nRuns only disposable loopback services, with mock provider and oracle. See docs/v2-acceptance.md.');
         return;
     }
-    const { AbiCoder, Contract, ContractFactory, FetchRequest, JsonRpcProvider } = await import(
+    const { AbiCoder, Contract, ContractFactory, FetchRequest, HDNodeWallet, JsonRpcProvider } = await import(
         pathToFileURL(path.join(ROOT, 'docker/aws/signer/node_modules/ethers/lib.esm/index.js')).href);
+    const { createSigner } = await import('../docker/aws/signer/signer.mjs');
     const coder = AbiCoder.defaultAbiCoder();
     const started = Date.now();
     const runDir = path.join(opts.outputDir, `${new Date().toISOString().replaceAll(':', '-')}-${randomUUID().slice(0, 8)}`);
@@ -294,12 +303,12 @@ async function main() {
         console.log('Starting local v2 acceptance: real proofs and services, mock provider and oracle.');
         const client = wallet('primary');
         const signingKeys = await client('public_keys');
-        assert.equal(signingKeys.circuit_id, 'zkapi-v2-note-bound-v1');
+        assert.equal(signingKeys.circuit_id, 'zkapi-v2-concession-v1');
         const port = await freePort();
         const rpcUrl = `http://127.0.0.1:${port}`;
         launch('anvil', ['--host', '127.0.0.1', '--port', String(port), '--chain-id', String(CHAIN_ID),
             '--mnemonic', 'test test test test test test test test test test test junk', '--silent'], 'anvil.log');
-        await waitFor('Anvil startup', async () => await rpc(rpcUrl, 'eth_chainId') === '0x7a69');
+        await waitFor('Anvil startup', async () => await rpc(rpcUrl, 'eth_chainId') === `0x${CHAIN_ID.toString(16)}`);
         const ethersRpc = new FetchRequest(rpcUrl);
         const getLocalUrl = FetchRequest.createGetUrlFunc({ agent: localAgent });
         ethersRpc.getUrlFunc = (req, signal) => { loopback(req.url); return getLocalUrl(req, signal); };
@@ -319,20 +328,23 @@ async function main() {
         await adapter.waitForDeployment();
         const deployed = await new ContractFactory(vaultArtifact.abi, linkBytecode(vaultArtifact,
             { 'src/libraries/Bn254Poseidon.sol:Bn254Poseidon': await poseidon.getAddress() }), signer).deploy(
-            treasury, 30 * 86400, 86400, CAP, await adapter.getAddress(), signingKeys.state_signing_key.x,
+            treasury, 30 * 86400, CHALLENGE_PERIOD, CAP, await adapter.getAddress(), signingKeys.state_signing_key.x,
             signingKeys.state_signing_key.y, signingKeys.clearance_signing_key.x, signingKeys.clearance_signing_key.y, accounts[0]);
         const deployment = await deployed.deploymentTransaction().wait();
         const vaultAddress = await deployed.getAddress();
         const vault = new Contract(vaultAddress, vaultArtifact.abi, signer);
         const usedNullifierCall = new RegExp(`^${vault.interface.getFunction('usedNullifiers').selector}[0-9a-fA-F]{64}$`);
-        assert.equal(await vault.challengePeriod(), 86400n);
+        const currentRootCall = vault.interface.getFunction('currentRoot').selector;
+        const nextNoteIdCall = vault.interface.getFunction('nextNoteId').selector;
+        const challengePeriodCall = vault.interface.getFunction('challengePeriod').selector;
+        assert.equal(await vault.challengePeriod(), BigInt(CHALLENGE_PERIOD));
         const config = { protocol_version: 2, chain_id: CHAIN_ID, contract_address: vaultAddress,
             request_charge_cap: CAP, policy_charge_cap: 0, policy_enabled: false,
             state_signing_key: signingKeys.state_signing_key, clearance_signing_key: signingKeys.clearance_signing_key };
         await client('init', { config });
         const indexerPort = await freePort();
         const indexerUrl = `http://127.0.0.1:${indexerPort}`;
-        launch(path.join(opts.binDir, 'zkapi-indexerd'), ['--listen', `127.0.0.1:${indexerPort}`, '--rpc-url', rpcUrl,
+        launch(path.join(opts.binDir, 'dagon-zkapi-indexerd'), ['--listen', `127.0.0.1:${indexerPort}`, '--ledger', 'ethereum', '--rpc-url', rpcUrl,
             '--contract-address', vaultAddress, '--from-block', String(deployment.blockNumber), '--poll-interval-ms', '100',
             '--cursor-path', path.join(runDir, 'indexer.json')], 'indexer.log');
         async function synchronizedTree() {
@@ -380,28 +392,68 @@ async function main() {
                     result = coder.encode(['uint80', 'int256', 'uint256', 'uint256', 'uint80'], [123, MOCK_PRICE, quoteTimestamp, quoteTimestamp, 123]);
                 }
             } else {
-                const vaultRead = call.method === 'eth_call' && target?.to?.toLowerCase() === vaultAddress.toLowerCase()
-                    && (target.data === '0x4d1352fd' || usedNullifierCall.test(target.data));
-                assert.ok(call.method === 'eth_chainId' || vaultRead, 'unexpected oracle RPC read');
+                const toVault = call.method === 'eth_call' && target?.to?.toLowerCase() === vaultAddress.toLowerCase();
+                const vaultRead = toVault && (target.data === '0x4d1352fd' || usedNullifierCall.test(target.data));
+                // The server's credit ledger also refreshes the root through this RPC.
+                const rootRead = toVault && (target.data === currentRootCall || target.data === nextNoteIdCall);
+                // Startup checks --challenge-period-seconds against the vault.
+                const periodRead = toVault && target.data === challengePeriodCall;
+                assert.ok(call.method === 'eth_chainId' || vaultRead || rootRead || periodRead, 'unexpected oracle RPC read');
                 if (vaultRead) assert.equal(call.params[1], 'latest', 'vault authorization must use the current chain state');
                 result = await rpc(rpcUrl, call.method, call.params);
             }
             respond(res, 200, { jsonrpc: '2.0', id: call.id, result });
         });
-        const serverPort = await freePort();
-        const serverUrl = `http://127.0.0.1:${serverPort}`;
-        const dbPath = path.join(runDir, 'server.db');
-        launch(path.join(opts.binDir, 'zkapi'), ['--chain-id', String(CHAIN_ID), '--contract-address', vaultAddress,
-            '--request-charge-cap', String(CAP), '--proof-setup-dir', path.join(ROOT, 'protocol/setup/v2'), 'serverd',
-            '--listen', `127.0.0.1:${serverPort}`, '--openrouter-api-base', providerUrl,
-            '--openrouter-management-key', 'local-only-management-key', '--openrouter-lease-ttl-seconds', '300',
-            '--openrouter-settlement-grace-seconds', '1', '--openrouter-settlement-poll-seconds', '1',
-            '--native-billing-rpc-url', oracleUrl, '--native-price-feed-address', feed,
-            '--db-path', dbPath, '--state-seed', '0x1', '--clear-seed', '0x2', '--indexer-url', indexerUrl,
-            '--root-poll-interval-ms', '100'], 'server.log');
-        await waitFor('actual server ready at chain root', async () => BigInt((await get(`${serverUrl}/health`)).current_root) === await vault.currentRoot());
+        // An honest server, and (later) a test-only server built with the
+        // `adversary` feature that settles requests but withholds every successor.
+        async function startServer(name, binary, extra = []) {
+            const port = await freePort();
+            const url = `http://127.0.0.1:${port}`;
+            const db = path.join(runDir, `${name}.db`);
+            const child = launch(binary, ['--chain-id', String(CHAIN_ID), '--contract-address', vaultAddress,
+                '--request-charge-cap', String(CAP), '--proof-setup-dir', path.join(ROOT, 'protocol/setup/v2'), 'serverd',
+                '--ledger', 'evm',
+                '--listen', `127.0.0.1:${port}`, '--openrouter-api-base', providerUrl,
+                '--openrouter-management-key', 'local-only-management-key', '--openrouter-lease-ttl-seconds', '300',
+                '--openrouter-settlement-grace-seconds', '1', '--openrouter-settlement-poll-seconds', '1',
+                '--native-billing-rpc-url', oracleUrl, '--native-price-feed-address', feed,
+                '--db-path', db, '--state-seed', '0x1', '--clear-seed', '0x2', '--indexer-url', indexerUrl,
+                '--root-poll-interval-ms', '100', ...extra], `${name}.log`);
+            await waitFor(`${name} ready at chain root`, async () => BigInt((await get(`${url}/health`)).current_root) === await vault.currentRoot());
+            return { url, db, child };
+        }
+        const { url: serverUrl, db: dbPath } = await startServer('server', path.join(opts.binDir, 'dagon-zkapi'));
         assert.deepEqual((await get(`${serverUrl}/v1/attestation`)).state_signing_key, signingKeys.state_signing_key);
         const settlements = [];
+        const expectedCharge = Number((BigInt(MOCK_USAGE_MICRO_USD) * 1_000_000_000n * 100_000_000n + MOCK_PRICE * 1_000_000n - 1n)
+            / (MOCK_PRICE * 1_000_000n));
+        // A real request through the HTTP server, used and retired; returns once
+        // the server settled it. A withholding server never signs the successor.
+        async function requestAndSettle(label, walletClient, noteId, url) {
+            const merkle = await treePath(walletClient, noteId);
+            const quote = await get(`${url}/v2/billing/quote`);
+            const payload = JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1, billing_quote: quote });
+            const id = `acceptance-${label}-${randomUUID()}`;
+            const prepared = await walletClient('prepare_request', { args: { payload, active_root: merkle.active_root,
+                merkle_siblings: merkle.siblings, client_request_id: id, request_time: Math.floor(Date.now() / 1000), created_at_ms: Date.now() } });
+            const issued = await request(`${url}/v2/openrouter/leases`, { method: 'POST', value: prepared.request });
+            assert.equal(issued.status, 201, `lease rejected: ${issued.value.error_code ?? issued.status}`);
+            const lease = issued.value;
+            const key = [...mock.keys.values()].find(k => k.key === lease.api_key);
+            assert.ok(key);
+            const inference = await request(`${lease.openrouter_api_base}/chat/completions`, { method: 'POST',
+                headers: { authorization: `Bearer ${lease.api_key}` }, value: { model: 'local/mock-model',
+                    messages: [{ role: 'user', content: 'Reply with the word OK.' }], max_tokens: 8, stream: false } });
+            assert.equal(inference.status, 200);
+            const retired = await request(`${url}/v2/openrouter/leases/${id}`, { method: 'POST', value: prepared.request });
+            assert.ok(retired.status === 200 || (retired.status === 409 && retired.value.error_code === 'lease_settlement_pending'));
+            const settled = await waitFor('settled lease charge', async () => {
+                const status = await get(`${url}/v2/openrouter/leases/${id}`);
+                return status.status === 'finalized' && status.charge_applied != null && status;
+            });
+            assert.equal(Number(settled.charge_applied), expectedCharge);
+            return { id, prepared, settled };
+        }
         async function inferenceAndSettlement(label) {
             const merkle = await treePath(client, primary.noteId);
             const quote = await get(`${serverUrl}/v2/billing/quote`);
@@ -433,8 +485,6 @@ async function main() {
                 return found.request_response && found;
             });
             const response = recovery.request_response;
-            const expectedCharge = Number((BigInt(MOCK_USAGE_MICRO_USD) * 1_000_000_000n * 100_000_000n + MOCK_PRICE * 1_000_000n - 1n)
-                / (MOCK_PRICE * 1_000_000n));
             assert.equal(response.charge_applied, expectedCharge);
             assert.equal(JSON.parse(response.response_payload).usage_usd, MOCK_USAGE_MICRO_USD / 1_000_000);
             assert.equal(key.disabled, true); assert.equal(key.deleted, true);
@@ -458,37 +508,80 @@ async function main() {
             await save(`${label}-settlement.json`, { ...record, response });
             return { request: prepared.request, response, record };
         }
+        const balance = address => rpc(rpcUrl, 'eth_getBalance', [address, 'latest']).then(BigInt);
+        const chainNow = async () => Number((await provider.getBlock('latest')).timestamp);
+        const validUntil = async () => (await chainNow()) + EXIT_PROOF_TTL;
+        const escapeArgs = async (conceded = 0) => ({ mode: 'escape', destination, conceded: String(conceded), valid_until: String(await validUntil()) });
+        const decodeInputs = plan => [...coder.decode([WITHDRAWAL_TUPLE], plan.inputs_abi)[0]];
+        const parsedLogs = (receipt, name) => receipt.logs.map(log => {
+            try { return vault.interface.parseLog(log); } catch { return null; }
+        }).filter(event => event?.name === name);
+        async function reverts(promise, errorName) {
+            await assert.rejects(promise, error => {
+                const data = error?.data ?? error?.info?.error?.data ?? error?.error?.data;
+                const decoded = data ? vault.interface.parseError(data) : null;
+                assert.equal(decoded?.name, errorName, `expected ${errorName}, got ${decoded?.name ?? error.shortMessage ?? error.message}`);
+                return true;
+            });
+        }
+        async function advance(seconds) {
+            await rpc(rpcUrl, 'evm_increaseTime', [seconds]);
+            await rpc(rpcUrl, 'anvil_mine', ['0x1']);
+        }
+        const requestTuple = inputs => [inputs.protocol_version, inputs.chain_id, inputs.contract_address, inputs.active_root,
+            inputs.state_signing_key_x, inputs.state_signing_key_y, inputs.request_time, inputs.solvency_bound,
+            inputs.request_nullifier, inputs.authorization_tag, inputs.anonymous_commitment_x, inputs.anonymous_commitment_y].map(BigInt);
+        const proofHex = request => `0x${Buffer.from(request.proof.proof, 'base64').toString('hex')}`;
+        // Close, finalize and the expiry sweep accrue the operator share in the
+        // vault (gwei units); anyone pays it out with withdrawTreasury().
+        const owed = () => vault.treasuryAccrued();
+
+        // ---- Honest history S0 -> S1 -> S2 -> S3 on the primary note ----
+        await client('snapshot', { name: 'S0' });
         const first = await inferenceAndSettlement('first');
-        await client('snapshot', { name: 'settled-before-second-request' });
-        console.log('First real HTTP settlement verified; spending the signed state again.');
+        await client('snapshot', { name: 'S1' });
         const second = await inferenceAndSettlement('second');
-        assert.notEqual(first.request.public_inputs.request_nullifier, second.request.public_inputs.request_nullifier);
-        const totalCharge = settlements.reduce((sum, item) => sum + item.charge_gwei, 0);
+        await client('snapshot', { name: 'S2' });
+        const third = await inferenceAndSettlement('third');
+        console.log('Three real settlements S0 -> S3; now a stale escape from S1 with a front-running deposit.');
+        const N = settlement => BigInt(settlement.request.public_inputs.request_nullifier);
+        const B = index => DEPOSIT - settlements.slice(0, index).reduce((sum, item) => sum + item.charge_gwei, 0);
         const extraClient = wallet('unrelated');
         await extraClient('init', { config });
+
+        // ---- Stale escape from S1 (spent: S2 was spent by the third request) is defeated ----
+        const stale = await client('prepare_withdrawal', { snapshot: 'S1', args: await escapeArgs(0) });
+        const staleInputs = decodeInputs(stale);
+        assert.equal(staleInputs[11], BigInt(B(1)));
+        assert.equal(staleInputs[13], N(second), 'escape nullifier is the one the second request spent');
+        assert.equal(staleInputs[15], N(third), 'successor nullifier is the one the third request spent');
+        assert.equal(staleInputs[16], 0n);
+        // Front-run: a deposit lands between proving and initiation. Exits are
+        // leaf-bound, so the root change cannot invalidate the escape.
+        const rootBefore = await vault.currentRoot();
         const unrelated = await deposit(extraClient, EXTRA_DEPOSIT);
-        const restoredRoot = await vault.currentRoot();
-        assert.notEqual(BigInt(second.request.public_inputs.active_root), restoredRoot);
-        const merkle = await treePath(client, primary.noteId);
-        const stale = await client('prepare_withdrawal', { snapshot: 'settled-before-second-request', args: {
-            mode: 'escape', destination, active_root: merkle.active_root, merkle_siblings: merkle.siblings } });
-        const staleInputs = [...coder.decode([WITHDRAWAL_TUPLE], stale.inputs_abi)[0]];
-        assert.equal(staleInputs[9], BigInt(DEPOSIT - first.record.charge_gwei));
-        assert.equal(staleInputs[11], BigInt(second.request.public_inputs.request_nullifier));
-        const balance = address => rpc(rpcUrl, 'eth_getBalance', [address, 'latest']).then(BigInt);
-        const balances = { vault: await balance(vaultAddress), destination: await balance(destination), treasury: await balance(treasury) };
-        const initiated = await (await vault.initiateEscapeWithdrawal(staleInputs, stale.proof_hex, stale.siblings)).wait();
-        await save('escape-initiation-receipt.json', initiated);
-        const initiationBlock = await rpc(rpcUrl, 'eth_getBlockByNumber', [`0x${initiated.blockNumber.toString(16)}`, false]);
-        const pending = await vault.pendingWithdrawals(primary.noteId);
+        assert.notEqual(await vault.currentRoot(), rootBefore);
+        const balances = { vault: await balance(vaultAddress), destination: await balance(destination), treasury: await owed() };
+        const initiated = await (await vault.initiateEscapeWithdrawal(staleInputs, stale.proof_hex)).wait();
+        await save('stale-escape-initiation-receipt.json', initiated);
+        let pending = await vault.pendingWithdrawals(primary.noteId);
         assert.equal(pending[0], true);
-        assert.equal(pending[5] - BigInt(initiationBlock.timestamp), 86400n);
-        await assert.rejects(vault.finalizeEscapeWithdrawal.staticCall(primary.noteId), 'unchallenged escape must still wait 24 hours');
+        assert.equal(pending[2], N(third));
+        assert.equal(await vault.nullifierState(N(second)), 1n);
+        assert.equal(await vault.nullifierState(N(third)), 1n);
+        await assert.rejects(vault.finalizeEscapeWithdrawal.staticCall(primary.noteId), 'an escape waits its challenge period');
         await rpc(rpcUrl, 'anvil_mine', ['0x2']);
-        await synchronizedTree();
-        console.log('Real stale-state escape initiated; starting the challenger with the server SQLite archive.');
+        console.log('Starting the challenger on the honest server archive.');
         const challengeTxs = [];
-        const simulated = new Set();
+        // The production signer, not Anvil's unlocked sendTransaction path,
+        // must accept every daemon read and sign each real challenge.
+        const challengeKey = HDNodeWallet.fromPhrase(
+            'test test test test test test test test test test test junk', undefined, "m/44'/60'/0'/0/1");
+        const challengeSigner = createSigner({
+            privateKey: challengeKey.privateKey, vault: vaultAddress, chainId: BigInt(CHAIN_ID),
+            rpc: (method, params) => rpc(rpcUrl, method, params),
+        });
+        assert.equal(challengeSigner.sender, challengerAccount.toLowerCase());
         const challengerRpc = await serve(async (req, res) => {
             const call = await body(req);
             if (call.method === 'eth_sendTransaction') {
@@ -496,11 +589,10 @@ async function main() {
                 assert.equal(tx.from.toLowerCase(), challengerAccount.toLowerCase());
                 assert.equal(tx.to.toLowerCase(), vaultAddress.toLowerCase());
                 assert.equal(tx.value ?? '0x0', '0x0');
-                assert.equal(vault.interface.parseTransaction(tx).name, 'challengeEscapeWithdrawal');
+                assert.ok(['challengeEscapeWithdrawal', 'raiseEscapeConcession'].includes(vault.interface.parseTransaction(tx).name));
             }
-            if (call.method === 'eth_call') simulated.add(call.params[0].data?.toLowerCase());
             try {
-                const result = await rpc(rpcUrl, call.method, call.params);
+                const result = await challengeSigner.handle(call.method, call.params);
                 if (call.method === 'eth_sendTransaction') challengeTxs.push(result);
                 respond(res, 200, { jsonrpc: '2.0', id: call.id, result });
             } catch (error) {
@@ -508,161 +600,178 @@ async function main() {
             }
         });
         const checkpoint = path.join(runDir, 'challenger.json');
-        const challenger = launch(path.join(opts.binDir, 'zkapi-challenged'), ['--rpc-url', challengerRpc,
-            '--indexer-url', indexerUrl, '--sender', challengerAccount, '--chain-id', String(CHAIN_ID),
+        const challenger = launch(path.join(opts.binDir, 'dagon-zkapi-challenged'), ['--ledger', 'evm', '--rpc-url', challengerRpc,
+            '--sender', challengerAccount, '--chain-id', String(CHAIN_ID),
             '--contract-address', vaultAddress, '--from-block', String(deployment.blockNumber), '--confirmations', '2',
             '--db-path', dbPath, '--checkpoint', checkpoint, '--proof-setup-dir', path.join(ROOT, 'protocol/setup/v2'),
             '--poll-interval-ms', '100'], 'challenger.log');
-        const challengeHash = await waitFor('daemon challenge broadcast', async () => challengeTxs[0]);
-        const challengeReceipt = await waitFor('mined challenge', () => rpc(rpcUrl, 'eth_getTransactionReceipt', [challengeHash]));
-        assert.equal(challengeReceipt.status, '0x1');
-        const transaction = await rpc(rpcUrl, 'eth_getTransactionByHash', [challengeHash]);
-        const decoded = vault.interface.parseTransaction({ data: transaction.input });
-        assert.equal(decoded.name, 'challengeEscapeWithdrawal');
-        const publicInputs = second.request.public_inputs;
-        const expectedRequest = [publicInputs.protocol_version, publicInputs.chain_id,
-            publicInputs.contract_address, publicInputs.active_root, publicInputs.state_signing_key_x,
-            publicInputs.state_signing_key_y, publicInputs.request_time, publicInputs.solvency_bound,
-            publicInputs.request_nullifier, publicInputs.authorization_tag, publicInputs.anonymous_commitment_x,
-            publicInputs.anonymous_commitment_y].map(BigInt);
-        assert.deepEqual([...decoded.args[1]].map(BigInt), expectedRequest, 'daemon must preserve every archived public input');
-        assert.equal(decoded.args[2].toLowerCase(), `0x${Buffer.from(second.request.proof.proof, 'base64').toString('hex')}`,
-            'daemon must preserve the exact archived Groth16 proof bytes');
-        assert.deepEqual([...decoded.args[3]], merkle.siblings.map(BigInt), 'daemon must supply the current restoration path');
-        const challengeEvents = challengeReceipt.logs.map(log => {
-            try { return vault.interface.parseLog(log); } catch { return null; }
-        }).filter(event => event?.name === 'EscapeWithdrawalChallenged');
-        assert.equal(challengeEvents.length, 1);
-        assert.equal(challengeEvents[0].args.noteId, BigInt(primary.noteId));
-        assert.equal(challengeEvents[0].args.nullifier, BigInt(publicInputs.request_nullifier));
-        assert.equal(challengeEvents[0].args.restoredRoot, restoredRoot);
-        assert.equal(simulated.has(transaction.input.toLowerCase()), true, 'daemon simulated exact submitted calldata');
-        assert.equal((await vault.notes(primary.noteId))[3], 1n);
+        const minedChallengerTx = async index => {
+            const hash = await waitFor(`challenger transaction ${index}`, async () => challengeTxs[index], 60_000);
+            const receipt = await waitFor('mined challenger transaction', () => provider.getTransactionReceipt(hash));
+            assert.equal(receipt.status, 1);
+            const transaction = await provider.getTransaction(hash);
+            return { hash, receipt, decoded: vault.interface.parseTransaction({ data: transaction.data }) };
+        };
+        const defeat = await minedChallengerTx(0);
+        assert.equal(defeat.decoded.name, 'challengeEscapeWithdrawal');
+        assert.deepEqual([...defeat.decoded.args[1]].map(BigInt), requestTuple(third.request.public_inputs),
+            'the defeat carries the archived request at the successor nullifier');
+        assert.equal(defeat.decoded.args[2].toLowerCase(), proofHex(third.request));
+        const defeated = parsedLogs(defeat.receipt, 'EscapeWithdrawalDefeated');
+        assert.equal(defeated.length, 1);
+        assert.equal(defeated[0].args.nullifier, N(second));
+        assert.equal(defeated[0].args.nextNullifier, N(third));
+        assert.equal((await vault.notes(primary.noteId))[3], 1n, 'a defeat returns the note to Active; its leaf never left');
         assert.equal((await vault.pendingWithdrawals(primary.noteId))[0], false);
-        assert.equal(await vault.usedNullifiers(publicInputs.request_nullifier), true);
-        assert.equal(await vault.currentRoot(), restoredRoot);
+        assert.equal(await vault.nullifierState(N(second)), 2n, 'the escaped nullifier is flagged challenged');
+        assert.equal(await vault.nullifierState(N(third)), 0n, 'the successor nullifier is released');
         assert.equal(await balance(vaultAddress), balances.vault);
         assert.equal(await balance(destination), balances.destination);
-        assert.equal(await balance(treasury), balances.treasury);
-        const challengeBlock = await rpc(rpcUrl, 'eth_getBlockByNumber', [challengeReceipt.blockNumber, false]);
-        const elapsed = Number(BigInt(challengeBlock.timestamp) - BigInt(initiationBlock.timestamp));
-        assert.ok(elapsed >= 0 && elapsed < 86400);
-        assert.equal(await vault.challengePeriod(), 86400n);
-        await rpc(rpcUrl, 'anvil_mine', ['0x2']);
-        await waitFor('challenge checkpoint retired after real confirmations', async () => {
-            const saved = await readJSON(checkpoint);
-            return Object.keys(saved.pending).length === 0;
-        });
-        await stop(challenger);
-        assert.equal(challengeTxs.length, 1);
-        await save('challenge-receipt.json', challengeReceipt);
-        await save('challenge-transaction.json', transaction);
-        await synchronizedTree();
-        console.log('Challenge restored the note. Closing its latest settled state with a real withdrawal proof.');
-        const current = await client('status');
-        const clearance = await request(`${serverUrl}/v2/withdraw/clearance`, { method: 'POST', value: { withdrawal_nullifier: current.withdrawal_nullifier } });
-        assert.equal(clearance.status, 200);
-        const closePath = await treePath(client, primary.noteId);
-        const close = await client('prepare_withdrawal', { args: { mode: 'mutual', destination,
-            active_root: closePath.active_root, merkle_siblings: closePath.siblings, clearance: clearance.value } });
-        const closeInputs = [...coder.decode([WITHDRAWAL_TUPLE], close.inputs_abi)[0]];
-        assert.equal(closeInputs[9], BigInt(DEPOSIT - totalCharge));
-        assert.equal(closeInputs[12], true);
-        assert.notEqual(closeInputs[11], staleInputs[11]);
-        const closeReceipt = await (await vault.mutualClose(closeInputs, close.proof_hex, close.siblings)).wait();
-        assert.equal(closeReceipt.status, 1);
-        assert.equal((await vault.notes(primary.noteId))[3], 3n);
-        assert.equal((await vault.notes(unrelated.noteId))[3], 1n);
-        assert.equal(await balance(destination) - balances.destination, BigInt(DEPOSIT - totalCharge) * GWEI);
-        assert.equal(await balance(treasury) - balances.treasury, BigInt(totalCharge) * GWEI);
-        assert.equal(await balance(vaultAddress), BigInt(EXTRA_DEPOSIT) * GWEI);
-        assert.equal(await vault.usedNullifiers(closeInputs[11]), true);
-        await synchronizedTree();
-        assert.equal(mock.keys.size, 2);
-        assert.ok([...mock.keys.values()].every(key => key.deleted && key.calls === 1));
+        assert.equal(await owed(), balances.treasury);
+        // Replays: the same proof, and the genesis state whose successor is now challenged.
+        await reverts(vault.initiateEscapeWithdrawal.staticCall(staleInputs, stale.proof_hex), 'ReplayedNullifier');
+        const genesisEscape = await client('prepare_withdrawal', { snapshot: 'S0', args: await escapeArgs(0) });
+        const genesisInputs = decodeInputs(genesisEscape);
+        assert.equal(genesisInputs[15], N(second));
+        await reverts(vault.initiateEscapeWithdrawal.staticCall(genesisInputs, genesisEscape.proof_hex), 'SupersededState');
+        await save('defeat-receipt.json', defeat.receipt);
 
-        console.log('Testing failed issuance recovery after escape initiation and finalization on the local chain.');
-        const retryClient = wallet('failed-issuance');
-        await retryClient('init', { config });
-        const retryNote = await deposit(retryClient, DEPOSIT);
-        await waitFor('server observes regression deposit root', async () =>
-            BigInt((await get(`${serverUrl}/health`)).current_root) === await vault.currentRoot());
-        const retryPath = await treePath(retryClient, retryNote.noteId);
-        // Prepare the genuine genesis exit before the request journal exists.
-        // This models retaining the original wallet state, without inventing a signature.
-        const retryEscape = await retryClient('prepare_withdrawal', { args: { mode: 'escape', destination,
-            active_root: retryPath.active_root, merkle_siblings: retryPath.siblings } });
-        const retryEscapeInputs = [...coder.decode([WITHDRAWAL_TUPLE], retryEscape.inputs_abi)[0]];
-        const retryQuote = await get(`${serverUrl}/v2/billing/quote`);
-        const retryId = `acceptance-failed-issuance-${randomUUID()}`;
-        const failedRequest = await retryClient('prepare_request', { args: {
-            payload: JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1, billing_quote: retryQuote }),
-            active_root: retryPath.active_root, merkle_siblings: retryPath.siblings, client_request_id: retryId,
+        // ---- Under-conceding escape from S2 is raised to its settled charge ----
+        console.log('Escape from S2 conceding 0: the challenger raises it to the third request’s settled charge.');
+        const underConceded = await client('prepare_withdrawal', { snapshot: 'S2', args: await escapeArgs(0) });
+        const underInputs = decodeInputs(underConceded);
+        assert.equal(underInputs[13], N(third));
+        const S3successor = BigInt((await client('status')).withdrawal_nullifier);
+        assert.equal(underInputs[15], S3successor, 'its successor is the newest state S3, never spent');
+        const underInitiated = await (await vault.initiateEscapeWithdrawal(underInputs, underConceded.proof_hex)).wait();
+        await rpc(rpcUrl, 'anvil_mine', ['0x2']);
+        const raise = await minedChallengerTx(1);
+        assert.equal(raise.decoded.name, 'raiseEscapeConcession');
+        assert.deepEqual([...raise.decoded.args[1]].map(BigInt), requestTuple(third.request.public_inputs));
+        const raised = parsedLogs(raise.receipt, 'EscapeConcessionRaised');
+        assert.equal(raised.length, 1);
+        assert.equal(raised[0].args.conceded, BigInt(third.record.charge_gwei));
+        pending = await vault.pendingWithdrawals(primary.noteId);
+        assert.equal(pending[3], BigInt(B(2)));
+        assert.equal(pending[4], BigInt(third.record.charge_gwei));
+        assert.equal(pending[5], BigInt(B(3)), 'a raise caps the payout at the newest state balance');
+        // Double spend of N⁺: the newest state's nullifier is consumed on-chain,
+        // so the server refuses any request from S3.
+        const s3Quote = await get(`${serverUrl}/v2/billing/quote`);
+        const s3Path = await treePath(client, primary.noteId);
+        const s3Request = await client('prepare_request', { args: { payload: JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1, billing_quote: s3Quote }),
+            active_root: s3Path.active_root, merkle_siblings: s3Path.siblings, client_request_id: `acceptance-after-exit-${randomUUID()}`,
             request_time: Math.floor(Date.now() / 1000), created_at_ms: Date.now() } });
-        const retryNullifier = failedRequest.request.public_inputs.request_nullifier;
-        assert.equal(retryEscapeInputs[11], BigInt(retryNullifier), 'request and escape must consume the same genuine state');
-        assert.equal(retryEscapeInputs[9], BigInt(DEPOSIT));
-        assert.equal(await vault.usedNullifiers(retryNullifier), false);
-        const keysBeforeFailure = mock.keys.size;
-        mock.failNextCreate();
-        const failedIssue = await request(`${serverUrl}/v2/openrouter/leases`, { method: 'POST', value: failedRequest.request });
-        assert.equal(failedIssue.status, 500);
-        assert.equal(failedIssue.value.error_code, 'internal_error');
-        assert.equal(mock.events.filter(event => event.type === 'create_failed').length, 1,
-            'the failure must occur at the mock provider, after request reservation');
-        assert.equal(mock.keys.size, keysBeforeFailure);
-        const failedRecovery = await get(`${serverUrl}/v2/requests/${retryId}`);
-        assert.equal(failedRecovery.nullifier_status, 'reserved');
-        assert.equal(failedRecovery.request_response, undefined);
-        const attemptsBeforeRetry = mock.events.filter(event => event.type === 'issued' || event.type === 'create_failed').length;
-        const retryBalances = { vault: await balance(vaultAddress), destination: await balance(destination), treasury: await balance(treasury) };
-        const retryInitiated = await (await vault.initiateEscapeWithdrawal(retryEscapeInputs, retryEscape.proof_hex, retryEscape.siblings)).wait();
-        assert.equal(await vault.usedNullifiers(retryNullifier), true);
-        assert.equal((await vault.pendingWithdrawals(retryNote.noteId))[0], true);
-        async function rejectedSpentRetry() {
-            const retried = await request(`${serverUrl}/v2/openrouter/leases`, { method: 'POST', value: failedRequest.request });
-            assert.equal(retried.status, 409);
-            assert.equal(retried.value.error_code, 'nullifier_used');
-            assert.equal(mock.keys.size, keysBeforeFailure, 'spent retry must never create another provider key');
-            assert.equal(mock.events.filter(event => event.type === 'issued' || event.type === 'create_failed').length,
-                attemptsBeforeRetry, 'spent retry must be rejected before provider creation');
-            return { http_status: retried.status, error_code: retried.value.error_code };
-        }
-        const pendingRetry = await rejectedSpentRetry();
-        await assert.rejects(vault.finalizeEscapeWithdrawal.staticCall(retryNote.noteId), 'the honest escape still has its full challenge window');
-        // Only this separate regression advances the disposable chain clock.
-        // The earlier daemon challenge runs within the unchanged 24-hour window.
-        await rpc(rpcUrl, 'evm_increaseTime', [86401]);
-        await rpc(rpcUrl, 'anvil_mine', ['0x1']);
-        const retryFinalized = await (await vault.finalizeEscapeWithdrawal(retryNote.noteId)).wait();
-        assert.equal(retryFinalized.status, 1);
-        assert.equal((await vault.notes(retryNote.noteId))[3], 3n);
-        assert.equal((await vault.pendingWithdrawals(retryNote.noteId))[0], false);
-        assert.equal(await balance(destination) - retryBalances.destination, BigInt(DEPOSIT) * GWEI);
-        assert.equal(await balance(treasury), retryBalances.treasury);
-        assert.equal(retryBalances.vault - await balance(vaultAddress), BigInt(DEPOSIT) * GWEI);
-        assert.equal(await balance(vaultAddress), BigInt(EXTRA_DEPOSIT) * GWEI);
-        const finalizedRetry = await rejectedSpentRetry();
-        assert.equal((await get(`${serverUrl}/v2/requests/${retryId}`)).nullifier_status, 'reserved');
-        const failedIssuance = { note_id: retryNote.noteId, client_request_id: retryId, request_nullifier: retryNullifier,
-            deposit_transaction: retryNote.receipt.hash, initiation_transaction: retryInitiated.hash,
-            finalization_transaction: retryFinalized.hash, failed_create_left_reserved_request: true,
-            exact_saved_request_replayed: true, rejected_while_pending: pendingRetry, rejected_after_finalization: finalizedRetry,
-            provider_create_attempts_before_retry: attemptsBeforeRetry, provider_create_attempts_after_retry: attemptsBeforeRetry,
-            additional_provider_keys: mock.keys.size - keysBeforeFailure, user_payout_gwei: DEPOSIT,
-            real_escape_proof: true, challenge_period_seconds: 86400, local_time_jump_seconds: 86401 };
-        await save('failed-issuance-regression.json', failedIssuance);
-        await save('failed-issuance-request.json', failedRequest.request);
-        await save('failed-issuance-escape-initiation-receipt.json', retryInitiated);
-        await save('failed-issuance-escape-finalization-receipt.json', retryFinalized);
+        const refused = await request(`${serverUrl}/v2/openrouter/leases`, { method: 'POST', value: s3Request.request });
+        assert.equal(refused.status, 409);
+        assert.equal(refused.value.error_code, 'nullifier_used');
+        await stop(challenger);
+        await advance(CHALLENGE_PERIOD + 1);
+        const raisedBalances = { destination: await balance(destination), treasury: await owed() };
+        const raisedFinal = await (await vault.finalizeEscapeWithdrawal(primary.noteId)).wait();
+        assert.equal(await balance(destination) - raisedBalances.destination, BigInt(B(3)) * GWEI);
+        assert.equal(await owed() - raisedBalances.treasury, BigInt(DEPOSIT - B(3)));
+        assert.equal((await vault.notes(primary.noteId))[3], 3n);
+
+        // ---- Fresh note: cooperative close with c = 0 and a validity deadline ----
+        const clearance = await request(`${serverUrl}/v2/withdraw/clearance`, { method: 'POST',
+            value: { withdrawal_nullifier: (await extraClient('status')).withdrawal_nullifier } });
+        assert.equal(clearance.status, 200);
+        const close = await extraClient('prepare_withdrawal', { args: { mode: 'mutual', destination, conceded: '0',
+            valid_until: String(await validUntil()), clearance: clearance.value } });
+        const closeInputs = decodeInputs(close);
+        assert.equal(closeInputs[14], true);
+        assert.equal(closeInputs[15], 0n);
+        assert.equal(closeInputs[16], 0n);
+        const closeBalances = { destination: await balance(destination) };
+        const closeReceipt = await (await vault.mutualClose(closeInputs, close.proof_hex)).wait();
+        assert.equal((await vault.notes(unrelated.noteId))[3], 3n);
+        assert.equal(await balance(destination) - closeBalances.destination, BigInt(EXTRA_DEPOSIT) * GWEI);
+
+        // ---- Withheld successor: an honest escape conceding its bound is paid B - b ----
+        console.log('Starting a test-only withholding server; the honest wallet escapes conceding exactly its bound.');
+        const withholding = await startServer('withholding-server', opts.adversaryBin, ['--adversary', 'withhold']);
+        const victim = wallet('withheld');
+        await victim('init', { config });
+        const victimNote = await deposit(victim, DEPOSIT);
+        const withheld = await requestAndSettle('withheld', victim, victimNote.noteId, withholding.url);
+        const recovery = await get(`${withholding.url}/v2/requests/${withheld.id}`);
+        assert.equal(recovery.request_response ?? null, null, 'the withholding server never signs the successor');
+        assert.equal((await victim('status')).pending_request, true);
+        const bound = Number(withheld.prepared.request.public_inputs.solvency_bound);
+        assert.equal(bound, CAP);
+        // Recovery availability must not be a prerequisite for unilateral exit.
+        // Keep the real archived evidence, but take the operator fully offline
+        // before proving and submitting the victim's escape.
+        await stop(withholding.child);
+        const honestEscape = await victim('prepare_withdrawal', { args: await escapeArgs(bound) });
+        const honestInputs = decodeInputs(honestEscape);
+        assert.equal(honestInputs[11], BigInt(DEPOSIT - bound));
+        assert.equal(honestInputs[16], BigInt(bound));
+        const escapeBalances = { destination: await balance(destination), treasury: await owed(), vault: await balance(vaultAddress) };
+        const honestInitiated = await (await vault.initiateEscapeWithdrawal(honestInputs, honestEscape.proof_hex)).wait();
+        // The operator's only evidence is the request at N: it cannot defeat
+        // (that needs N⁺) and cannot raise past the bound already conceded.
+        // ABI arguments: the address slot must be an address string, not a word.
+        const requestArgs = inputs => requestTuple(inputs).map((word, index) => index === 2
+            ? `0x${word.toString(16).padStart(40, '0')}` : word);
+        const evidence = [requestArgs(withheld.prepared.request.public_inputs), proofHex(withheld.prepared.request)];
+        await reverts(vault.challengeEscapeWithdrawal.staticCall(victimNote.noteId, ...evidence), 'NotSuccessorNullifier');
+        await reverts(vault.raiseEscapeConcession.staticCall(victimNote.noteId, ...evidence, BigInt(DEPOSIT)), 'ConcessionNotRaised');
+        await advance(CHALLENGE_PERIOD + 1);
+        const honestFinal = await (await vault.finalizeEscapeWithdrawal(victimNote.noteId)).wait();
+        assert.equal(await balance(destination) - escapeBalances.destination, BigInt(DEPOSIT - bound) * GWEI, 'G1: paid B - b');
+        assert.equal(await owed() - escapeBalances.treasury, BigInt(bound));
+        assert.equal(escapeBalances.vault - await balance(vaultAddress), BigInt(DEPOSIT - bound) * GWEI,
+            'only the user payout leaves the vault; the bound accrues to the treasury');
+
+        // ---- Bounded pause, then the expiry sweep ----
+        console.log('Bounded pause: exits reopen after the maximum pause; the expiry sweep waits for the paused time.');
+        const sleeper = wallet('expiring');
+        await sleeper('init', { config });
+        const sleeperNote = await deposit(sleeper, EXTRA_DEPOSIT);
+        const claimableBefore = await vault.claimableAt(sleeperNote.noteId);
+        await (await vault.pause()).wait();
+        const maxPause = Number(await vault.MAX_PAUSE_DURATION());
+        const pausedEscape = await sleeper('prepare_withdrawal', { args: await escapeArgs(0) });
+        await reverts(vault.initiateEscapeWithdrawal.staticCall(decodeInputs(pausedEscape), pausedEscape.proof_hex), 'Paused');
+        await advance(maxPause + 1);
+        assert.equal(await vault.claimableAt(sleeperNote.noteId) - claimableBefore >= BigInt(maxPause), true,
+            'paused time extends the expiry sweep');
+        // The pause expired on its own: exits reopen without any owner action.
+        const reopened = await sleeper('prepare_withdrawal', { args: await escapeArgs(0) });
+        await vault.initiateEscapeWithdrawal.staticCall(decodeInputs(reopened), reopened.proof_hex);
+        await (await vault.unpause()).wait();
+        await reverts(vault.pause.staticCall(), 'PauseCooldown');
+        const claimableAt = Number(await vault.claimableAt(sleeperNote.noteId));
+        await reverts(vault.claimExpired.staticCall(sleeperNote.noteId), 'NoteNotExpired');
+        await advance(claimableAt - await chainNow() + 1);
+        const sweepBalances = { treasury: await owed() };
+        const swept = await (await vault.claimExpired(sleeperNote.noteId)).wait();
+        assert.equal(parsedLogs(swept, 'ExpiredClaimed').length, 1);
+        assert.equal(await owed() - sweepBalances.treasury, BigInt(EXTRA_DEPOSIT));
+        assert.equal((await vault.notes(sleeperNote.noteId))[3], 3n);
+        // Permissionless payout of everything the treasury accrued.
+        const accrued = await owed();
+        const treasuryBefore = await balance(treasury);
+        const treasuryPaid = await (await vault.withdrawTreasury()).wait();
+        const paidEvents = parsedLogs(treasuryPaid, 'TreasuryWithdrawn');
+        assert.equal(paidEvents.length, 1);
+        assert.equal(paidEvents[0].args.amount, accrued);
+        assert.equal(await balance(treasury) - treasuryBefore, accrued * GWEI);
+        assert.equal(await owed(), 0n);
+        assert.ok([...mock.keys.values()].every(key => key.deleted));
+
         const hashes = {};
         for (const file of [fileURLToPath(import.meta.url), path.join(ROOT, 'crates/zkapi-serverd/examples/v2_acceptance_wallet.rs'),
-            ...['zkapi', 'zkapi-indexerd', 'zkapi-challenged', 'examples/v2_acceptance_wallet'].map(file => path.join(opts.binDir, file)),
+            path.join(ROOT, 'docker/aws/signer/signer.mjs'),
+            ...['dagon-zkapi', 'dagon-zkapi-indexerd', 'dagon-zkapi-challenged', 'examples/v2_acceptance_wallet'].map(file => path.join(opts.binDir, file)),
+            opts.adversaryBin,
             ...['request.pk', 'request.vk', 'withdrawal.pk', 'withdrawal.vk'].map(file => path.join(ROOT, 'protocol/setup/v2', file))]) {
             hashes[path.relative(ROOT, file)] = createHash('sha256').update(await fs.readFile(file)).digest('hex');
         }
         const gitOutput = args => {
-            const result = spawnSync('git', args, { cwd: ROOT, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+            const result = spawnSync('git', args, { cwd: ROOT, encoding: 'utf8', maxBuffer: 1024 * 1024 * 1024 });
             assert.equal(result.status, 0, `git ${args.join(' ')} failed: ${result.error?.message ?? result.stderr}`);
             return result.stdout;
         };
@@ -672,27 +781,32 @@ async function main() {
             tracked_source_diff_sha256: createHash('sha256').update(gitOutput(['diff', '--binary', 'HEAD'])).digest('hex'),
             artifact_sha256: hashes,
             network: { chain_id: CHAIN_ID, kind: 'disposable loopback Anvil', fork: false, public_rpc: false },
-            coverage: { wallet: 'production browser wallet Rust APIs; fresh random genesis note',
-                proof_system: 'real checked-in Groth16 proving keys and deployed verifier',
-                server: 'actual zkapi serverd HTTP routes and SQLite archive', indexer: 'actual zkapi-indexerd',
-                challenger: 'actual zkapi-challenged daemon', provider: 'loopback mock management and inference HTTP service',
+            coverage: { wallet: 'production browser wallet Rust APIs; fresh random genesis notes',
+                proof_system: 'real checked-in Groth16 proving keys and deployed verifier (concession-exit circuit)',
+                server: 'actual dagon-zkapi EVM serverd routes and SQLite archive, plus a test-only --adversary withhold build',
+                indexer: 'actual dagon-zkapi-indexerd', challenger: 'actual dagon-zkapi-challenged EVM daemon (defeat and raise)',
+                challenge_signer: 'production AWS createSigner RPC allowlist, fee checks and signed raw transactions',
+                provider: 'loopback mock management and inference HTTP service',
                 oracle: 'loopback mock price feed; chain, native-vault identity and live nullifiers checked against actual Anvil',
                 external_provider_verified: false, oa_station_verified: false, live_network_verified: false },
             deposit: { transaction: primary.receipt.hash, note_id: primary.noteId, amount_gwei: DEPOSIT, genuine_genesis: true },
             settlements, mock_provider_events: mock.events,
-            challenge: { transaction: challengeHash, note_id: primary.noteId, challenge_period_seconds: 86400,
-                elapsed_chain_seconds: elapsed, proof_from_genuine_settled_state: true, historical_request_root_preserved: true,
-                archived_inputs_preserved: true, archived_proof_preserved: true, restoration_path_verified: true,
-                challenge_event_verified: true, no_time_jump: true, daemon_simulation_and_submission: true,
-                restored_active: true, pending_cleared: true, no_payout: true, confirmations_observed: 2 },
-            withdrawal: { transaction: closeReceipt.hash, real_proof: true, signed_clearance: true,
-                user_payout_gwei: DEPOSIT - totalCharge, treasury_payout_gwei: totalCharge, closed: true },
-            failed_issuance_retry: failedIssuance,
-            unrelated_note: { note_id: unrelated.noteId, retained_local_balance_gwei: EXTRA_DEPOSIT },
+            stale_escape_defeated: { initiation: initiated.hash, defeat: defeat.hash, front_running_deposit: unrelated.receipt.hash,
+                escaped_nullifier_challenged: true, successor_released: true, note_active: true, no_payout: true,
+                replay_reverted: 'ReplayedNullifier', older_state_reverted: 'SupersededState' },
+            under_concession_raised: { initiation: underInitiated.hash, raise: raise.hash, raised_to_gwei: third.record.charge_gwei,
+                finalization: raisedFinal.hash, user_payout_gwei: B(3), treasury_payout_gwei: DEPOSIT - B(3),
+                successor_request_refused: 'nullifier_used' },
+            mutual_close: { transaction: closeReceipt.hash, user_payout_gwei: EXTRA_DEPOSIT, conceded: 0 },
+            withheld_successor: { note_id: victimNote.noteId, request: withheld.id, settled_charge_gwei: Number(withheld.settled.charge_applied),
+                bound_gwei: bound, initiation: honestInitiated.hash, finalization: honestFinal.hash,
+                user_payout_gwei: DEPOSIT - bound, treasury_payout_gwei: bound, defeat_reverted: 'NotSuccessorNullifier',
+                raise_reverted: 'ConcessionNotRaised' },
+            bounded_pause: { max_pause_seconds: maxPause, exits_reopened_without_unpause: true, re_pause_reverted: 'PauseCooldown',
+                expiry_sweep: swept.hash, swept_gwei: EXTRA_DEPOSIT },
             all_runtime_keys_revoked: true };
-        await save('mutual-close-receipt.json', closeReceipt);
         await save('result.json', result);
-        console.log(`PASS: deposit → two provider calls → signed settlements → stale escape → daemon challenge → mutual withdrawal; failed issuance cannot mint access after escape.\nEvidence: ${runDir}`);
+        console.log(`PASS: stale escape defeated (front-run deposit harmless) → under-conceded escape raised and paid B₃ → mutual close → withheld successor escaped at c = b and paid B − b → bounded pause and expiry sweep.\nEvidence: ${runDir}`);
     } catch (error) {
         await save('failure.json', { passed: false, error: error.message, stack: error.stack });
         console.error(`FAIL: ${error.message}\nEvidence: ${runDir}`);

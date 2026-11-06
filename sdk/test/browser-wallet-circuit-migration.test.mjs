@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { BrowserWalletRuntime } from '../services/browserWalletRuntime.js';
 
-const CIRCUIT_ID = 'zkapi-v2-note-bound-v1';
+const CIRCUIT_ID = 'zkapi-v2-concession-v1';
 
 function manifest() {
     return {
@@ -33,7 +33,9 @@ function manifest() {
 
 test('browser rejects missing, legacy, and unknown circuits with migration guidance', () => {
     const runtime = new BrowserWalletRuntime();
-    for (const circuitId of [undefined, '', 'legacy-unbound', 'unknown-future-circuit']) {
+    // The note-bound circuit has no concession exit: its vaults let an
+    // operator that withholds a successor take the deposit.
+    for (const circuitId of [undefined, '', 'legacy-unbound', 'zkapi-v2-note-bound-v1', 'unknown-future-circuit']) {
         const deployment = manifest();
         deployment.proof_setup.circuit_id = circuitId;
         assert.throws(() => runtime.validateManifest(deployment), error => {
@@ -116,4 +118,42 @@ test('token deployments are rejected before deployment selection, worker creatio
         assert.equal(runtime.worker, null);
         assert.equal(runtime.initialized, false);
     }
+});
+
+test('operator manifest loss or replacement leaves a pin-validated exit-only wallet', async () => {
+    for (const unavailable of [true, false]) {
+        const runtime = new BrowserWalletRuntime();
+        const deployment = manifest();
+        runtime.browserConfig = { trusted_deployment: {
+            ...deployment, ...deployment.proof_setup, ...deployment.privacy_mode
+        } };
+        runtime.directJson = async () => {
+            if (unavailable) throw new TypeError('operator offline');
+            return { ...deployment, contract_address: `0x${'99'.repeat(20)}` };
+        };
+        const restored = await runtime.loadDeploymentManifest('https://server.example/config.json');
+        assert.equal(restored.contract_address, deployment.contract_address);
+        assert.equal(restored.proof_setup.withdrawal_proving_key_sha256, deployment.proof_setup.withdrawal_proving_key_sha256);
+        assert.equal(runtime.exitOnly, true);
+        runtime.validateManifest(restored);
+        runtime.validateManifestTrust(restored);
+        runtime.init = async () => {};
+        await assert.rejects(runtime.prepareDeposit(1000), { code: 'deployment_exit_only' });
+        await assert.rejects(runtime.prepareLeaseRequest(), { code: 'deployment_exit_only' });
+        await assert.rejects(runtime.claimPendingDepositSubmission(), { code: 'deployment_exit_only' });
+        runtime.directJson = async () => deployment;
+        await runtime.loadDeploymentManifest('https://server.example/config.json');
+        assert.equal(runtime.exitOnly, false);
+    }
+});
+
+test('exit-only initialization never falls back to missing or incompatible trusted pins', async () => {
+    const runtime = new BrowserWalletRuntime();
+    const deployment = manifest();
+    runtime.directJson = async () => { throw new TypeError('operator offline'); };
+    runtime.browserConfig = {};
+    await assert.rejects(runtime.loadDeploymentManifest('https://server.example/config.json'), /operator offline/);
+    runtime.browserConfig.trusted_deployment = { ...deployment, ...deployment.proof_setup, ...deployment.privacy_mode,
+        circuit_id: 'zkapi-v2-note-bound-v1' };
+    await assert.rejects(runtime.loadDeploymentManifest('https://server.example/config.json'), { code: 'incompatible_proof_circuit' });
 });

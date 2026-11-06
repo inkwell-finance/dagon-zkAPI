@@ -1070,7 +1070,8 @@ test('selected cap reaches proof inputs and insufficient funds never start provi
         proofInputs.push(payload);
         const request = { payload: payload.args.payload,
             public_inputs: { solvency_bound: payload.config.request_charge_cap } };
-        return { journal: { prepared_request: request }, request };
+        return { journal: { prepared_request: request }, request,
+            state: { ...payload.state, bound_at_state: payload.config.request_charge_cap } };
     } };
     await assert.rejects(runtime.prepareLeaseRequest(undefined, null, 6), error => error.required_credits === 6_000_000);
     assert.equal(proofInputs.length, 0);
