@@ -45,7 +45,7 @@ fn main() -> Result<()> {
         &balance_commitment(deposit_amount, &blinding, &leaf),
         &rerandomization,
     )?;
-    let nullifier = core::nullifier(&secret, &current_anchor);
+    let nullifier = core::nullifier(&secret, note_id, &current_anchor);
     let request_context = Felt252::from_u64(99);
     let request_public = RequestPublicInputsV2 {
         protocol_version: 2,
@@ -74,45 +74,41 @@ fn main() -> Result<()> {
             current_blinding: blinding,
             rerandomization,
             current_anchor,
-            is_genesis: true,
+            prev_anchor: Felt252::ZERO,
             state_signature: None,
         },
     )?;
     assert!(RequestVerifier::load(&setup)?.verify(&request_public, &request_proof)?);
 
     let destination = [0x11u8; 20];
-    let destination_felt = Felt252::try_from_bytes_be({
-        let mut bytes = [0u8; 32];
-        bytes[12..].copy_from_slice(&destination);
-        bytes
-    })
-    .map_err(anyhow::Error::msg)?;
     let withdrawal_public = WithdrawalPublicInputsV2 {
         protocol_version: 2,
         chain_id: 31_337,
         contract_address,
-        active_root: root,
+        registration,
         state_signing_key_x: state_key.x,
         state_signing_key_y: state_key.y,
         clearance_signing_key_x: clearance_key.x,
         clearance_signing_key_y: clearance_key.y,
         note_id,
+        deposit_amount,
+        expiry_ts: expiry,
         final_balance: deposit_amount,
         destination,
         withdrawal_nullifier: nullifier,
         has_clearance: false,
-        withdrawal_tag: core::withdrawal_tag(&nullifier, &destination_felt, deposit_amount, false),
+        next_nullifier: core::successor_nullifier(&secret, note_id, &nullifier),
+        conceded: 0,
+        valid_until: expiry,
     };
     let withdrawal_proof = WithdrawalProver::load(&setup)?.prove(
         &withdrawal_public,
         WithdrawalWitnessData {
             secret,
-            deposit_amount,
-            expiry,
-            merkle_siblings: siblings,
+            current_balance: deposit_amount,
             final_blinding: blinding,
             current_anchor,
-            is_genesis: true,
+            prev_anchor: Felt252::ZERO,
             state_signature: None,
             clearance_signature: None,
         },

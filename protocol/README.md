@@ -6,7 +6,7 @@ returns a fresh server-signed state. The vault settles the remaining balance
 when the note closes.
 
 The current circuit binds signed balances to the private membership leaf.
-Its circuit ID is `zkapi-v2-note-bound-v1`. Read the
+Its circuit ID is `zkapi-v2-concession-v1`. Read the
 [setup compatibility and trust assumptions](setup/v2/README.md) before using its keys.
 
 ## Implementation

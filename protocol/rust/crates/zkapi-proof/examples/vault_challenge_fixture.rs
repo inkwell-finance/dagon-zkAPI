@@ -24,18 +24,22 @@ const VAULT: &str = "0xFb1b848e938aE6474F890bfb28f6a793a515BAcb";
 struct Fixture {
     inputs_abi: String,
     proof_hex: String,
+    public_inputs: serde_json::Value,
+    public_fields: Vec<Felt252>,
 }
 
 #[derive(Serialize)]
 struct Fixtures {
     circuit_id: &'static str,
     note_a_registration: String,
-    note_b_registration: String,
-    request_before_deposit: Fixture,
-    request_before_close: Fixture,
-    escape_after_deposit: Fixture,
-    escape_after_close: Fixture,
-    close_b: Fixture,
+    req0: Fixture,
+    req1: Fixture,
+    req2: Fixture,
+    esc0: Fixture,
+    esc1: Fixture,
+    esc1_conceded: Fixture,
+    esc2: Fixture,
+    close2: Fixture,
 }
 
 struct Generator {
@@ -56,6 +60,7 @@ struct Note {
     balance: u128,
     blinding: Felt252,
     anchor: Felt252,
+    prev_anchor: Felt252,
     signature: Option<SchnorrSignature>,
 }
 
@@ -78,7 +83,7 @@ impl Generator {
             &balance_commitment(note.balance, &note.blinding, &leaf),
             &rerandomization,
         )?;
-        let nullifier = core::nullifier(&note.secret, &note.anchor);
+        let nullifier = core::nullifier(&note.secret, note.id, &note.anchor);
         let public = RequestPublicInputsV2 {
             protocol_version: 2,
             chain_id: 31_337,
@@ -106,7 +111,7 @@ impl Generator {
                 current_blinding: note.blinding,
                 rerandomization,
                 current_anchor: note.anchor,
-                is_genesis: note.signature.is_none(),
+                prev_anchor: note.prev_anchor,
                 state_signature: note.signature,
             },
         )?;
@@ -114,50 +119,48 @@ impl Generator {
             self.request_verifier.verify(&public, &proof)?,
             "request proof failed"
         );
-        fixture(&public.to_field_elements(), &proof)
+        fixture(&public.to_field_elements(), &public.to_field_elements(), &proof, &public)
     }
 
     fn withdrawal(
         &self,
         note: &Note,
-        siblings: [Felt252; MERKLE_DEPTH],
+        conceded: u128,
         clearance: bool,
     ) -> Result<Fixture> {
         let key = self.state_signer.public_key();
         let clear_key = self.clearance_signer.public_key();
-        let nullifier = core::nullifier(&note.secret, &note.anchor);
-        let mut public = WithdrawalPublicInputsV2 {
+        let nullifier = core::nullifier(&note.secret, note.id, &note.anchor);
+        let public = WithdrawalPublicInputsV2 {
             protocol_version: 2,
             chain_id: 31_337,
             contract_address: self.vault,
-            active_root: core::merkle_root(note.id, &self.leaf(note), &siblings),
+            registration: core::registration_commitment(&note.secret),
             state_signing_key_x: key.x,
             state_signing_key_y: key.y,
             clearance_signing_key_x: clear_key.x,
             clearance_signing_key_y: clear_key.y,
             note_id: note.id,
-            final_balance: note.balance,
+            deposit_amount: DEPOSIT,
+            expiry_ts: self.expiry,
+            final_balance: note.balance - conceded,
             destination: [0x11; 20],
             withdrawal_nullifier: nullifier,
             has_clearance: clearance,
-            withdrawal_tag: Felt252::ZERO,
+            next_nullifier: if clearance { Felt252::ZERO } else {
+                core::successor_nullifier(&note.secret, note.id, &nullifier)
+            },
+            conceded,
+            valid_until: TIMESTAMP + 20 * 86_400,
         };
-        public.withdrawal_tag = core::withdrawal_tag(
-            &nullifier,
-            &public.destination_field(),
-            note.balance,
-            clearance,
-        );
         let proof = self.withdrawals.prove(
             &public,
             WithdrawalWitnessData {
                 secret: note.secret,
-                deposit_amount: DEPOSIT,
-                expiry: self.expiry,
-                merkle_siblings: siblings,
+                current_balance: note.balance,
                 final_blinding: note.blinding,
                 current_anchor: note.anchor,
-                is_genesis: note.signature.is_none(),
+                prev_anchor: note.prev_anchor,
                 state_signature: note.signature,
                 clearance_signature: clearance.then(|| {
                     self.clearance_signer.sign(&core::clearance_message(
@@ -173,12 +176,20 @@ impl Generator {
             self.withdrawal_verifier.verify(&public, &proof)?,
             "withdrawal proof failed"
         );
-        fixture(&public.to_field_elements(), &proof)
+        // Solidity's tuple expands packed note_fields into n, D, e.
+        let fields = public.to_field_elements();
+        let mut abi = fields[..8].to_vec();
+        abi.extend([
+            Felt252::from_u64(public.note_id.into()),
+            core::field_to_felt(&ark_bn254::Fr::from(public.deposit_amount)),
+            Felt252::from_u64(public.expiry_ts),
+        ]);
+        abi.extend_from_slice(&fields[9..]);
+        fixture(&abi, &fields, &proof, &public)
     }
 }
 
-fn fixture(inputs: &[Felt252], proof: &Groth16ProofWire) -> Result<Fixture> {
-    // Both Solidity public-input structs are static ABI tuples in this order.
+fn fixture(inputs: &[Felt252], public_fields: &[Felt252], proof: &Groth16ProofWire, public: &impl Serialize) -> Result<Fixture> {
     let inputs = inputs
         .iter()
         .flat_map(|field| field.as_bytes().iter().copied())
@@ -187,6 +198,8 @@ fn fixture(inputs: &[Felt252], proof: &Groth16ProofWire) -> Result<Fixture> {
     Ok(Fixture {
         inputs_abi: format!("0x{}", hex::encode(inputs)),
         proof_hex: format!("0x{}", hex::encode(proof)),
+        public_inputs: serde_json::to_value(public)?,
+        public_fields: public_fields.to_vec(),
     })
 }
 
@@ -204,53 +217,45 @@ fn main() -> Result<()> {
         expiry: (TIMESTAMP + NOTE_TTL).div_ceil(86_400) * 86_400,
         vault: Felt252::from_hex(VAULT).map_err(anyhow::Error::msg)?,
     };
-    // A has genuine signed non-genesis state. Its historical request and stale
-    // escape use that identical state under different active Merkle roots.
-    let mut a = Note {
+    let genesis = Note {
         id: 0,
         secret: Felt252::from_u64(42),
-        balance: 900_000,
-        blinding: Felt252::from_u64(7),
-        anchor: Felt252::from_u64(12_345),
-        signature: None,
-    };
-    let commitment = balance_commitment(a.balance, &a.blinding, &generator.leaf(&a));
-    a.signature = Some(generator.state_signer.sign(&core::state_message(
-        2,
-        31_337,
-        &generator.vault,
-        &commitment.x,
-        &commitment.y,
-        &a.anchor,
-    )));
-    let b = Note {
-        id: 1,
-        secret: Felt252::from_u64(43),
         balance: DEPOSIT,
-        blinding: Felt252::from_u64(8),
+        blinding: Felt252::from_u64(7),
         anchor: Felt252::ONE,
+        prev_anchor: Felt252::ZERO,
         signature: None,
     };
+    let advance = |previous: &Note, charge: u128| {
+        let mut next = previous.clone();
+        next.prev_anchor = previous.anchor;
+        next.anchor = core::next_anchor(&core::nullifier(&previous.secret, previous.id, &previous.anchor));
+        next.balance -= charge;
+        // Request rerandomization is 9; a zero server delta is sufficient.
+        next.blinding = zkapi_proof::compact::add_blindings(&previous.blinding, &Felt252::from_u64(9));
+        let commitment = balance_commitment(next.balance, &next.blinding, &generator.leaf(&next));
+        next.signature = Some(generator.state_signer.sign(&core::state_message(
+            2, 31_337, &generator.vault, &commitment.x, &commitment.y, &next.anchor,
+        )));
+        next
+    };
+    let a = advance(&genesis, 100_000);
+    let successor = advance(&a, 50_000);
     let empty: [Felt252; MERKLE_DEPTH] = core::zero_hashes()[..MERKLE_DEPTH].try_into().unwrap();
-    let mut a_with_b = empty;
-    a_with_b[0] = generator.leaf(&b);
-    let mut b_with_a = empty;
-    b_with_a[0] = generator.leaf(&a);
     let fixtures = Fixtures {
         circuit_id: CIRCUIT_ID,
         note_a_registration: format!(
             "0x{}",
             hex::encode(core::registration_commitment(&a.secret).as_bytes())
         ),
-        note_b_registration: format!(
-            "0x{}",
-            hex::encode(core::registration_commitment(&b.secret).as_bytes())
-        ),
-        request_before_deposit: generator.request(&a, empty)?,
-        request_before_close: generator.request(&a, a_with_b)?,
-        escape_after_deposit: generator.withdrawal(&a, a_with_b, false)?,
-        escape_after_close: generator.withdrawal(&a, empty, false)?,
-        close_b: generator.withdrawal(&b, b_with_a, true)?,
+        req0: generator.request(&genesis, empty)?,
+        req1: generator.request(&a, empty)?,
+        req2: generator.request(&successor, empty)?,
+        esc0: generator.withdrawal(&genesis, 0, false)?,
+        esc1: generator.withdrawal(&a, 0, false)?,
+        esc1_conceded: generator.withdrawal(&a, 100_000, false)?,
+        esc2: generator.withdrawal(&successor, 0, false)?,
+        close2: generator.withdrawal(&successor, 0, true)?,
     };
     println!("{}", serde_json::to_string_pretty(&fixtures)?);
     Ok(())

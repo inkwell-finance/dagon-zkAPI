@@ -2,7 +2,7 @@
 
 | Behavior | Implementation |
 | --- | --- |
-| Registration, active leaf, nullifiers, request/withdrawal tags | [v2.rs](../../rust/crates/zkapi-core/src/v2.rs) |
+| Registration, active leaf, note-bound nullifiers, derived anchors | [v2.rs](../../rust/crates/zkapi-core/src/v2.rs) |
 | Active-note tree and sibling paths | [merkle.rs](../../rust/crates/zkapi-core/src/merkle.rs) |
 | Request and withdrawal constraints | [groth16.rs](../../rust/crates/zkapi-proof/src/groth16.rs) |
 | Native proving, verification, and signing | [compact.rs](../../rust/crates/zkapi-proof/src/compact.rs) |

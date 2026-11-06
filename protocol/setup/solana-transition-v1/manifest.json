@@ -1,0 +1,99 @@
+{
+  "circuit_id": "dagon-zkapi-solana-transition-v1",
+  "protocol_version": 2,
+  "proof_backend": "groth16_bn254",
+  "public_inputs": [
+    "protocol_version",
+    "chain_id",
+    "protocol_binding",
+    "old_root",
+    "new_root",
+    "note_id",
+    "commitment",
+    "amount",
+    "expiry",
+    "inserting"
+  ],
+  "transition": {
+    "alpha_g1": [
+      "0x1d4f45ed227977c054c2b4dd30f85554aa652bd64ae9d07f5b62bb37b25f53a1",
+      "0x0e66bd6e0765f1c049f5df95f47c50b08706a9386190b2986590f7e3b4616e63"
+    ],
+    "beta_g2": [
+      [
+        "0x134c1bf66d15f111450f741d0c74cfd4993eb441dd4a5ff8869cac4e579459a4",
+        "0x27fb10e3c1269b61974bafa1e42eae1305c189fc53c7ed0016a1ced89e99ea02"
+      ],
+      [
+        "0x16a61865bf7638fca4050ba9585415d3a8d8e52ecea74d6af2154bcf53020e60",
+        "0x25d1c17dbb1ba6f8f6c6ae7b87d274d67206ae5e4ebf31e339abb78da67948f7"
+      ]
+    ],
+    "gamma_g2": [
+      [
+        "0x123c0262f18d4bfad45593a77ae162dc40ee64143da2c20f58a56982fed57cb8",
+        "0x1410f2b455baec76ec24c09d627ae5609fc65937316f598681dcd7820223504d"
+      ],
+      [
+        "0x28a37c86eb7ce1fba1706cccaec04cf2f33e84da51f7529cd9e8f4a7e982410c",
+        "0x24222b3f0cc379923941ac027f855b03ee8485f5c09f9eb53f9160162b9a5392"
+      ]
+    ],
+    "delta_g2": [
+      [
+        "0x08e3c7e4b2624d943ad5e61230bed56e6776957dde365c78605686474e492cc0",
+        "0x15c4bbc8ea01bc820f90326eae03602a0147ebb0982d8338cd64772f6a025f7c"
+      ],
+      [
+        "0x2e4403157c7b29909d11454c99e57dbfc8c38cd5a00b7e88040c8c1848c9149b",
+        "0x1336211b64aebb112f6c2e953c2e4148ca1da3921ed7c36769e4c1dd46dd72da"
+      ]
+    ],
+    "ic": [
+      [
+        "0x074adfad1b015ab2bd625990971f41c16e1478ab1e40163f8b2b6acb61af68df",
+        "0x1448e04ad549bae36894bcd5ae447b55832fadfed2075e69a0d15e60b02e78c8"
+      ],
+      [
+        "0x23e2e5a6dc99b486b33e92707e020d548d7d73624d5375a462ef90b4aab88d59",
+        "0x0f24309c0fcea637bf4fc6199405f0d2e0ccbde4fa59b098e50be866799f36ff"
+      ],
+      [
+        "0x1046ce5cb3ad4f29bf7733047ca3e9679d099982b8fa31925ddb4a6569d3aad6",
+        "0x1a91e3d9ddb6cde485b99bd1c436eb6ad9d60e886bb907c0127129833aaab5e6"
+      ],
+      [
+        "0x084c1bddd801868e2191c6e94b2c4bd2d605ade37b26e1dd0644bd680b9748f5",
+        "0x169c79ce28426e259a07ea34b5da66663b24af3cbf024b12ccf0fed7bfcd0ad4"
+      ],
+      [
+        "0x1e4c328edfcf33168406af50f868bd899bd8275c93e53137b64dc39ada338e0f",
+        "0x12daa534b890db5dfa151e5b21745c09da8d6411b8ca5d2a4544f77f19ea26a5"
+      ],
+      [
+        "0x16906e80984452648ae36dccc9c0d734d82a8bbde0f812d75bd7e2f461a9a05e",
+        "0x1a0242c070eecfeb97fe3d9e2c7baa61d48abf592cb0a4488ac275fa69c3ccec"
+      ],
+      [
+        "0x0974ed1eee293d3d3aa724b383e3b559e5f8018a42ed066819a9285c995a1072",
+        "0x2f4e04a76f1efc38333c859489a16205d8fe7bde9083aad8771929ac1753e865"
+      ],
+      [
+        "0x2960ea865a07406a32d289457a5283ebba935e11e3835fcb3330caab6b7405d7",
+        "0x0f0655e4067f233a429daa815bc46a791c753cee490d88c3216793f22ddc4aa6"
+      ],
+      [
+        "0x0a1781af92b80ef15bdf368fc8be370d6a28639481bfb686ec76cf4861836f86",
+        "0x26dfe6dcd42bcf0cd1196f079e041701518839e88e60a44d5e0570080a6ea0e9"
+      ],
+      [
+        "0x2ddf2d3b2005429cd856523386ea51fc325d937f439f3a23f32d644ca611bc3f",
+        "0x2296136d5b0beea36faa5a13238e4abe8a68d0ccd3c6c406c3093dead1d83e9e"
+      ],
+      [
+        "0x001b14eae24a30775727c47a987af3d7fab11d13de345a0a674110c0710c4cde",
+        "0x04527d3aac247bf1c3f3fb4f719b549f4426cf84e8ee1c30f735e8f4cb7c1f42"
+      ]
+    ]
+  }
+}

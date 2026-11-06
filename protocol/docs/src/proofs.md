@@ -8,14 +8,16 @@ serialization, Baby-JubJub operations, and setup export.
 The request circuit has 12 public field elements. It proves membership,
 secret knowledge, a valid genesis or signed state, sufficient balance, expiry,
 rerandomization, and a request-context-bound nullifier authorization. The
-withdrawal circuit has 14 public field elements and proves the note-bound final
-state, destination/balance binding, and clearance when requested.
+withdrawal circuit has 16 public field elements and proves the leaf-bound final
+state (no Merkle path or root), the concession split `B = final + c`, the
+note-bound nullifier chain, the successor nullifier, destination/balance
+binding, and clearance when requested.
 
 Both circuits use `E(B,r,L) = B*G + r*H + L*J`. Reusing a signed state with a
 different membership leaf fails the signature/balance relation. The exact
 public input order is in [inputs.rs](../../rust/crates/zkapi-types/src/inputs.rs).
 
-Keys use circuit ID `zkapi-v2-note-bound-v1`. Their matching generated Solidity
+Keys use circuit ID `zkapi-v2-concession-v1`. Their matching generated Solidity
 verifier and Poseidon implementation are committed. The browser wallet consumes
 the same proving-key bytes. See [setup compatibility](../../setup/v2/README.md):
 the committed keys use a single-party setup with no multi-party ceremony.

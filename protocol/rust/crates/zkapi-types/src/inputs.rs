@@ -11,6 +11,7 @@ use crate::Felt252;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequestPublicInputsV2 {
     pub protocol_version: u16,
+    #[serde(deserialize_with = "crate::serialization::deserialize_u64_or_decimal_string")]
     pub chain_id: u64,
     pub contract_address: Felt252,
     pub active_root: Felt252,
@@ -43,50 +44,81 @@ impl RequestPublicInputsV2 {
     }
 }
 
-/// Public statement verified for a v2 mutual or escape withdrawal.
+/// Public statement verified for a v2 mutual close or concession escape.
+///
+/// Exits are leaf-bound and root-free: the vault compares `registration` and
+/// `note_fields` with the note it stores, so no Merkle root is published.
+/// Escapes (`has_clearance == false`) also publish the successor nullifier
+/// `next_nullifier` and the declared concession `conceded`; mutual closes
+/// publish zero for both.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WithdrawalPublicInputsV2 {
     pub protocol_version: u16,
+    #[serde(deserialize_with = "crate::serialization::deserialize_u64_or_decimal_string")]
     pub chain_id: u64,
     pub contract_address: Felt252,
-    pub active_root: Felt252,
+    pub registration: Felt252,
     pub state_signing_key_x: Felt252,
     pub state_signing_key_y: Felt252,
     pub clearance_signing_key_x: Felt252,
     pub clearance_signing_key_y: Felt252,
     pub note_id: u32,
+    pub deposit_amount: u128,
+    #[serde(deserialize_with = "crate::serialization::deserialize_u64_or_decimal_string")]
+    pub expiry_ts: u64,
     pub final_balance: u128,
     pub destination: [u8; 20],
     pub withdrawal_nullifier: Felt252,
     pub has_clearance: bool,
-    pub withdrawal_tag: Felt252,
+    pub next_nullifier: Felt252,
+    pub conceded: u128,
+    #[serde(deserialize_with = "crate::serialization::deserialize_u64_or_decimal_string")]
+    pub valid_until: u64,
 }
 
 impl WithdrawalPublicInputsV2 {
+    pub const NUM_PUBLIC_INPUTS: usize = 16;
+
     pub fn destination_field(&self) -> Felt252 {
         let mut bytes = [0u8; 32];
         bytes[12..].copy_from_slice(&self.destination);
         Felt252(bytes)
     }
 
-    pub fn to_field_elements(&self) -> [Felt252; 14] {
+    /// `note_id * 2^192 + deposit_amount * 2^64 + expiry_ts`.
+    pub fn note_fields(&self) -> Felt252 {
+        pack_note_fields(self.note_id, self.deposit_amount, self.expiry_ts)
+    }
+
+    pub fn to_field_elements(&self) -> [Felt252; 16] {
         [
             Felt252::from_u64(self.protocol_version as u64),
             Felt252::from_u64(self.chain_id),
             self.contract_address,
-            self.active_root,
+            self.registration,
             self.state_signing_key_x,
             self.state_signing_key_y,
             self.clearance_signing_key_x,
             self.clearance_signing_key_y,
-            Felt252::from_u64(self.note_id as u64),
+            self.note_fields(),
             Felt252::from_u128(self.final_balance),
             self.destination_field(),
             self.withdrawal_nullifier,
             Felt252::from_u64(self.has_clearance as u64),
-            self.withdrawal_tag,
+            self.next_nullifier,
+            Felt252::from_u128(self.conceded),
+            Felt252::from_u64(self.valid_until),
         ]
     }
+}
+
+/// Pack `(n, D, e)` into `n * 2^192 + D * 2^64 + e` (big-endian bytes 4..32).
+pub fn pack_note_fields(note_id: u32, deposit_amount: u128, expiry_ts: u64) -> Felt252 {
+    let mut bytes = [0u8; 32];
+    bytes[4..8].copy_from_slice(&note_id.to_be_bytes());
+    bytes[8..24].copy_from_slice(&deposit_amount.to_be_bytes());
+    bytes[24..32].copy_from_slice(&expiry_ts.to_be_bytes());
+    Felt252(bytes)
 }
 
 /// Hash the exact client request id and payload digest into the private context

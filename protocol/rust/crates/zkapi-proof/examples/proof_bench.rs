@@ -346,7 +346,7 @@ fn request_fixture(genesis: bool) -> Result<RequestFixture> {
         current_blinding: common.blinding,
         rerandomization,
         current_anchor: common.anchor,
-        is_genesis: genesis,
+        prev_anchor: common.prev_anchor,
         state_signature: common.state_signature,
     };
     let circuit = RequestCircuit {
@@ -376,7 +376,7 @@ fn request_fixture(genesis: bool) -> Result<RequestFixture> {
             current_blinding: scalar(witness.current_blinding),
             rerandomization: scalar(witness.rerandomization),
             current_anchor: field(witness.current_anchor),
-            is_genesis: witness.is_genesis,
+            prev_anchor: field(witness.prev_anchor),
             state_signature: signature(witness.state_signature),
         },
     };
@@ -411,31 +411,30 @@ fn withdrawal_fixture(genesis: bool, mutual: bool) -> Result<WithdrawalFixture> 
         protocol_version: common.protocol_version,
         chain_id: common.chain_id,
         contract_address: common.contract_address,
-        active_root: common.root,
+        registration: core::registration_commitment(&common.secret),
         state_signing_key_x: common.state_key.x,
         state_signing_key_y: common.state_key.y,
         clearance_signing_key_x: common.clearance_key.x,
         clearance_signing_key_y: common.clearance_key.y,
         note_id: common.note_id,
+        deposit_amount: common.deposit_amount,
+        expiry_ts: common.expiry,
         final_balance: common.balance,
         destination,
         withdrawal_nullifier: common.nullifier,
         has_clearance: mutual,
-        withdrawal_tag: core::withdrawal_tag(
-            &common.nullifier,
-            &destination_felt,
-            common.balance,
-            mutual,
-        ),
+        next_nullifier: if mutual { Felt252::ZERO } else {
+            core::successor_nullifier(&common.secret, common.note_id, &common.nullifier)
+        },
+        conceded: 0,
+        valid_until: common.expiry,
     };
     let witness = WithdrawalWitnessData {
         secret: common.secret,
-        deposit_amount: common.deposit_amount,
-        expiry: common.expiry,
-        merkle_siblings: common.siblings,
+        current_balance: common.balance,
         final_blinding: common.blinding,
         current_anchor: common.anchor,
-        is_genesis: genesis,
+        prev_anchor: common.prev_anchor,
         state_signature: common.state_signature,
         clearance_signature,
     };
@@ -444,27 +443,29 @@ fn withdrawal_fixture(genesis: bool, mutual: bool) -> Result<WithdrawalFixture> 
             protocol_version: public.protocol_version,
             chain_id: public.chain_id,
             contract_address: field(public.contract_address),
-            active_root: field(public.active_root),
+            registration: field(public.registration),
             state_signing_key: point(public.state_signing_key_x, public.state_signing_key_y),
             clearance_signing_key: point(
                 public.clearance_signing_key_x,
                 public.clearance_signing_key_y,
             ),
             note_id: public.note_id,
+            deposit_amount: public.deposit_amount,
+            expiry: public.expiry_ts,
             final_balance: public.final_balance,
             destination: field(destination_felt),
             withdrawal_nullifier: field(public.withdrawal_nullifier),
             has_clearance: public.has_clearance,
-            withdrawal_tag: field(public.withdrawal_tag),
+            next_nullifier: field(public.next_nullifier),
+            conceded: public.conceded,
+            valid_until: public.valid_until,
         },
         witness: WithdrawalWitness {
             secret: field(witness.secret),
-            deposit_amount: witness.deposit_amount,
-            expiry: witness.expiry,
-            merkle_siblings: witness.merkle_siblings.map(field),
+            current_balance: witness.current_balance,
             final_blinding: scalar(witness.final_blinding),
             current_anchor: field(witness.current_anchor),
-            is_genesis: witness.is_genesis,
+            prev_anchor: field(witness.prev_anchor),
             state_signature: signature(witness.state_signature),
             clearance_signature: signature(witness.clearance_signature),
         },
@@ -490,6 +491,7 @@ struct CommonFixture {
     blinding: Felt252,
     commitment: zkapi_types::wire::CurvePointWire,
     anchor: Felt252,
+    prev_anchor: Felt252,
     nullifier: Felt252,
     state_key: zkapi_types::wire::CurvePointWire,
     clearance_key: zkapi_types::wire::CurvePointWire,
@@ -518,9 +520,9 @@ impl CommonFixture {
         let anchor = if genesis {
             Felt252::ONE
         } else {
-            Felt252::from_u64(12_345)
+            core::next_anchor(&core::nullifier(&secret, note_id, &Felt252::ONE))
         };
-        let nullifier = core::nullifier(&secret, &anchor);
+        let nullifier = core::nullifier(&secret, note_id, &anchor);
         let state_signer = CompactSigner::from_seed(&Felt252::from_u64(1));
         let clearance_signer = CompactSigner::from_seed(&Felt252::from_u64(2));
         let state_key = state_signer.public_key();
@@ -552,6 +554,7 @@ impl CommonFixture {
             blinding,
             commitment,
             anchor,
+            prev_anchor: if genesis { Felt252::ZERO } else { Felt252::ONE },
             nullifier,
             state_key,
             clearance_key,

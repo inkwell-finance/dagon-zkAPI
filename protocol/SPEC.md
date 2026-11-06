@@ -7,7 +7,7 @@ order, encodings, and constraints.
 ## Cryptographic parameters
 
 - Proof system: circuit-specific Groth16 on BN254.
-- Circuit revision: `zkapi-v2-note-bound-v1`.
+- Circuit revision: `zkapi-v2-concession-v1`.
 - Circuit field: BN254 scalar field, modulus
   `0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001`.
 - Hash: domain-separated Poseidon, exponent 5, rate 2, capacity 1,
@@ -29,9 +29,13 @@ proof and signature system.
 
 A registration commitment is `C = H_reg(secret, 0)`. The active leaf is
 `L = H_leaf(note_id, C, deposit_amount, expiry)`. The user keeps the secret,
-private balance and blinding, current anchor, and server signature locally.
-Genesis has balance equal to the deposit and anchor 1. A later spend proves a
-valid signature on the deployment-bound commitment and anchor.
+private balance and blinding, current anchor, previous anchor, and server
+signature locally. Genesis has balance equal to the deposit and anchor 1. The
+request nullifier is note-bound: `N = H(d_null, secret, note_id, anchor)`. The
+next anchor is derived, `anchor' = H(d_anchor, N)`, so the successor nullifier
+`N+ = H(d_null, secret, note_id, anchor')` is computable from `N` alone. A later
+spend proves a valid signature on the deployment-bound commitment and anchor and
+that the anchor equals the derived successor of the previous nullifier.
 
 Binding `L` into both request and withdrawal commitments prevents a signed
 state from being moved to a different membership note. Rerandomization changes
@@ -66,34 +70,41 @@ binds the nullifier to a private context derived from the exact client request
 ID and payload hash. Runtime validation binds the public deployment, keys,
 root, time, and charge bound to the configured service.
 
-The withdrawal statement contains these 14 field elements:
+The withdrawal statement contains these 16 field elements:
 
 1. protocol version
 2. chain ID
 3. vault address
-4. active root
+4. registration commitment
 5. state signing key x
 6. state signing key y
 7. clearance signing key x
 8. clearance signing key y
-9. note ID
+9. packed note fields `note_id * 2^192 + deposit_amount * 2^64 + expiry_ts`
 10. final balance
 11. destination address
 12. withdrawal nullifier
 13. has-clearance flag
-14. withdrawal tag
+14. next nullifier (`N+`; zero for mutual close)
+15. conceded amount
+16. valid-until timestamp
 
-The withdrawal proof establishes membership and the note-bound final state,
-reveals the final balance, and binds the nullifier to the destination, balance,
-and clearance mode. Mutual close additionally proves the clearance signature.
-The vault checks the deployment, pinned keys, current root, note status,
-nullifier use, and final balance before settlement.
+The withdrawal proof carries no Merkle path, active root or withdrawal tag.
+It recomputes the registration and the leaf from the range-checked note fields,
+binds the signed state commitment to that leaf, proves `state_balance =
+final + conceded` without wrap and `state_balance <= deposit`, and proves the
+note-bound nullifier chain. Mutual close additionally proves the clearance
+signature and requires `next_nullifier = 0` and `conceded = 0`. Escape reveals
+`N+ = successor_nullifier(secret, note_id, N)`. The vault checks the
+deployment, pinned keys, `validUntil`, note status and note fields against the
+stored leaf, nullifier states and amounts before settlement.
 
 ## Wire format and persistence
 
 [wire.rs](rust/crates/zkapi-types/src/wire.rs) defines the active HTTP schemas.
-`Groth16ProofWire` carries backend `groth16_bn254` and base64-encoded Arkworks
-canonical compressed proof bytes. Public inputs are part of the enclosing
+`Groth16ProofWire` carries backend `groth16_bn254` and a base64-encoded 256-byte
+proof: eight big-endian 32-byte BN254 coordinates (not compressed Arkworks
+bytes). Public inputs are part of the enclosing
 request and are verified directly. The Solidity adapter accepts the EVM proof
 encoding produced by the proof library.
 
@@ -113,13 +124,93 @@ The browser wallet receives storage and transport from its caller.
 must attach exactly `amount * 1 gwei`, have positive amount, and stay within
 `MAX_NATIVE_UNITS = 2^53 - 1`. The vault buckets expiry to daily boundaries.
 
-Mutual close removes the active leaf and pays the user's final balance to the
-chosen destination and the spent amount to the treasury. Escape initiation
-removes the leaf immediately and starts the configured challenge period. A
-valid archived request with the matching nullifier challenges the escape and
-restores the leaf; unrelated root updates do not invalidate that historical
-proof. An uncontested escape can be finalized after its deadline. Expired
-active notes can be claimed for the treasury.
+Treasury shares are pulled, not pushed: mutual close, finalize and `claimExpired`
+add the operator share (or the swept deposit) to `treasuryAccrued`, and the
+permissionless `withdrawTreasury()` sends the accrued total to the current
+treasury (`TreasuryWithdrawn`). A treasury that refuses ETH therefore cannot
+block any user payout; it only blocks its own withdrawal until the owner sets a
+working treasury.
+
+`finalizeEscapeWithdrawal` closes the note and accrues the operator share before
+it pushes the escape's final balance to its destination with
+`ESCAPE_PAYOUT_GAS` (100,000) and reverts when the caller supplies too little
+gas to forward that stipend (`InsufficientPayoutGas`). A destination that
+refuses ETH or needs more gas is credited to `escapePayoutCredits(destination)`
+(`EscapePayoutDeferred`); the permissionless `claimEscapePayout(destination)`
+pays it there with all gas (`EscapePayoutClaimed`) and keeps the credit if the
+transfer fails. An escape destination therefore cannot keep a note pending or
+lock the operator share.
+
+Mutual close pays the user's final balance to the chosen destination and the
+spent amount to the treasury, consumes the request nullifier, and marks the note
+`Closed`; the leaf stays in the tree until `retireClosedLeaf(noteId, siblings)`
+(permissionless, `Closed`-only) removes it. Exits never remove a leaf and never
+take a Merkle path or root, so a root-changing deposit cannot front-run them.
+
+Escape initiation (`initiateEscapeWithdrawal`) proves the exit statement for a
+leaf-bound state, consumes the state's nullifier `N` and its derived successor
+nullifier `N+`, records a pending withdrawal and starts the challenge period.
+The pending withdrawal pays `final = state_balance - conceded` to the
+destination, where the proof reveals the concession `c` and requires
+`final + c <= D`. `validUntil` bounds how long a prepared exit proof can be
+submitted.
+
+Challenge (the leaf stays in the tree; there is no second phase and no restore):
+
+- Defeat (`challengeEscapeWithdrawal(noteId, request, proof)`): a valid request
+  proof whose request nullifier equals the pending `N+` proves the user spent
+  past the escaped state. The pending payout is deleted, `N` becomes
+  `Challenged`, `N+` is released, the note returns to `Active`, and
+  `EscapeWithdrawalDefeated` is emitted. Defeat is root-independent.
+- Raise (`raiseEscapeConcession(noteId, request, proof, amount)`): a request
+  proof at the escaped nullifier `N` (the request that spent the escaped state)
+  raises the concession to `c' = min(amount, sb, state_balance)`, where `sb` is
+  the request's solvency bound; `c' > c` is required (`ConcessionNotRaised`).
+  The payout becomes `state_balance - c'` (`EscapeConcessionRaised`). The
+  deadline does not change and a later defeat is still possible.
+- Finalize (`finalizeEscapeWithdrawal(noteId)`) is permissionless after the
+  deadline; it pays the pending final balance to the destination (or credits
+  it, see Native ETH settlement) and the remainder of the deposit to the
+  treasury.
+
+After a defeat the note sets `claimableAfter` so an expiry sweep cannot occur
+before the user can exit again.
+
+Nullifier states: `0` unused or released, `1` consumed, `2` challenged
+(`nullifierState`; `usedNullifiers` is true for any non-zero state). An escape
+whose `N+` is `Challenged` reverts `SupersededState`; a consumed `N` or `N+`
+reverts `ReplayedNullifier`.
+
+Bounded pause: the owner can pause deposits and exits for at most
+`MAX_PAUSE_DURATION` (7 days). The pause lapses by itself, and a new pause needs
+`PAUSE_COOLDOWN` (1 day) after the previous one ended. Challenge, raise and
+finalize are never blocked. `claimExpired` reverts while the vault is
+effectively paused, and each note's `claimableAt` is extended by the paused time
+accumulated since its deposit. Expired notes are claimed for the treasury only
+through `claimExpired` after `claimableAt`.
+
+**Concession rule and guarantees.** An exit from state `S_k` releases a single
+bound `b_k` per state: the client never proves more than one request bound
+against the same state. The exit proves a concession `c`: in-flight value the
+operator may be owed. An honest client picks `c = 0` when no request is in
+flight and otherwise waits for settlement (or `expiry - 12h`) and concedes
+`b_k` or the reported charge. The guarantees are:
+
+- G1 (honest user): from the newest installed state `S_k`, the user is paid at
+  least `B_k - b_k` without operator cooperation, including when the operator
+  withholds the successor state, a depositor front-runs the exit, or the vault
+  is paused.
+- G2 (honest operator): total paid on a note is at most
+  `D - sum(owed(served requests))`. A user who spent `S_{k+1}` cannot be paid
+  from `S_k`: the request at `N+` defeats the escape, or the request at `N`
+  raises the concession to the owed amount.
+- G3 (privacy): requests stay unlinkable; new linkage appears only at exit, for
+  the exiting note, for its last request.
+
+A request proof proves authorization, not delivery. The server therefore signs
+the successor state only after the request nullifier is confirmed unused
+on-chain (settle-then-sign) and stores request evidence append-only so the
+challenger can defeat or raise a stale escape.
 
 ## Source ownership
 
@@ -133,7 +224,7 @@ active notes can be claimed for the treasury.
 
 ## Setup compatibility and verification
 
-The wire version is v2 and the circuit ID is `zkapi-v2-note-bound-v1`.
+The wire version is v2 and the circuit ID is `zkapi-v2-concession-v1`.
 Keys carry that circuit header. Setup files, Solidity verification keys, WASM,
 and SDK asset hashes must remain paired. The committed keys use a single-party
 setup with no multi-party ceremony. See [the setup README](setup/v2/README.md)

@@ -33,4 +33,21 @@ pub struct ClientConfig {
     /// Server signing keys pinned by the deployment contract/configuration.
     pub state_signing_key: CurvePointWire,
     pub clearance_signing_key: CurvePointWire,
+    /// The deployment's settlement window W (seconds): how long a request
+    /// may take to settle. Exit timing (C4, E3) depends on it.
+    pub settlement_window_seconds: u64,
+    /// E3's `unsettled_request_escape_after_seconds`; `None` is the default.
+    pub unsettled_request_escape_after_seconds: Option<u64>,
+}
+
+impl ClientConfig {
+    /// The solvency bound every request proof commits to: the policy cap when
+    /// policy enforcement is on, the request cap otherwise.
+    pub fn solvency_bound(&self) -> u128 {
+        if self.policy_enabled {
+            self.policy_charge_cap
+        } else {
+            self.request_charge_cap
+        }
+    }
 }

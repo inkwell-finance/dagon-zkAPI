@@ -101,16 +101,16 @@ The proof $\pi_{\text{req}}$ proves:
    - first request:
 
 $$
-x = H(s, 1)
+x = H(d_{\text{null}}, s, n, 1)
 $$
 
    - later request:
 
 $$
-x = H(s, \tau)
+x = H(d_{\text{null}}, s, n, \tau)
 $$
 
-   where $\tau$ is the previously issued state anchor.
+   where $n$ is the note ID (the nullifier is note-bound) and $\tau = H(d_{\text{anchor}}, x_{\text{prev}})$ is the anchor derived from the previous nullifier; the circuit enforces this chain.
 
 4. **State validity**  
    For non-genesis spends, the prover knows a valid server signature on the current state:
@@ -172,7 +172,7 @@ $$
 
 The server then:
 
-1. samples a fresh next anchor $\tau_{\text{new}}$;
+1. derives the next anchor $\tau_{\text{new}} = H(d_{\text{anchor}}, N)$ from the request nullifier $N$ (never random);
 2. computes the updated balance commitment $E(B_{\text{new}})$;
 3. signs the new state:
 
@@ -235,25 +235,15 @@ The user chooses a destination address $\text{Dest}$ and prepares:
 
 The proof shows:
 
-1. membership for the full note leaf $L$ derived from $C = H(s, 0)$;
+1. recomputation of the registration $C = H(s, 0)$ and of the full note leaf $L = H_{\text{leaf}}(n, C, D, e)$ from range-checked public note fields (no Merkle path and no root: the exit is bound to the leaf by its fields, which the vault compares with the stored note);
 2. knowledge of $s$;
-3. knowledge of the current state $(E(B_{\text{final}}), \tau_{\text{current}}, \sigma_{\text{current}})$;
-4. validity of $\sigma_{\text{current}}$ on $(E(B_{\text{final}}), \tau_{\text{current}})$;
-5. knowledge of the opening of $E(B_{\text{final}})$, thereby revealing $B_{\text{final}}$ as the final public balance;
-6. withdrawal authorization:
-   - if the user never spent before:
+3. knowledge of the current state $(E(B), \tau_{\text{current}}, \sigma_{\text{current}})$;
+4. validity of $\sigma_{\text{current}}$ on $(E(B), \tau_{\text{current}})$ bound to $L$;
+5. knowledge of the opening of $E(B)$, so $B$ is the state balance with $B = B_{\text{final}} + c$ (no wrap) and $B \leq D$;
+6. the note-bound nullifier $x_w = H(d_{\text{null}}, s, n, \tau_{\text{current}})$, with genesis iff $\tau = 1$ and the anchor chain $\tau = H(d_{\text{anchor}}, H(d_{\text{null}}, s, n, \tau_{\text{prev}}))$ for later states;
+7. for escape, the successor nullifier $N^+ = H(d_{\text{null}}, s, n, H(d_{\text{anchor}}, x_w))$; for mutual close, $N^+ = 0$ and $c = 0$.
 
-$$
-x_w = H(s, 1)
-$$
-
-   - otherwise:
-
-$$
-x_w = H(s, \tau_{\text{current}})
-$$
-
-The withdrawal tag also binds the nullifier to the destination, final balance, and clearance mode. The user then has two close-out paths.
+The anchor is derived, never random: $\tau_{k+1} = H(d_{\text{anchor}}, N_k)$. The withdrawal statement has 16 public inputs: protocol version, chain ID, vault address, registration, state key (x, y), clearance key (x, y), packed note fields $(n, D, e)$, $B_{\text{final}}$, destination, $x_w$, has-clearance, $N^+$, $c$, `valid_until`. There is no withdrawal tag. The user then has two close-out paths.
 
 ### Mutual Close (Instant Path)
 
@@ -281,36 +271,36 @@ The server learns no balance or routing data from this clearance request; it onl
 
 ### Escape Hatch (Fallback Path)
 
-If the server is offline or maliciously refuses to clear the withdrawal, the user submits the same payload without $\sigma_{\text{clear}}$:
+If the server is offline or maliciously refuses to clear the withdrawal, the user submits the same payload without $\sigma_{\text{clear}}$, plus the successor nullifier $N^+$, the concession $c$, and a `valid_until` timestamp:
 
 $$
-(B_{\text{final}}, \text{Dest}, x_w, \pi_{\text{wd}})
+(B_{\text{final}}, c, \text{Dest}, x_w, N^+, \text{valid\_until}, \pi_{\text{wd}})
 $$
 
-The contract verifies $\pi_{\text{wd}}$, removes the active note leaf immediately, and starts the configured challenge window (24 hours by default).
+The proof is leaf-bound and root-free: it carries no Merkle path and the vault does not check any root, so no deposit can invalidate it. The contract verifies $\pi_{\text{wd}}$ and `now <= valid_until`, checks the note fields against the stored note, consumes $x_w$ and $N^+$, records the pending withdrawal, and starts the configured challenge window (24 hours by default). The leaf stays in the tree.
 
-If the withdrawal is not challenged during that window, the contract settles the note exactly as in the mutual-close path.
+If the withdrawal is neither defeated nor raised during that window, anyone finalizes it and the contract settles the note as in the mutual-close path. Exits are blocked only while the vault is effectively paused; the pause is bounded to `MAX_PAUSE_DURATION` (7 days) with a `PAUSE_COOLDOWN` of 1 day, `claimExpired` is blocked while paused, and paused time extends each note's `claimableAt`. `retireClosedLeaf` (EVM) and `retire_closed_leaf` (Solana) are the permissionless, `Closed`-only calls that remove a closed leaf.
 
 ## Challenge Rule for Escape-Hatch Withdrawal
 
-This explicitly prevents the user from withdrawing using an **old** state that still reflects a higher balance.
+This prevents the user from withdrawing using an **old** state that still reflects a higher balance, without leaf removal, a second phase, or any root dependency.
 
-Suppose the user tries to withdraw with an old state:
+Suppose the user escapes from state $S_k$ with nullifier $N_k = H(d_{\text{null}}, s, n, \tau_k)$. The proof also reveals the derived successor nullifier $N_{k+1} = H(d_{\text{null}}, s, n, H(d_{\text{anchor}}, N_k))$, which is the request nullifier of $S_{k+1}$. If the user already spent $S_{k+1}$ in a request, the operator holds that request proof.
 
-$$
-(E(B_{\text{old}}), \tau_{\text{old}}, \sigma_{\text{old}})
-$$
+During the challenge window the escape can be answered in two ways:
 
-Then the withdrawal nullifier is:
+- **Defeat.** Anyone submits a valid request proof whose request nullifier equals the pending $N_{k+1}$. The pending payout is deleted, $N_k$ becomes `Challenged`, $N_{k+1}$ is released, the note stays `Active`, and the vault emits `EscapeWithdrawalDefeated`. Defeat needs no Merkle path and does not check the root, so a root-changing deposit cannot front-run it. There is no restore step: the leaf never left the tree.
+- **Raise.** A request proof at the escaped nullifier $N_k$ whose owed charge exceeds the proven concession $c$ raises it to $c' = \min(\text{amount}, sb, B)$ with $c' > c$. The pending payout becomes $B - c'$, the deadline is unchanged, a later defeat is still possible, and the vault emits `EscapeConcessionRaised`.
 
-$$
-x_w = H(s, \tau_{\text{old}})
-$$
+After the deadline, `finalizeEscapeWithdrawal` is permissionless and pays the pending final balance to the destination and the rest of the deposit to the treasury. On EVM the payout push carries `ESCAPE_PAYOUT_GAS`; a destination that refuses it is credited instead (`claimEscapePayout`), so it can neither keep the note pending nor lock the operator share.
 
-But if that old state was already consumed by a later accepted request, then the server already has a valid prior transcript using the same nullifier.
+**Concession rule and guarantees.** The escape statement reveals a concession $c$ (the in-flight amount the user concedes) with $B = B_{\text{final}} + c$ and $B \leq D$. The client releases at most one bound $b_k$ per state. With that rule:
 
-During the escape-hatch challenge window, the server can submit that prior accepted transcript.  
-The contract then rejects the stale withdrawal.
+- **G1 (honest user).** For the newest installed state $S_k$, the user is paid at least $B_k - b_k$ with no operator cooperation. An operator that withholds the successor state, a depositor that front-runs the exit, or a pause cannot take the unspent balance.
+- **G2 (honest operator).** Total paid out on a note is at most $D - \sum \text{owed}(\text{served requests})$. A user who received and spent $S_{k+1}$ cannot be paid from $S_k$: the evidence defeats the escape or raises the concession to what is owed.
+- **G3 (privacy).** Requests remain unlinkable. New linkage appears only at exit, only for the exiting note, and only for its last request.
+
+The request proof establishes authorization, not delivery of the successor state, so the server signs the successor only after the request nullifier is confirmed unused on-chain (settle-then-sign), and keeps request evidence in an append-only table for the challenger.
 
 This is the clean replacement for RLN-style secret-recovery slashing in the simplified design.
 
@@ -328,17 +318,17 @@ $$
 \text{payout to server} = D - B_{\text{final}}
 $$
 
-and closes the note / removes the commitment.
+and closes the note (the leaf is later removed by `retireClosedLeaf`).
 
 This means the server is paid for the user's entire lifetime of API usage in one aggregated settlement transaction, including any optional policy deductions reflected in the final private balance.
 
 To handle abandoned accounts, each note carries the expiry time $T_{\text{exp}}$. If the note is still open and no withdrawal is in progress when it expires, the server may call:
 
 $$
-\text{claimExpired}(\text{noteId}, \text{siblings})
+\text{claimExpired}(\text{noteId})
 $$
 
-The contract then closes the note and transfers the full deposit $D$ to the server treasury $A_{\text{srv}}$.
+The contract then closes the note and transfers the full deposit $D$ to the server treasury $A_{\text{srv}}$. `claimExpired` needs no Merkle path, is blocked while the vault is effectively paused, and is only allowed after the note's `claimableAt`, which includes accumulated paused time and the post-defeat `claimableAfter`.
 
 This guarantees that the server is eventually paid even if the user disappears without withdrawing. An implementation may additionally offer a separate rollover / renewal transaction that extends $T_{\text{exp}}$, but that mechanism is orthogonal to the accounting model described here.
 
@@ -350,7 +340,7 @@ This is important because it prevents the server from trivially correlating requ
 
 In the mutual-close path, the server sees only the withdrawal nullifier $x_w$. The final balance and destination address are revealed only to the contract when the user actually closes the note.
 
-If additional hardening is desired, the next anchor $\tau_{\text{new}}$ can be derived from both server randomness and user-contributed randomness. However, this is best treated as an implementation refinement rather than part of the core protocol.
+The next anchor is derived from the request nullifier, $\tau_{\text{new}} = H(d_{\text{anchor}}, N)$, so the client and the vault can compute the successor nullifier without any server-supplied value. Server randomness stays only in the blinding delta.
 
 ## Extensions
 

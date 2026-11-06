@@ -50,6 +50,11 @@ impl Felt252 {
         if s.len() > 64 {
             return Err("hex string too long for felt252".to_string());
         }
+        // Byte slicing below requires ASCII, and `from_str_radix` would
+        // otherwise accept a sign character inside a digit pair.
+        if !s.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("invalid hex: expected only hexadecimal digits".to_string());
+        }
         let padded = format!("{:0>64}", s);
         let mut bytes = [0u8; 32];
         for i in 0..32 {
@@ -198,5 +203,14 @@ mod tests {
             }
         }
         assert!(Felt252::try_from_bytes_be(prime_plus_one).is_err());
+    }
+
+    #[test]
+    fn test_rejects_signs_and_non_ascii_without_panicking() {
+        for input in ["0x+1", "+1", "0x-1", "0xé", "0x1é1", "0x 1"] {
+            assert!(Felt252::from_hex(input).is_err(), "{input:?}");
+        }
+        assert!(serde_json::from_str::<Felt252>("\"0xéé\"").is_err());
+        assert_eq!(Felt252::from_hex("0x0001").unwrap(), Felt252::from_u64(1));
     }
 }

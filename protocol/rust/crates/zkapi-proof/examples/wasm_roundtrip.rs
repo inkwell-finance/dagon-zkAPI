@@ -34,7 +34,7 @@ fn main() -> Result<()> {
         "deposit": { "secret": secret, "note_id": 0, "amount": 1000000, "expiry_ts": expiry },
         "request": { "payload": "browser artifact test", "active_root": root, "merkle_siblings": siblings,
             "client_request_id": "wasm-roundtrip", "request_time": 2000000000u64, "created_at_ms": 2000000000000u64 },
-        "withdrawal": { "mode": "escape", "destination": "0x1111111111111111111111111111111111111111", "active_root": root, "merkle_siblings": siblings }
+        "withdrawal": { "mode": "escape", "destination": "0x1111111111111111111111111111111111111111", "conceded": 0, "valid_until": 1900000000u64 }
     });
     let mut child = Command::new("node")
         .args(&args[1..])

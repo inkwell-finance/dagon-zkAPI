@@ -26,4 +26,23 @@ pub enum ClientError {
     ProofGeneration(String),
     #[error("verification failed: {0}")]
     VerificationFailed(String),
+    /// S3, S4 or S5 failed on a correctly signed successor: it is treated
+    /// exactly like a withheld successor.
+    #[error("invalid_successor: {0}")]
+    InvalidSuccessor(String),
+    /// C2: a request proof at this state already used another bound.
+    #[error("bound_fixed_at_state: request proofs at this state use the bound {bound}; refusing {requested}")]
+    BoundFixedAtState { bound: u128, requested: u128 },
+    /// A signed state without its predecessor's anchor cannot prove.
+    #[error("prev_anchor_missing: this signed state was saved without its predecessor's anchor")]
+    PrevAnchorMissing,
+    /// C4: the note is too close to expiry for a new request to settle.
+    #[error("note_near_expiry: a new request could not settle before the exit deadline")]
+    NoteNearExpiry,
+    /// C3: an exit lock freezes the wallet.
+    #[error("exit_locked: {0}")]
+    ExitLocked(String),
+    /// An escape may concede at most the state's bound.
+    #[error("conceded_exceeds_bound: conceded {conceded} exceeds the state's bound {bound}")]
+    ConcededExceedsBound { conceded: u128, bound: u128 },
 }

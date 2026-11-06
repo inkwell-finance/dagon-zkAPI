@@ -9,15 +9,20 @@ pub mod inputs;
 pub mod note;
 pub mod serialization;
 pub mod signature;
+pub mod solana;
 pub mod wire;
 
 pub use felt::Felt252;
 pub use inputs::{
-    canonical_payload_hash, canonical_request_context, canonical_response_hash,
+    canonical_payload_hash, canonical_request_context, canonical_response_hash, pack_note_fields,
     RequestPublicInputsV2, WithdrawalPublicInputsV2,
 };
 pub use note::NullifierStatus;
 pub use signature::SchnorrSignature;
+pub use solana::{
+    solana_chain_id, solana_deployment_binding, solana_destination_binding,
+    solana_destination_matches, SolanaMerkleTransitionInputs,
+};
 
 /// Protocol version for the compact BN254 proof protocol.
 pub const PROTOCOL_VERSION: u16 = 2;
