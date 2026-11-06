@@ -1,6 +1,6 @@
 ---
 title: API Reference
-description: Browser SDK, v2 server, indexer, and native ETH vault
+description: Browser SDK, v2 server, finalized indexer, and native-SOL vault
 ---
 
 The browser SDK builds proofs and owns wallet recovery. Its package exports and
@@ -9,7 +9,7 @@ integration contract are documented in `sdk/README.md` in the repository.
 <Cards>
   <Card title="serverd" description="v2 requests, OpenRouter leases, recovery, and withdrawal clearance." href="/docs/api-reference/serverd" />
   <Card title="indexer" description="Current roots, note snapshots, and depth-32 Merkle paths." href="/docs/api-reference/indexer" />
-  <Card title="ZkApiVault" description="Native ETH deposits, mutual close, escapes, and challenges." href="/docs/api-reference/vault" />
+  <Card title="Dagon Solana vault" description="Native-SOL deposits, Groth16 closes, escapes, challenges and expiry." href="/docs/api-reference/vault" />
 </Cards>
 
 ```text
@@ -19,7 +19,7 @@ Browser SDK -> WASM prover -> server -> usage settlement and signed next state
   indexer                 SQLite transcripts
      |
      v
-Native ETH vault <-------- challenge service
+Anchor SOL vault <-------- challenge service
 ```
 
 `protocol/rust/crates/zkapi-types/src/wire.rs` defines the protocol's JSON
@@ -28,12 +28,14 @@ messages. Runtime handlers in `crates/zkapi-serverd/src/routes.rs` and
 
 ## Proof and field encoding
 
-The active circuit revision is `zkapi-v2-note-bound-v1`, using the v2 JSON
+The active circuit revision is `zkapi-v2-concession-v1`, using the v2 JSON
 shapes and public-input order. The proving/verifying keys and vault's Groth16
 adapter must match that circuit and setup. Pin the circuit ID, artifact hashes,
-vault address, and server signing keys for the configured deployment.
+Solana program/vault/genesis identity, Pyth source, and server signing keys for
+the configured deployment.
 
-Field values use `0x`-prefixed hexadecimal strings. The Rust type
+BN254 field values use `0x`-prefixed hexadecimal strings. Solana-derived `u64`
+chain IDs use canonical decimal strings so JavaScript never rounds them. The Rust type
 `Felt252` carries BN254 scalar-field values; it does not select the
 Stark field. Curve points use `{ x, y }` and Schnorr signatures use
 `{ r_x, r_y, s }`.

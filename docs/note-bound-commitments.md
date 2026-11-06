@@ -9,7 +9,8 @@ C = balance * G + blinding * H + L * J
 ```
 
 Both request and withdrawal circuits compute `L` from the exact private values
-used by the Merkle-membership proof. They use that same `L` to open the signed
+(the request circuit also proves Merkle membership; the withdrawal circuit is
+root-free and binds `L` through the public note fields). They use that same `L` to open the signed
 commitment. `J` is independently derived with Keccak try-and-increment from
 `zkapi.v2.note-binding.generator.v1`, choosing even y and clearing the cofactor.
 No known scalar relation to `G` or `H` is introduced. The full canonical BN254
@@ -29,7 +30,7 @@ assumptions. Groth16/BN254 and Baby-JubJub are not post-quantum.
 
 ## Compatibility and setup
 
-The circuit identifier is `zkapi-v2-note-bound-v1`. Proving and verifying key
+The circuit identifier is `zkapi-v2-concession-v1`. Proving and verifying key
 files carry that header; loaders reject files without the expected circuit header
 before decoding. Public deployment manifests must advertise
 `proof_setup.circuit_id`, and clients must
@@ -50,9 +51,10 @@ recovery journals are bound to that configuration. See
 
 ## Challenge and settlement requirements
 
-Operate `zkapi-challenged` alongside the server and indexer, with durable retries
-and an explicit restricted signer. Challenges preserve the historical request
-root and use a current restoration path. See
+Operate `dagon-zkapi-challenged` alongside the server and indexer, with durable retries
+and an explicit restricted signer. Defeat and raise preserve the historical request
+root and need no Merkle path; there is no restore step. The concession rule
+(G1/G2/G3), challenger policy and bounded pause are in
 [service operation](challenge-service.md).
 
 Direct OpenRouter retirement persists disable, grace, usage capture and

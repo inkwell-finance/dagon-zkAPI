@@ -1,98 +1,115 @@
-# zkAPI
+# Dagon zkAPI
 
-zkAPI lets you pay for AI and other APIs with ETH and make unlinkable requests.
-It keeps API usage separate from your on-chain deposit: the service can verify
-that you can pay without learning which deposit is yours.
+Dagon zkAPI is a Solana-first private payment layer for AI and other APIs. A
+browser wallet deposits native SOL, proves authorization with Groth16, pays only
+for completed usage, and withdraws the remaining balance without linking API
+requests to the on-chain deposit.
 
-Built by Open Anonymity in collaboration with the Ethereum Foundation, zkAPI
-uses zero-knowledge proofs to make this possible. Deposit ETH, pay only for what
-you use, and withdraw your remaining balance on-chain.
+This repository ports the upstream Ethereum zkAPI protocol to Solana while
+preserving its request and proof model. Solana is the production-default ledger;
+the former EVM implementation remains available only as an explicit compatibility
+backend.
 
-Live web app: [**chat.openanonymity.ai**](https://chat.openanonymity.ai/) —
-try zkAPI in OA Chat by choosing the Ethereum wallet option.
+The implementation release gates, including a fresh SBF build and complete
+local-validator money lifecycle, are recorded in
+[the port status](docs/PORTING_STATUS.md). This repository is not itself a live
+deployment: do not treat checked-in program IDs, example identities, test
+fixtures, development setup keys, or generated artifacts as production pins.
 
-Documentation: [**zkapi.openanonymity.ai**](https://zkapi.openanonymity.ai/).
+## Security and architecture
 
-The protocol is experimental; see
-[the note-binding review](docs/note-bound-commitments.md).
+- Groth16 over BN254 remains the trusted authorization path.
+- The Anchor vault settles native SOL and verifies request/withdrawal proofs with
+  Solana BN254 syscalls.
+- A chain-neutral `CreditLedger` boundary isolates the request/server protocol
+  from ledger transport.
+- The browser uses exact decimal strings for Solana-derived `u64` chain IDs and a
+  durable, signed-transaction journal for multi-stage wallet operations.
+- Server startup verifies the pinned cluster, immutable program deployment,
+  vault-state PDA, finalized vault metadata, and Pyth SOL/USD source before
+  opening durable state.
+- Encrypt/FHE is intentionally absent from the default dependency graph and the
+  trusted money path. A future experimental ledger may implement `CreditLedger`
+  without changing the request API or vault semantics.
 
-## Local OpenAI-compatible API
-
-Use [zkapi-clientd](zkapi-clientd/README.md) to configure an ETH wallet and serve
-inference to Open WebUI or another local OpenAI-compatible client.
+The selected authorization circuit is `zkapi-v2-concession-v1`. The
+Solana-only root transition uses the separate
+`dagon-zkapi-solana-transition-v1` circuit. Both checked-in setups are
+single-party ceremonies and must be replaced or accepted explicitly for a real
+deployment. See [note-bound commitments](docs/note-bound-commitments.md),
+[transition setup provenance](protocol/setup/solana-transition-v1/README.md),
+and [Solana server invariants](docs/SOLANA_SERVER.md).
 
 ## Build and test
+
+Prerequisites include Node 24+, Rust, Solana CLI and Anchor 0.32.1. From the
+repository root:
 
 ```sh
 npm ci
 npm test
-npm run build:browser
-npm run build:mainnet
 npm run verify:assets
-cargo build --release --workspace
-cargo test --release --workspace
-cargo test --release --manifest-path protocol/rust/Cargo.toml --workspace
-(cd protocol/contracts && forge test)
+npm run verify:solana-vk
+cargo test --locked --workspace
+cargo test --locked --manifest-path protocol/rust/Cargo.toml --workspace
+anchor build --manifest-path solana/Anchor.toml
 ```
 
-The protocol and required Solidity libraries are ordinary files in this repository.
-No submodule initialization, Cairo compiler or STARK prover is needed. See
-[source provenance](protocol/VENDORED.md).
+The final local-validator lifecycle is a release gate and is not implied by the
+unit suites above. Current verified coverage and known environment constraints
+are recorded in [docs/PORTING_STATUS.md](docs/PORTING_STATUS.md).
 
 ## Browser SDK
 
-`@openanonymity/zkapi-browser-sdk` owns native ETH funding, wallet persistence,
-proof generation, lease recovery, settlement and withdrawals. Mainnet and Sepolia
-have independent deployment pins, signing keys and wallet state. Applications
-configure the SDK before initializing a wallet; see [SDK integration](sdk/README.md)
-and [native billing](docs/native-eth-billing.md).
+The package identity is `@dagon/zkapi-browser-sdk`. Its public modules include
+the runtime/store/client APIs plus Solana ledger identity, native-SOL billing,
+Wallet Standard transport, and the crash-safe operation journal.
 
-The packaged WASM and proving keys support the current circuit
-`zkapi-v2-note-bound-v1`. Ordinary SDK consumers do not need Rust. To rebuild
-WASM deliberately, use `scripts/build-browser-client.sh` and review the changed
-artifact hashes.
+```js
+import { BrowserWalletRuntime } from '@dagon/zkapi-browser-sdk/runtime';
+import { SolanaOperationJournal } from '@dagon/zkapi-browser-sdk/solana-journal';
+```
 
-## Full local lifecycle acceptance
-
-Run `npm run test:e2e:v2` to build and test deposit, HTTP lease issuance, mocked
-provider usage, signed settlement, real-proof stale withdrawal/challenge and
-honest withdrawal on a fresh local chain. The provider and oracle are mocked;
-protocol services, wallet proofs and contracts are real. See the
-[acceptance process and coverage limits](docs/v2-acceptance.md).
+Applications must pin the server URL, RPC cluster identity, immutable program,
+vault-state PDA, genesis hash, Pyth source, setup hashes and Wallet Standard
+account. See [SDK integration](sdk/README.md) and the native-SOL tests under
+`sdk/test/`.
 
 ## Operator services
 
-- `zkapi serverd`: native ETH lease authorization, settlement and Schnorr signing.
-- `zkapi-indexerd` / `zkapi indexer`: vault event indexing and Merkle paths.
-- `zkapi-challenged`: durable escape monitoring and challenge submission.
-- `zkapi signing-keys`: derive deployment public keys from operator seeds.
-- `zkapi setup --output-dir NEW_DIRECTORY`: generate a fresh single-party Groth16 setup.
+The shipped executable names are Dagon-branded:
 
-Native server startup requires a pinned oracle RPC/feed and a lease issuer.
-Use [deployment instructions](docs/deployment.md), [Docker operation](docker/aws/README.md)
-and [challenge service operation](docs/challenge-service.md). The browser sends
-prompts directly to the inference provider; the server handles authorization
-and settlement.
+- `dagon-zkapi serverd` runs proof authorization, lease settlement and prepared
+  Solana ledger operations.
+- `dagon-zkapi indexer` or `dagon-zkapi-indexerd` reconstructs finalized Merkle
+  snapshots.
+- `dagon-zkapi-challenged` monitors and challenges stale escape withdrawals.
+- `dagon-zkapi signing-keys` derives the state and clearance public keys.
+- `dagon-zkapi setup --output-dir NEW_DIRECTORY` creates a fresh Groth16 setup;
+  it is not needed to connect to an existing deployment.
 
-The keys in `protocol/setup/v2` must match the vault's immutable verifier and
-the client's pinned proof artifacts. The `setup` command generates new keys; it
-is not part of connecting a client to the configured vault.
+All three ledger-facing services default to Solana. Select `--ledger evm` (or
+`--ledger ethereum` for the indexer) only for the compatibility backend.
 
-## Protocol details
-
-The active protocol uses Groth16 over BN254, Poseidon, note-bound Baby-JubJub
-commitments and Schnorr signatures, and a 32-level Merkle tree. The ledger uses
-integer gwei, and the protocol relies on a single-party setup.
+For containers, copy the public and secret examples in `docker/aws/`, replace
+every placeholder, keep secret files mode `0600`, and run the
+`dagon-zkapi-run` entrypoint through `docker/aws/compose.yml`. The default
+deployment example is Solana; `deployment.evm.env.example` is explicitly legacy.
 
 ## Source layout
 
 | Directory | Purpose |
 | --- | --- |
-| `zkapi-clientd/` | Local ETH-funded OpenAI-compatible client and installer |
-| `sdk/` | Browser native ETH wallet, public artifacts and SDK tests |
-| `protocol/rust/` | Shared v2 types, BN254 helpers, circuits and Rust/WASM wallets |
-| `protocol/contracts/` | Native ETH vault, Groth16 verifier and contract tests |
-| `protocol/setup/v2/` | Selected circuit setup and verifier artifacts |
-| `crates/` | Operator CLI, server, indexer and challenger |
-| `demo/contracts/` | Native ETH verifier/vault deployment script |
-| `docker/aws/` | API/indexer/challenger image configuration and restricted signer |
+| `solana/` | Anchor native-SOL vault and generated Groth16 verifier constants |
+| `crates/dagon-zkapi-ledger/` | Generic `CreditLedger` contract and shared operation types |
+| `crates/dagon-zkapi-solana-ledger/` | Solana RPC, account validation and operation preparation adapter |
+| `crates/zkapi-serverd/` | Protocol server and Solana-default challenge service |
+| `crates/zkapi-indexerd/` | Privacy-safe finalized Solana/EVM tree indexer |
+| `sdk/` | Browser SDK, Wallet Standard transport, durable journals and tests |
+| `protocol/rust/` | Shared v2 types, circuits, proof code and browser WASM |
+| `protocol/setup/v2/` | Selected proof setup and immutable artifact manifest |
+| `protocol/contracts/` | Legacy EVM compatibility vault and verifier |
+| `docker/aws/` | Solana-default operator image and explicit EVM compatibility config |
+
+The original upstream protocol provenance remains documented in
+[protocol/VENDORED.md](protocol/VENDORED.md).

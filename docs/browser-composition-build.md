@@ -1,6 +1,6 @@
-# Browser SDK ownership
+# Dagon browser SDK ownership
 
-Host applications consume `@openanonymity/zkapi-browser-sdk` as an immutable
+Host applications consume `@dagon/zkapi-browser-sdk` as an immutable
 dependency and own their UI, payment-mode runtime, routing, and deployments.
 
 This repository builds the SDK and local client independently of host applications.

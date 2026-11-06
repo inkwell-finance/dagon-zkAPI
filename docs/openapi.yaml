@@ -1,9 +1,10 @@
 openapi: 3.1.0
 info:
-  title: zkAPI v2
+  title: Dagon zkAPI v2
   version: 2.0.0-testnet
   description: >-
-    Native ETH lease, settlement and withdrawal Groth16 protocol API.
+    Solana-default native-SOL lease, settlement, prepared-operation and
+    withdrawal Groth16 protocol API. Native ETH is explicit compatibility mode.
     Sepolia deployments may require a shared password, advertised by public
     /health testnet_password_required. All service routes then require the
     TestnetPassword header and return 401 testnet_password_required when absent
@@ -35,9 +36,29 @@ paths:
         "401": {$ref: "#/components/responses/TestnetPasswordRequired"}
   /v2/billing/quote:
     get:
-      summary: Read the pinned finalized native ETH billing quote
+      summary: Read the pinned finalized ledger billing quote
       responses:
-        "200": {description: Native gwei quote with chain, feed and round binding}
+        "200": {description: Native SOL/Pyth quote with exact deployment binding, or explicit EVM compatibility quote}
+  /v2/ledger/deposits/prepare:
+    post:
+      summary: Prepare ordered Solana deposit messages for Wallet Standard signing
+      responses:
+        "200": {description: Deployment-bound prepared operation and exact legacy messages}
+  /v2/ledger/withdrawals/prepare:
+    post:
+      summary: Prepare an ordered Solana mutual-close operation
+      responses:
+        "200": {description: Deployment-bound prepared operation and exact legacy messages}
+  /v2/ledger/escapes/prepare:
+    post:
+      summary: Prepare an ordered Solana escape initiation
+      responses:
+        "200": {description: Deployment-bound prepared operation and exact legacy messages}
+  /v2/ledger/escapes/finalize/prepare:
+    post:
+      summary: Prepare Solana escape finalization
+      responses:
+        "200": {description: Deployment-bound prepared operation and exact legacy messages}
   /v2/openrouter/leases:
     post:
       summary: Open a prompt-private, spending-limited OpenRouter lease

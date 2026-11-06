@@ -1,77 +1,63 @@
 ---
-title: Introduction
-description: Anonymous prepaid API usage with note-bound zero-knowledge proofs
+title: Dagon zkAPI
+description: Private native-SOL API payments with note-bound Groth16 proofs
 ---
 
-zkAPI lets users fund a private note with native ETH, then authorize off-chain
-API usage with proofs generated in the browser. Each authorization consumes a
-state nullifier; after usage settles, the server signs the next private balance
-and anchor.
+Dagon zkAPI lets a user fund a private note with native SOL and authorize API
+usage with Groth16 proofs generated in the browser. Each accepted authorization
+consumes a nullifier; after usage settles, the server signs the next private
+balance and anchor.
 
-These docs describe **protocol v2**, circuit revision
-`zkapi-v2-note-bound-v1`: Groth16 over BN254, Poseidon hashes, and Baby-JubJub
-commitments with Schnorr signatures.
+The production-default ledger is the immutable Solana Anchor vault. The original
+EVM/native-ETH path remains only as an explicit compatibility backend. Encrypt
+and other FHE systems are outside the trusted money path.
+
+These docs cover protocol v2 and circuit `zkapi-v2-concession-v1`: Groth16 over
+BN254, Poseidon, note-bound Baby-JubJub commitments, and Schnorr signatures.
+
+<Callout type="warn" title="Deployment prerequisites">
+The implementation's fresh SBF build and complete funded local-validator
+lifecycle pass. A funded production rollout still requires an explicit setup
+trust decision plus review of the exact immutable program, vault and live Pyth
+accounts selected by the operator.
+</Callout>
 
 ## What you get
 
 <Cards>
-  <Card
-    title="Browser wallet"
-    description="The SDK owns local proofs, private state, runtime-key leases, and withdrawal recovery."
-    href="/docs/architecture"
-  />
-  <Card
-    title="Private request authorization"
-    description="Prove membership and solvency without revealing which deposited note authorized the request."
-    href="/docs/protocol"
-  />
-  <Card
-    title="Net-settled refunds"
-    description="Unused funds stay in the private balance and settle on-chain at withdrawal."
-    href="/docs/protocol#refunds"
-  />
-  <Card
-    title="Note-bound cryptography"
-    description="Signed balances bind to the funded note, with explicit circuit and setup compatibility requirements."
-    href="/docs/cryptography"
-  />
+  <Card title="Browser wallet" description="Wallet Standard signing, local proofs, durable stage journals, leases and withdrawal recovery." href="/docs/architecture" />
+  <Card title="Private authorization" description="Prove membership and solvency without disclosing the funded note." href="/docs/protocol" />
+  <Card title="Native-SOL settlement" description="An Anchor vault verifies withdrawals and keeps only public note/account state." href="/docs/api-reference/vault" />
+  <Card title="Ledger isolation" description="A generic CreditLedger boundary keeps request semantics independent of chain transport." href="/docs/architecture" />
 </Cards>
 
-## How the pieces fit
+## Components
 
-**The wallet** keeps the secret, note metadata, balance, blinding, anchor, and
-server signature locally. It proves active membership and sufficient funds,
-then sends a nullifier, a rerandomized note-bound commitment, an authorization
-tag, and a Groth16 proof. The browser SDK runs the prover in WASM, using the
-same cryptographic libraries as the native Rust wallet library.
+**The browser SDK** keeps note secrets, signed private state and recovery
+journals locally. It verifies exact deployment pins, generates proofs in WASM,
+and submits prepared Solana stages through Wallet Standard.
 
-**`serverd`** verifies proofs, checks the deployment and active root, rejects
-conflicting nullifier reuse, and signs balance updates with its Schnorr key.
-It issues short-lived OpenRouter keys against proof-bound native ETH billing
-quotes and settles their measured usage. Prompts and responses pass directly
-between the client and OpenRouter.
+**`dagon-zkapi serverd`** verifies proof authorizations, rejects nullifier
+reuse, issues short-lived provider credentials and settles measured usage using
+a pinned finalized Pyth SOL/USD quote.
 
-**The vault, indexer, and challenge service** maintain the active note tree,
-verify withdrawals on-chain, and challenge escape withdrawals from states
-that already authorized usage.
+**The Anchor vault, finalized indexer and challenger** maintain the active note
+tree, verify on-chain Groth16 withdrawals, and challenge escape withdrawals
+from a state that already authorized usage.
 
-## Privacy and deployment assumptions
+## Trust and privacy boundaries
 
-Request proofs hide the note ID, deposit, exact balance, expiry, anchor, and
-state signature. They do not hide information outside the proof: deposits and
-withdrawals are public, network and timing metadata remain observable, and
-the upstream provider sees prompts. Direct leases keep prompts out of the
-billing authorization.
+Proofs hide note ID, deposit, balance, expiry, anchor and state signature.
+Deposits, withdrawals, network metadata and timing remain public, and the API
+provider sees prompts. The checked-in setup is single-party; artifact hashes
+identify it but do not provide multiparty-ceremony security.
 
-The current Groth16 and Baby-JubJub construction is not post-quantum. The
-checked-in proving keys use a single-party setup with no multiparty ceremony;
-artifact hashes establish identity, not setup security. See
-[Cryptography](/docs/cryptography) for setup trust and compatibility requirements.
-
-## Next steps
+The current construction is not post-quantum. A future experimental FHE ledger
+may implement `CreditLedger`, but it must not change request/vault semantics or
+enter the production money path without a separate readiness review.
 
 <Cards>
   <Card title="Getting started" href="/docs/getting-started" />
-  <Card title="Protocol overview" href="/docs/protocol" />
+  <Card title="Protocol" href="/docs/protocol" />
   <Card title="API reference" href="/docs/api-reference" />
 </Cards>

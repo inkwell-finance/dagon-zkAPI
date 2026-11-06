@@ -1,21 +1,36 @@
 ---
 title: serverd
-description: Note-bound proof authorization, native ETH billing, leases, and recovery
+description: Note-bound proof authorization, native-SOL billing, prepared operations, and recovery
 ---
 
 The server verifies Groth16-authorized direct OpenRouter leases, reserves
 nullifiers durably, and returns Schnorr-signed state transitions after usage
-settlement. Billing uses native ETH units of one gwei.
+settlement. The Solana backend uses one lamport per protocol credit and a pinned
+finalized Pyth SOL/USD quote.
 
 ## Authorize a direct lease
 
 | Method and path | Purpose |
 |---|---|
-| `GET /v2/billing/quote` | Obtain the native ETH billing quote |
+| `GET /v2/billing/quote` | Obtain the finalized native-SOL billing quote |
 | `POST /v2/openrouter/leases` | Verify an `ApiRequestV2`, reserve its nullifier, and return a spending-limited runtime key (201) |
 | `GET /v2/openrouter/leases/{client_request_id}` | Return non-secret lease timing, usage, and status |
 | `POST /v2/openrouter/leases/{client_request_id}` | Retire the lease using the original authenticated request |
 | `POST /v2/openrouter/leases/{client_request_id}/expire` | Reconcile an unaccepted native lease authorization |
+
+## Prepare Solana wallet operations
+
+| Method and path | Purpose |
+|---|---|
+| `POST /v2/ledger/deposits/prepare` | Prepare the ordered staged deposit messages |
+| `POST /v2/ledger/withdrawals/prepare` | Prepare a mutual-close withdrawal |
+| `POST /v2/ledger/escapes/prepare` | Prepare escape initiation |
+| `POST /v2/ledger/escapes/finalize/prepare` | Prepare escape finalization |
+
+Each response repeats the exact backend, network, decimal-string chain ID,
+deployment binding, program and vault identity. The browser verifies that
+identity and every prepared legacy message before Wallet Standard signs it.
+The server never signs or broadcasts the user's transaction.
 
 The authorization request has this shape:
 
@@ -62,7 +77,10 @@ directly; no public-output hash or witness envelope is part of the proof object.
 
 Both return `RecoveryResponseV2` with `status`, `nullifier_status`, and an
 optional `request_response`. Nullifier statuses are `reserved`, `finalized`,
-`clearance_reserved`, or `unknown`. Unknown requests return
+`clearance_reserved`, `exit_deferred`, `exited_unsigned`, or `unknown`. A
+settled-but-unsigned request reads `reserved`. Once the nullifier is used on
+chain, `request_response` is omitted (status only). Lease status reports
+`exit_deferred` / `exited_unsigned` for such leases. Unknown requests return
 `status: "not_found"` without a transcript.
 
 After usage settlement, `request_response` contains:

@@ -1,104 +1,157 @@
 ---
-title: ZkApiVault
-description: Native ETH settlement with note-bound Groth16 verification
+title: Dagon Solana Vault
+description: Native-SOL settlement with staged operations and on-chain Groth16 verification
 ---
 
-The wallet calls `ZkApiVault` for native ETH deposits and withdrawals. It
-accounts in whole gwei, with maximum amount `2^53 - 1`. The v2 vault pins
-its Groth16 proof adapter, state-signing key, and clearance-signing key as
-immutable constructor parameters. It has no XMSS root-rotation API.
+`dagon_zkapi_vault` is an Anchor program that escrows native SOL, maintains the
+depth-32 note root, verifies request/withdrawal Groth16 proofs through Solana
+BN254 syscalls, and settles mutual or escape withdrawals. One protocol credit
+equals one lamport.
+
+The production program must be executable and permanently immutable. The vault
+PDA stores the cluster genesis hash, derived chain ID/deployment binding,
+treasury, request cap, signer keys, note/challenge policy, total credits and
+current root. Server and browser startup pin and recheck those values.
+
+## Staged operations
+
+Only deposits use staged operations: the deposit proof payload can exceed one
+transaction, so it uses an operation PDA. Escape, close, challenge (defeat),
+raise, finalize, expiry claim and leaf retirement are direct transactions
+(operation kind 4 is retired/reserved):
+
+1. `initialize_operation` records owner, kind, exact payload length/digest and
+   bounded expiry slot.
+2. `write_operation` accepts at most 800 bytes at the exact next offset.
+3. The matching `execute_*` instruction decodes the complete payload, verifies
+   the digest/state/proof, mutates the vault atomically and closes the operation.
+4. `cancel_operation` lets only the owner recover rent from an abandoned staged
+   operation.
+
+The browser signs these prepared legacy messages in order and journals signed
+bytes before broadcast. A restart resubmits the same bytes; it does not ask the
+wallet to sign a replacement operation.
 
 ## Deposit
 
-| Field | Value |
-|---|---|
-| Method | `deposit(bytes32 commitment, uint128 amount, uint256[32] siblings)` (payable) |
-| Caller | User's wallet |
-| Effect | Checks the empty-slot path against `currentRoot`, adds the note leaf, escrows the native ETH, and emits `NoteDeposited(noteId, commitment, amount, expiryTs, newRoot)` |
+`execute_deposit(expected_note_id)` checks the empty-slot Merkle path against the
+current root, requires a nonzero amount no greater than `2^53 - 1`, transfers
+exactly that many lamports into the vault, creates the canonical note PDA and
+emits `NoteDeposited`.
 
-Here `commitment` is the Poseidon registration derived from the note secret,
-not the anonymous balance commitment signed by the server. The deposited leaf
-binds that registration, note ID, amount, and expiry. The note-bound circuit
-includes this same leaf in each private balance commitment.
-
-The transaction must send exactly `amount * nativeAssetWeiPerUnit` wei;
-`nativeAssetWeiPerUnit` is one gwei and `billingToken` is the zero-address
-native-asset sentinel. Only deposits carry transaction value. The on-chain
-event supplies the actual expiry, rounded up to the vault's one-day expiry
-bucket.
+The public registration commitment is derived from the private note secret.
+The secret and signed balance state never enter a Solana account.
 
 ## Mutual close
 
-| Field | Value |
-|---|---|
-| Method | `mutualClose(WithdrawalPublicInputs inputs, bytes proof, uint256[32] siblings)` |
-| Caller | User's wallet or another transaction submitter |
-| Effect | Verifies the withdrawal proof with `hasClearance = true`, checks deployment and immutable signing-key bindings, removes the leaf at the current root, consumes the nullifier, closes the note, and pays the user and treasury |
+`execute_close(note_id, nullifier)` verifies the withdrawal payload with
+`has_clearance = true`, `next_nullifier = 0` and `conceded = 0`, the actual
+writable destination account, the note fields, `valid_until`, an unused
+nullifier and immutable deployment fields. It takes no transition proof or root.
+On success it consumes the nullifier, pays the final private balance to the
+destination, accrues the spent remainder to `treasury_accrued`, and marks the note `Closed`.
 
-The withdrawal's Schnorr clearance and state signatures are private proof
-witnesses. `WithdrawalPublicInputs` contains these 14 fields in order:
+The 32-byte Solana destination is domain-separated and hashed into the existing
+160-bit withdrawal public input. The program recomputes that binding from the
+actual account; a client-supplied substitute cannot redirect funds.
 
-```text
-protocolVersion, chainId, contractAddress, activeRoot,
-stateSigningKeyX, stateSigningKeyY,
-clearanceSigningKeyX, clearanceSigningKeyY,
-noteId, finalBalance, destination, withdrawalNullifier,
-hasClearance, withdrawalTag
-```
+## Escape, challenge and finalization
 
-`proof` is the decoded 256-byte Groth16 artifact described in the
-[API overview](/docs/api-reference). The user receives `finalBalance` billing
-units; the treasury receives `depositAmount - finalBalance`. The vault
-multiplies both amounts by `nativeAssetWeiPerUnit` before paying ETH.
+`execute_escape` verifies a leaf-bound, root-free withdrawal proof (16 public
+inputs, no clearance, no transition proof) and checks `now <= valid_until`, the
+note fields against the stored note, `f + c <= D`, and the nullifier states. It
+consumes the state nullifier `N` and its derived successor `N+`, and creates a
+pending-withdrawal PDA with `{nullifier, next_nullifier, state_balance,
+conceded, final_balance, destination, deadline}`. The leaf stays in the tree
+and nothing is paid immediately. The destination is passed writable and must be
+creditable at finalization (`DestinationNotCreditable` otherwise): a reserved
+key the runtime demotes to read-only, the vault, or the pending account would
+make finalization fail forever and lock the operator share.
 
-## Initiate escape withdrawal
+Nullifier accounts carry `status`: `0` released, `1` consumed, `2` challenged.
+They are created or updated tolerating pre-funded System-owned PDAs and are
+never closed. An escape whose `N+` is challenged fails as superseded; a
+consumed `N` or `N+` is a replay.
 
-| Field | Value |
-|---|---|
-| Method | `initiateEscapeWithdrawal(WithdrawalPublicInputs inputs, bytes proof, uint256[32] siblings)` |
-| Caller | User's wallet or another transaction submitter |
-| Effect | Verifies a withdrawal proof with `hasClearance = false`, removes the leaf at the current root, consumes the nullifier, and stores the payout and `challengeDeadline = now + challengePeriod` |
+Before the deadline, a direct transaction can answer the escape with the exact
+archived request proof (`ChallengePayload { note_id, public_inputs, proof }`) for
+`N+`:
 
-The challenge period is configured at deployment; the default constant is 24
-hours. No payout occurs until finalization.
+- `execute_challenge` (defeat): the request nullifier equals the pending `N+`.
+  The root is not checked and the vault root account is read-only. `N` becomes
+  challenged, `N+` is released, the pending PDA closes, the note returns to
+  `ACTIVE`, and `claimable_after` is set so an expiry sweep cannot race the next
+  exit. It emits `EscapeWithdrawalDefeated`.
+- `raise_escape_concession(note_id, payload, amount)`: a request proof at the
+  escaped nullifier `N` raises the concession to `min(amount, sb,
+  state_balance)`, lowering the pending payout to `state_balance` minus that
+  value. It emits `EscapeConcessionRaised`, must strictly exceed the existing
+  concession, does not change the deadline and does not preclude a later defeat.
 
-## Challenge a stale escape withdrawal
+After the deadline, `finalize_escape(note_id)` is permissionless, pays the
+recorded destination amount and accrues the operator share to
+`treasury_accrued`. The pending account's rent, paid by the escaper, is refunded
+to that destination rather than to the caller. The browser keeps finalization in a
+separate durable journal. Exits never remove the leaf, so no instruction
+re-inserts one and no challenged note status exists.
 
-| Field | Value |
-|---|---|
-| Method | `challengeEscapeWithdrawal(uint32 noteId, RequestPublicInputs inputs, bytes proof, uint256[32] siblings)` |
-| Caller | Anyone with valid archived request evidence, before the deadline |
-| Effect | Verifies the archived request proof and its matching nullifier, restores the note's leaf, returns it to `Active`, and cancels the pending withdrawal |
+## Closed leaves
 
-Submit the original request's public inputs, including its historical root.
-The root may differ from the current root or the root when the escape began:
-unrelated deposits or closes must not invalidate archived evidence. The
-request nullifier must equal the pending withdrawal's nullifier. A later
-signature alone is not challenge evidence.
+`execute_close` and `finalize_escape` leave the leaf in the tree with the note
+`Closed` (status 4). `retire_closed_leaf` (transition proof with
+`inserting = false`, `Closed`-only, permissionless) removes it, sets the note
+`Retired` (status 5) so the tree can be reconstructed from note accounts, and
+emits `ClosedLeafRetired`.
 
-The `siblings` argument is a fresh path for the empty slot at the **current**
-root so the contract can restore the leaf. The challenge cancels the stale
-withdrawal; it does not slash or pay out the note.
+## Bounded pause
 
-## Finalize escape withdrawal
+`set_paused` is bounded. A pause is effective for at most `MAX_PAUSE_DURATION`
+(7 days) and lapses by itself; a new pause requires `PAUSE_COOLDOWN` (1 day)
+after the previous one ended. Deposits are blocked while paused, exits
+(`execute_escape`, `execute_close`) are blocked only while the pause is
+effective, and defeat, raise and finalize are never blocked. The note records
+`paused_offset` at deposit; `claimable_at` is
+`max(expiry, claimable_after)` plus the paused time accumulated since the offset,
+including a running pause.
 
-| Field | Value |
-|---|---|
-| Method | `finalizeEscapeWithdrawal(uint32 noteId)` |
-| Caller | Anyone at or after the stored deadline |
-| Effect | Closes the note and pays the destination and final balance already recorded during initiation, with the remainder paid to treasury |
+## Expiry and solvency
 
-## Claim expired note
+`execute_claim_expired` needs no transition proof. It closes an `ACTIVE` note
+and accrues the full deposit to `vault.treasury_accrued` only after
+`claimable_at`, and it fails
+while the vault is effectively paused. An indefinite pause therefore cannot turn
+into an expiry sweep.
 
-| Field | Value |
-|---|---|
-| Method | `claimExpired(uint32 noteId, uint256[32] siblings)` |
-| Caller | Anyone at or after expiry |
-| Effect | Removes an active expired note's leaf, closes the note, and pays its full deposit to treasury |
+## Treasury accrual
 
-## Deployment compatibility
+User close and finalize never touch the treasury account: the operator share
+(`D` minus the final balance) accrues to `vault.treasury_accrued`. The
+permissionless `withdraw_treasury()` flushes the accrued amount to the pinned
+treasury in a separate transaction, so a bad treasury account cannot block user
+exits.
 
-The verifier must match circuit revision `zkapi-v2-note-bound-v1` and the
-selected setup. The vault's adapter and signing keys are immutable. The server,
-frontend, deployment manifest and proof assets must match these deployed
-values, and clients must independently pin the trusted configuration.
+## Concession rule
+
+Request proofs do not establish delivery of successor signed states, so the
+exit carries a concession instead of trusting the operator. For the newest
+installed state `S_k` and the single bound `b_k` the client released at it, the
+user is paid at least `B_k - b_k` without operator cooperation (G1). Total payout
+is bounded by `D` minus the owed amount of served requests (G2): the request at
+`N+` defeats the escape or the request at `N` raises the concession. Requests stay unlinkable and
+new linkage appears only at exit (G3).
+
+## Arithmetic and rejections
+
+Every credit-changing instruction uses checked integer arithmetic and reasserts
+vault lamport solvency: lamports cover active `total_credits` plus
+`treasury_accrued` plus rent. The program rejects exits while the pause is effective,
+stale roots/note IDs on deposits and retirements, replayed or superseded
+nullifiers, expired `valid_until`, malformed field elements, wrong PDAs/owners
+and mismatched staged payloads.
+
+## Compatibility
+
+The proof statement is `zkapi-v2-concession-v1`; the selected proving
+keys, generated Solana verifier constants and browser WASM must share the same
+artifact hashes. The legacy Solidity `ZkApiVault` is documented and shipped only
+as the explicit EVM compatibility backend.

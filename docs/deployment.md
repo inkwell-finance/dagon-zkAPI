@@ -1,7 +1,11 @@
-# Native ETH deployment
+# Legacy EVM compatibility deployment
 
-The source supports native ETH vaults and the note-bound Groth16 circuit
-`zkapi-v2-note-bound-v1`. The current selected setup remains a single-party
+Dagon zkAPI production commands default to Solana. This page applies only when
+`--ledger evm` is selected explicitly; use [SOLANA_SERVER.md](SOLANA_SERVER.md)
+and the Solana-default `docker/aws/deployment.env.example` otherwise.
+
+The source supports native ETH vaults and the concession-exit Groth16 circuit
+`zkapi-v2-concession-v1`. The current selected setup remains a single-party
 experimental setup; publishing code does not establish an independent audit or
 setup ceremony. See [setup provenance](../protocol/setup/v2/README.md).
 
@@ -15,11 +19,11 @@ keep wallet journals bound to their configuration.
 cargo build --release --workspace
 ```
 
-`zkapi serverd` requires `--native-billing-rpc-url` and
+`dagon-zkapi serverd --ledger evm` requires `--native-billing-rpc-url` and
 `--native-price-feed-address` (or corresponding `ZKAPI_NATIVE_*` variables), plus
 an OA org/service credential or direct OpenRouter management credential.
 Supply chain ID, vault, gwei request cap, matching signing seeds, database path,
-indexer URL and the exact proof directory. Run `zkapi serverd --help` for flags.
+indexer URL and the exact proof directory. Run `dagon-zkapi serverd --help` for flags.
 Native prices come from the pinned finalized oracle round; a generic RPC/chain
 or USD token configuration is not interchangeable with these pins.
 
@@ -41,7 +45,8 @@ pins separately. The vault accepts native ETH.
 
 Use a fresh directory when intentionally generating a new Groth16 setup.
 Keep challenger coverage and persistent server/indexer state available whenever
-the vault holds funds.
+the vault holds funds. The owner pause is bounded (`MAX_PAUSE_DURATION` 7 days,
+`PAUSE_COOLDOWN` 1 day) and the challenger must keep running during it.
 
 ## Runtime
 

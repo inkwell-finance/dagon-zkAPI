@@ -1,101 +1,85 @@
 ---
 title: Getting Started
-description: Build the active workspace and integrate the browser SDK
+description: Build Dagon zkAPI and integrate the Solana browser wallet
 ---
 
-The repository contains the browser SDK, Rust runtime and proof libraries,
-and Solidity native ETH vault. Use Rust, Node.js 24 or later, and Foundry for
-local development.
+The repository contains the Anchor native-SOL vault, Rust proof/runtime code,
+browser SDK, operator services and explicit EVM compatibility implementation.
+Use Node 24+, Rust, Solana CLI and Anchor 0.32.1.
 
-## Build and test
-
-From the repository root:
+## Build and verify
 
 ```bash
-cargo build --release --workspace --locked
-cargo test --release --workspace --locked
-cargo test --release --manifest-path protocol/rust/Cargo.toml --workspace --locked
 npm ci
-npm run test:sdk
-npm run build:browser
-npm run build:mainnet
+npm test
 npm run verify:assets
+npm run verify:solana-vk
+cargo test --locked --workspace
+cargo test --locked --manifest-path protocol/rust/Cargo.toml --workspace
+anchor build --manifest-path solana/Anchor.toml
 ```
 
-Run `forge test` from `protocol/contracts/` for vault and verifier tests.
-Committed proof assets are already included; consuming the SDK does not
-require generating new setup keys. The protocol source and Solidity
-dependencies are tracked under `protocol/`; no submodule initialization is
-required.
-
-To generate request and escape-withdrawal proofs with the packaged browser
-WASM and proving keys, then verify them with the native verifier:
-
-```bash
-cargo run --release --locked --manifest-path protocol/rust/Cargo.toml \
-  -p zkapi-proof --example wasm_roundtrip -- \
-  "$PWD/scripts/prove-browser-fixture.mjs" "$PWD/sdk"
-```
+The unit suites do not prove deployment readiness. Complete the funded
+local-validator deposit/request/settlement/mutual-close/escape/challenge/finalize
+lifecycle before release.
 
 ## Browser integration
 
-Install the SDK from a reviewed immutable repository revision or its `npm pack`
-tarball. Configure it before initializing the wallet:
+Install a reviewed immutable revision or its `npm pack` artifact. Configure the
+SDK before wallet initialization:
 
 ```js
-import { configureBrowserSdk } from '@openanonymity/zkapi-browser-sdk';
-import client from '@openanonymity/zkapi-browser-sdk/client';
+import { configureBrowserSdk } from '@dagon/zkapi-browser-sdk';
+import client from '@dagon/zkapi-browser-sdk/client';
 
 configureBrowserSdk({
-  configUrl: '/zkapi/browser-config.json',
-  workerUrl: '/zkapi/assets/zkapiWasmWorker.js',
+  configUrl: '/dagon-zkapi/browser-config.json',
+  workerUrl: '/dagon-zkapi/assets/zkapiWasmWorker.js',
 });
 
 await client.init();
 const unsubscribe = client.subscribe(snapshot => renderBalance(snapshot));
 ```
 
-The host supplies the payment UI and an EIP-1193 wallet provider. The SDK owns
-private note state, proof generation, transaction journals, receipt recovery,
-and settlement. Build the static worker, WASM, keys, and configuration with
-`buildBrowserSdkAssets` from the package's `/build` export.
+For Solana, the host supplies a Wallet Standard account with
+`solana:signTransaction`. The deployment configuration pins the finalized RPC,
+genesis hash, immutable program, vault-state PDA, exact decimal-string chain ID,
+Pyth identities, signer keys and proof hashes. The SDK owns private note state,
+proof generation, signed-transaction journals and recovery.
 
-Use the repository's `sdk/README.md` for the complete integration contract,
-including external wallet providers, durable manual signing, and recovery.
-The trusted configuration pins the network, native vault, server signing keys,
-proof asset hashes, and deployment manifest. Protocol amounts are whole gwei.
+Never log note secrets, proof witnesses, provider credentials or signed
+transactions. Do not clear a durable stage journal from UI state.
 
-## Runtime services
-
-The root workspace builds the server and indexer runtime libraries,
-`zkapi-indexerd`, `zkapi-challenged`, and the `zkapi` operator CLI. Start the
-server with `zkapi serverd`; use `--help` for current configuration flags. The server and browser must use the same deployment,
-keys, and `zkapi-v2-note-bound-v1` circuit revision.
-
-## Select the matching setup
-
-The checked-in `protocol/setup/v2` keys belong to the
-`zkapi-v2-note-bound-v1` circuit. Keep the proving keys, verifying keys,
-Solidity adapter, and browser WASM from the same release together.
-
-Use the configured deployment's pinned artifacts. Check
-`proof_setup.circuit_id`, key and WASM hashes, chain ID, vault address, and
-state/clearance signing keys against independently trusted deployment values.
-The key-file circuit header catches accidental mismatches; it does not prove
-setup provenance or replace hash pinning.
-
-Only when intentionally creating a **new** deployment, generate a separate
-setup directory:
+## Operator services
 
 ```bash
-./target/release/zkapi setup --output-dir protocol/setup/new-deployment
+cargo build --release --locked \
+  -p zkapi-cli --bin dagon-zkapi \
+  -p zkapi-indexerd --bin dagon-zkapi-indexerd \
+  -p zkapi-serverd --bin dagon-zkapi-challenged
+
+./target/release/dagon-zkapi --help
+./target/release/dagon-zkapi-indexerd --help
+./target/release/dagon-zkapi-challenged --help
 ```
 
-This creates new incompatible keys and a matching verifier. The checked-in
-setup is single-party; no multiparty ceremony has been conducted.
-Production use requires independent review of the design and setup assumptions.
+All ledger-facing commands default to Solana. `--ledger evm` (or
+`--ledger ethereum` for the indexer) is compatibility-only. Use the
+Solana-default examples in `docker/aws/` and keep populated secret files mode
+`0600`.
 
-The vault's verifier and signing keys are immutable. The server, frontend and
-manifest must match those deployed values before a wallet is funded.
+## Proof setup
 
-See `protocol/setup/v2/README.md` for setup provenance and compatibility.
+The selected setup belongs to `zkapi-v2-concession-v1`. Proving keys, verifying
+keys, generated Solana constants and browser WASM must come from the same
+release. The key header catches accidental mismatches; it does not establish
+setup provenance.
+
+Only when creating a new incompatible deployment:
+
+```bash
+./target/release/dagon-zkapi setup --output-dir protocol/setup/new-deployment
+```
+
+The vault's verifier and signer keys are immutable. Independently verify every
+deployed identity before funding a wallet.

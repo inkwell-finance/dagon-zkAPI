@@ -1,10 +1,12 @@
 ---
-title: indexer
-description: Contract-event mirror and depth-32 Merkle paths
+title: Finalized indexer
+description: Solana account reconstruction and privacy-safe depth-32 Merkle snapshots
 ---
 
-The indexer applies native vault events to a local Merkle tree. The browser
-uses it for proving and deposits; the server uses it to track the active root.
+The Solana-default indexer reads finalized vault/note/pending accounts and
+reconstructs the complete local tree only when its root matches the finalized
+vault account. The browser uses whole-tree snapshots for proofs without
+revealing a selected note ID.
 
 | Method and path | Result |
 | --- | --- |
@@ -13,12 +15,12 @@ uses it for proving and deposits; the server uses it to track the active root.
 | `GET /v1/tree/next-note-id` | Next unused note slot |
 | `GET /v1/tree/snapshot` | Tree snapshot for client synchronization |
 | `GET /v1/tree/notes/{note_id}/path` | Occupied leaf and 32 siblings |
-| `GET /v1/tree/notes/{note_id}/zero-path` | Empty-leaf path for insertion or restoration |
+| `GET /v1/tree/notes/{note_id}/zero-path` | Empty-leaf path for insertion |
 
-The root, leaf, and siblings use canonical BN254 field encodings. The indexer
-consumes deposit, close, escape, challenge, finalization, and expiry events
-from Ethereum JSON-RPC. It persists replay progress and checkpoints to support
-restart and chain synchronization.
+The root, leaf, and siblings use canonical BN254 field encodings. Duplicate,
+wrong-owner, malformed or root-inconsistent Solana accounts fail closed. The
+explicit `--ledger ethereum` compatibility mode retains event replay and its
+cursor checkpoint.
 
 An indexer cannot forge membership: clients and contracts recompute roots from
 the supplied paths. Incorrect or stale paths can cause proving or transaction
@@ -39,7 +41,7 @@ the tree and derive paths locally without revealing a particular note ID in a
 request URL. Tree endpoints return `503` while initial chain replay is
 incomplete.
 
-Use current-root sibling paths when submitting a deposit, withdrawal, or
-challenge restoration. A challenge separately supplies the original archived
-request proof with its historical root; do not rewrite its public inputs to
-the indexer's latest root.
+Use current-root sibling paths when submitting a deposit or a closed-leaf
+retirement. Withdrawals, escapes, defeats and concession raises need no path:
+a defeat or raise supplies only the original archived request proof with its
+historical root; do not rewrite its public inputs to the indexer's latest root.

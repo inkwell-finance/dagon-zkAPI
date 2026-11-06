@@ -1,4 +1,7 @@
-# Native ETH browser billing
+# EVM compatibility: native ETH browser billing
+
+This path is retained for `--ledger evm`. The production-default Dagon path is
+native SOL with a finalized pinned Pyth source.
 
 The protocol uses native ETH billing with the browser SDK and the
 server, indexer, and challenger services.
@@ -17,9 +20,9 @@ units back to wei and enforce proof, nullifier, destination, timing
 and reentrancy protections. Failed recipient transfers revert the complete close.
 
 The deployment manifest pins the vault address, native asset, and circuit
-`zkapi-v2-note-bound-v1` with its exact setup/WASM/key hashes. The circuit binds
-each signed balance to its deposit note. Challenges preserve the historical
-request root and use a current restoration path. See
+`zkapi-v2-concession-v1` with its exact setup/WASM/key hashes. The circuit binds
+each signed balance to its deposit note. Defeats and raises preserve the historical
+request root and need no path; exits never remove the leaf. See
 [Note-bound commitments](note-bound-commitments.md).
 
 ## Pinned configuration
@@ -40,7 +43,7 @@ The public deployment manifest and browser trust configuration must agree on:
 
 Pin the RPC URL, chain, vault and protocol/signing/proof-asset
 fields too. Both manifest `proof_setup.circuit_id` and browser
-`trusted_deployment.circuit_id` must equal `zkapi-v2-note-bound-v1`, and all
+`trusted_deployment.circuit_id` must equal `zkapi-v2-concession-v1`, and all
 request/withdrawal proving and verifying key hashes must match that setup. The example feed is Sepolia; it does not select a production feed.
 The server checks chain ID, feed decimals and the vault's native-unit getter
 before answering or accepting a quote. There is no symbol-only fallback.
@@ -171,7 +174,7 @@ Start the native server with its vault/chain/request cap and
 signer, indexer, proof and OA-source settings, plus:
 
 ```sh
-zkapi ... serverd ... \
+dagon-zkapi ... serverd --ledger evm ... \
   --native-billing-rpc-url "$RPC_URL" \
   --native-price-feed-address "$ETH_USD_FEED" \
   --native-price-feed-decimals 8 \
@@ -182,8 +185,8 @@ The server requires native oracle and prompt-private lease configuration.
 Operate the compatible v2 [challenge daemon](challenge-service.md)
 alongside server and indexer, with a dedicated funded signer restricted to the
 configured vault. It reads the exact historical request root from the native server's
-finalized transcript or exact active-lease request and uses a current zero-slot
-restoration path. A missing station usage receipt does not prevent an already
+finalized transcript or exact active-lease request and submits a defeat or concession raise (no path
+and no restore step). A missing station usage receipt does not prevent an already
 issued lease from being challenged. Native usage
 settlement preserves the original proof/public inputs required for that challenge.
 Do not reuse a daemon, verifier or setup from another circuit. Configure the published manifest separately; these flags do

@@ -1,4 +1,4 @@
-# Sepolia shared password
+# EVM compatibility: Sepolia shared password
 
 The protocol server can require one shared password on Sepolia (chain ID
 `11155111`). This is an additional service access gate, independent of note

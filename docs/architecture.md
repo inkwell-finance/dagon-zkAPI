@@ -1,4 +1,7 @@
-# Native ETH architecture
+# Legacy EVM compatibility architecture
+
+This page documents the retained native-ETH backend. Dagon zkAPI defaults to
+the Solana architecture described in [SOLANA_SERVER.md](SOLANA_SERVER.md).
 
 ```text
 Host app -> browser SDK -> zkAPI server (proof-backed lease authorization)
@@ -21,9 +24,11 @@ saved quote. Exact retries preserve the original proof and quote. See
 [native billing](native-eth-billing.md) for rounding and recovery rules.
 
 The indexer mirrors deposits, closes and escape transitions. The challenger
-preserves historical request proofs while obtaining current restoration paths,
-and retries through durable deployment-bound checkpoints. See
-[challenge operation](challenge-service.md).
+submits a root-independent defeat with the historical request proof (the payout
+is cancelled, the note stays `Active`, the leaf never left the tree) or raises
+the concession up to the request's solvency bound; anyone finalizes after the
+deadline. Retries use durable deployment-bound
+checkpoints. See [challenge operation](challenge-service.md).
 
 Only the v2 Groth16/Baby-JubJub proof path and native ETH payment path are active.
 The operator CLI supplies server/indexer/setup/signing-key commands; the host
