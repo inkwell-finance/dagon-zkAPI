@@ -1,0 +1,14 @@
+[package]
+name = "dagon-zkapi-ledger"
+description = "Chain-neutral credit-ledger boundary for Dagon zkAPI"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+zkapi-types = { path = "../../protocol/rust/crates/zkapi-types" }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -1,0 +1,19 @@
+[package]
+name = "dagon-zkapi-solana"
+description = "Solana Groth16 verifier and ledger primitives for Dagon zkAPI"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+groth16-solana = "0.2.0"
+thiserror = { workspace = true }
+zkapi-types = { path = "../../protocol/rust/crates/zkapi-types" }
+
+[dev-dependencies]
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zkapi-core = { path = "../../protocol/rust/crates/zkapi-core" }
+zkapi-proof = { path = "../../protocol/rust/crates/zkapi-proof" }

@@ -1,0 +1,318 @@
+//! Solana Groth16 primitives for Dagon zkAPI.
+//!
+//! This crate consumes the existing 256-byte zkAPI proof wire format and the
+//! 12/16-element request/withdrawal statements plus the isolated
+//! 10-element Solana Merkle-transition statement. It only adapts point
+//! ordering and proof-A negation for Solana's BN254 syscalls.
+
+mod verifying_keys;
+
+use base64::Engine;
+use groth16_solana::groth16::{Groth16Verifier, Groth16Verifyingkey};
+use zkapi_types::wire::{Groth16ProofWire, ProofBackendWire};
+use zkapi_types::{RequestPublicInputsV2, SolanaMerkleTransitionInputs, WithdrawalPublicInputsV2};
+
+pub use verifying_keys::{
+    REQUEST_VERIFYING_KEY, TRANSITION_VERIFYING_KEY, WITHDRAWAL_VERIFYING_KEY,
+};
+
+/// BN254 base-field modulus used for proof coordinates (not the scalar field).
+const BN254_BASE_MODULUS: [u8; 32] = [
+    0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58, 0x5d,
+    0x97, 0x81, 0x6a, 0x91, 0x68, 0x71, 0xca, 0x8d, 0x3c, 0x20, 0x8c, 0x16, 0xd8, 0x7c, 0xfd, 0x47,
+];
+
+#[derive(Debug, thiserror::Error)]
+pub enum SolanaVerifierError {
+    #[error("expected groth16_bn254 proof backend")]
+    WrongBackend,
+    #[error("invalid Groth16 proof encoding: {0}")]
+    InvalidEncoding(String),
+    #[error("Groth16 proof verification failed: {0}")]
+    Verification(String),
+}
+
+pub fn verify_request(
+    public: &RequestPublicInputsV2,
+    proof: &Groth16ProofWire,
+) -> Result<(), SolanaVerifierError> {
+    verify(
+        public.to_field_elements().map(|value| *value.as_bytes()),
+        proof,
+        &REQUEST_VERIFYING_KEY,
+    )
+}
+
+/// Verify the canonical 256-byte proof directly, avoiding base64 inside a
+/// Solana program.
+pub fn verify_request_bytes(
+    public: &RequestPublicInputsV2,
+    proof: &[u8],
+) -> Result<(), SolanaVerifierError> {
+    verify_bytes(
+        public.to_field_elements().map(|value| *value.as_bytes()),
+        proof,
+        &REQUEST_VERIFYING_KEY,
+    )
+}
+
+pub fn verify_withdrawal(
+    public: &WithdrawalPublicInputsV2,
+    proof: &Groth16ProofWire,
+) -> Result<(), SolanaVerifierError> {
+    verify(
+        public.to_field_elements().map(|value| *value.as_bytes()),
+        proof,
+        &WITHDRAWAL_VERIFYING_KEY,
+    )
+}
+
+/// Verify the canonical 256-byte proof directly, avoiding base64 inside a
+/// Solana program.
+pub fn verify_withdrawal_bytes(
+    public: &WithdrawalPublicInputsV2,
+    proof: &[u8],
+) -> Result<(), SolanaVerifierError> {
+    verify_bytes(
+        public.to_field_elements().map(|value| *value.as_bytes()),
+        proof,
+        &WITHDRAWAL_VERIFYING_KEY,
+    )
+}
+
+pub fn verify_transition(
+    public: &SolanaMerkleTransitionInputs,
+    proof: &Groth16ProofWire,
+) -> Result<(), SolanaVerifierError> {
+    verify(
+        public.to_field_elements().map(|value| *value.as_bytes()),
+        proof,
+        &TRANSITION_VERIFYING_KEY,
+    )
+}
+
+/// Verify a Solana Merkle-transition proof without base64 decoding.
+pub fn verify_transition_bytes(
+    public: &SolanaMerkleTransitionInputs,
+    proof: &[u8],
+) -> Result<(), SolanaVerifierError> {
+    verify_bytes(
+        public.to_field_elements().map(|value| *value.as_bytes()),
+        proof,
+        &TRANSITION_VERIFYING_KEY,
+    )
+}
+
+fn verify<const N: usize>(
+    public_inputs: [[u8; 32]; N],
+    proof: &Groth16ProofWire,
+    key: &Groth16Verifyingkey<'_>,
+) -> Result<(), SolanaVerifierError> {
+    if proof.backend != ProofBackendWire::Groth16Bn254 {
+        return Err(SolanaVerifierError::WrongBackend);
+    }
+    let proof = base64::engine::general_purpose::STANDARD
+        .decode(&proof.proof)
+        .map_err(|error| SolanaVerifierError::InvalidEncoding(error.to_string()))?;
+    verify_bytes(public_inputs, &proof, key)
+}
+
+fn verify_bytes<const N: usize>(
+    public_inputs: [[u8; 32]; N],
+    proof: &[u8],
+    key: &Groth16Verifyingkey<'_>,
+) -> Result<(), SolanaVerifierError> {
+    if proof.len() != 256 {
+        return Err(SolanaVerifierError::InvalidEncoding(
+            "proof must contain eight 32-byte coordinates".into(),
+        ));
+    }
+    for coordinate in proof.as_chunks::<32>().0 {
+        if !less_than(coordinate, &BN254_BASE_MODULUS) {
+            return Err(SolanaVerifierError::InvalidEncoding(
+                "proof coordinate is outside the BN254 base field".into(),
+            ));
+        }
+    }
+
+    // zkAPI wire: A(x,y), B(x.c0,x.c1,y.c0,y.c1), C(x,y), all big-endian.
+    // Solana pairing input: -A(x,y), B(x.c1,x.c0,y.c1,y.c0), C(x,y).
+    let mut proof_a = [0u8; 64];
+    proof_a.copy_from_slice(&proof[..64]);
+    let proof_a_y: [u8; 32] = proof_a[32..].try_into().unwrap();
+    proof_a[32..].copy_from_slice(&negate_fq(&proof_a_y)?);
+
+    let mut proof_b = [0u8; 128];
+    proof_b[..32].copy_from_slice(&proof[96..128]);
+    proof_b[32..64].copy_from_slice(&proof[64..96]);
+    proof_b[64..96].copy_from_slice(&proof[160..192]);
+    proof_b[96..].copy_from_slice(&proof[128..160]);
+
+    let proof_c: [u8; 64] = proof[192..].try_into().unwrap();
+    let mut verifier = Groth16Verifier::new(&proof_a, &proof_b, &proof_c, &public_inputs, key)
+        .map_err(|error| SolanaVerifierError::Verification(error.to_string()))?;
+    verifier
+        .verify()
+        .map_err(|error| SolanaVerifierError::Verification(error.to_string()))
+}
+
+fn negate_fq(value: &[u8; 32]) -> Result<[u8; 32], SolanaVerifierError> {
+    if value.iter().all(|byte| *byte == 0) {
+        return Ok([0; 32]);
+    }
+    if !less_than(value, &BN254_BASE_MODULUS) {
+        return Err(SolanaVerifierError::InvalidEncoding(
+            "proof A y-coordinate is outside the BN254 base field".into(),
+        ));
+    }
+    let mut result = [0u8; 32];
+    let mut borrow = 0u16;
+    for index in (0..32).rev() {
+        let left = BN254_BASE_MODULUS[index] as u16;
+        let right = value[index] as u16 + borrow;
+        if left >= right {
+            result[index] = (left - right) as u8;
+            borrow = 0;
+        } else {
+            result[index] = (left + 256 - right) as u8;
+            borrow = 1;
+        }
+    }
+    debug_assert_eq!(borrow, 0);
+    Ok(result)
+}
+
+fn less_than(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.iter()
+        .zip(right)
+        .find_map(|(left, right)| (left != right).then_some(left < right))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+    use zkapi_core::v2 as core;
+    use zkapi_proof::compact::SolanaTransitionProver;
+    use zkapi_types::Felt252;
+
+    #[derive(Deserialize)]
+    struct Fixture {
+        req0: ProofFixture,
+        close2: ProofFixture,
+    }
+
+    #[derive(Deserialize)]
+    struct ProofFixture {
+        public_fields: Vec<Felt252>,
+        proof_hex: String,
+    }
+
+    fn fixture() -> Fixture {
+        serde_json::from_str(include_str!(
+            "../../../protocol/contracts/test/fixtures/vault-challenge.json"
+        ))
+        .unwrap()
+    }
+
+    fn decode(value: &str) -> Vec<u8> {
+        hex::decode(value.strip_prefix("0x").unwrap_or(value)).unwrap()
+    }
+
+    fn fields<const N: usize>(fixture: &ProofFixture) -> [[u8; 32]; N] {
+        fixture.public_fields.iter().map(|field| *field.as_bytes())
+            .collect::<Vec<_>>().try_into().expect("fixture input count")
+    }
+
+    #[test]
+    fn real_request_proof_verifies_with_solana_key() {
+        let fixture = fixture().req0;
+        verify_bytes(
+            fields::<12>(&fixture),
+            &decode(&fixture.proof_hex),
+            &REQUEST_VERIFYING_KEY,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn real_withdrawal_proof_verifies_with_solana_key() {
+        let fixture = fixture().close2;
+        verify_bytes(
+            fields::<16>(&fixture),
+            &decode(&fixture.proof_hex),
+            &WITHDRAWAL_VERIFYING_KEY,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn real_transition_proof_verifies_with_solana_key() {
+        let setup = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../protocol/setup/solana-transition-v1");
+        let prover = SolanaTransitionProver::load(setup).unwrap();
+        let note_id = 7;
+        let commitment = Felt252::from_u64(0xcafe);
+        let amount = 5_000_000;
+        let expiry = 4_000_000_000;
+        let tree = zkapi_core::MerkleTree::new();
+        let siblings = tree.get_siblings(note_id);
+        let leaf = core::note_leaf(note_id, &commitment, u128::from(amount), expiry);
+        let public = SolanaMerkleTransitionInputs {
+            protocol_version: 2,
+            chain_id: 11_155_111,
+            protocol_binding: Felt252::from_u64(0xdead),
+            old_root: tree.root(),
+            new_root: core::merkle_root(note_id, &leaf, &siblings),
+            note_id,
+            commitment,
+            amount,
+            expiry,
+            inserting: true,
+        };
+        let proof = prover.prove(&public, siblings).unwrap();
+        verify_transition(&public, &proof).unwrap();
+
+        let proof_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&proof.proof)
+            .unwrap();
+        verify_transition_bytes(&public, &proof_bytes).unwrap();
+
+        let mut tampered = public;
+        tampered.amount += 1;
+        assert!(verify_transition_bytes(&tampered, &proof_bytes).is_err());
+    }
+
+    #[test]
+    fn mutated_statement_and_noncanonical_coordinates_are_rejected() {
+        let fixture = fixture().req0;
+        let mut inputs = fields::<12>(&fixture);
+        inputs[0][31] ^= 1;
+        assert!(
+            verify_bytes(inputs, &decode(&fixture.proof_hex), &REQUEST_VERIFYING_KEY,).is_err()
+        );
+
+        let mut proof = decode(&fixture.proof_hex);
+        proof[..32].copy_from_slice(&BN254_BASE_MODULUS);
+        assert!(matches!(
+            verify_bytes(
+                fields::<12>(&fixture),
+                &proof,
+                &REQUEST_VERIFYING_KEY,
+            ),
+            Err(SolanaVerifierError::InvalidEncoding(_))
+        ));
+    }
+
+    #[test]
+    fn fq_negation_is_canonical_and_involutive() {
+        let one = {
+            let mut value = [0; 32];
+            value[31] = 1;
+            value
+        };
+        assert_eq!(negate_fq(&negate_fq(&one).unwrap()).unwrap(), one);
+        assert_eq!(negate_fq(&[0; 32]).unwrap(), [0; 32]);
+    }
+}
