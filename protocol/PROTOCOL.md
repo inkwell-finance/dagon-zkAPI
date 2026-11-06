@@ -1,8 +1,11 @@
 # ZK API Usage Credits
 
-This note describes the active zkAPI v2 usage-credit protocol. The implementation
-uses BN254 Groth16 proofs, BN254 Poseidon hashing, Baby-JubJub Schnorr signatures,
-and native ETH settlement in whole gwei. See [SPEC.md](SPEC.md) for exact public
+This note describes the active zkAPI v2 usage-credit protocol as deployed by
+Dagon on Solana. The implementation uses BN254 Groth16 proofs, BN254 Poseidon
+hashing, Baby-JubJub Schnorr signatures, and native SOL settlement in lamports
+by the Anchor vault program. The protocol is chain-neutral and descends from
+upstream [ethereum/zkapi](https://github.com/ethereum/zkapi), whose EVM vault
+remains the Ethereum deployment. See [SPEC.md](SPEC.md) for exact public
 statements and [setup compatibility](setup/v2/README.md) for the current circuit
 revision and single-party setup trust assumptions.
 
@@ -42,7 +45,7 @@ This makes the protocol naturally sequential: one state authorizes one next requ
 
 - $s$: user secret.
 - $C = H(s, 0)$: on-chain registration commitment.
-- $D$: prepaid usage deposit locked in the contract.
+- $D$: prepaid usage deposit locked in the vault.
 - $C_{\max}$: maximum ordinary per-request charge.
 - $S_{\max}$: optional higher cap for policy-violation deductions.
 - $B$: current private available balance.
@@ -76,9 +79,9 @@ $$
 D
 $$
 
-into the smart contract.
+into the vault program.
 
-4. The contract records the deposit amount $D$ and expiry $T_{\text{exp}}$, then inserts the full note leaf $L$ into the on-chain Merkle tree at the note ID.
+4. The vault records the deposit amount $D$ and expiry $T_{\text{exp}}$, then inserts the full note leaf $L$ into the on-chain Merkle tree at the note ID.
 
 ## Request Generation
 
@@ -243,7 +246,7 @@ The proof shows:
 6. the note-bound nullifier $x_w = H(d_{\text{null}}, s, n, \tau_{\text{current}})$, with genesis iff $\tau = 1$ and the anchor chain $\tau = H(d_{\text{anchor}}, H(d_{\text{null}}, s, n, \tau_{\text{prev}}))$ for later states;
 7. for escape, the successor nullifier $N^+ = H(d_{\text{null}}, s, n, H(d_{\text{anchor}}, x_w))$; for mutual close, $N^+ = 0$ and $c = 0$.
 
-The anchor is derived, never random: $\tau_{k+1} = H(d_{\text{anchor}}, N_k)$. The withdrawal statement has 16 public inputs: protocol version, chain ID, vault address, registration, state key (x, y), clearance key (x, y), packed note fields $(n, D, e)$, $B_{\text{final}}$, destination, $x_w$, has-clearance, $N^+$, $c$, `valid_until`. There is no withdrawal tag. The user then has two close-out paths.
+The anchor is derived, never random: $\tau_{k+1} = H(d_{\text{anchor}}, N_k)$. The withdrawal statement has 16 public inputs: protocol version, chain ID, deployment binding, registration, state key (x, y), clearance key (x, y), packed note fields $(n, D, e)$, $B_{\text{final}}$, destination binding, $x_w$, has-clearance, $N^+$, $c$, `valid_until`. There is no withdrawal tag. The user then has two close-out paths.
 
 ### Mutual Close (Instant Path)
 
@@ -263,9 +266,9 @@ $$
 (B_{\text{final}}, \text{Dest}, x_w, \pi_{\text{wd}}, \sigma_{\text{clear}})
 $$
 
-to the contract.
+to the vault.
 
-5. The contract verifies $\pi_{\text{wd}}$ and $\sigma_{\text{clear}}$, then immediately settles the note.
+5. The vault verifies $\pi_{\text{wd}}$ and $\sigma_{\text{clear}}$, then immediately settles the note.
 
 The server learns no balance or routing data from this clearance request; it only sees the nullifier $x_w$.
 
@@ -277,9 +280,9 @@ $$
 (B_{\text{final}}, c, \text{Dest}, x_w, N^+, \text{valid\_until}, \pi_{\text{wd}})
 $$
 
-The proof is leaf-bound and root-free: it carries no Merkle path and the vault does not check any root, so no deposit can invalidate it. The contract verifies $\pi_{\text{wd}}$ and `now <= valid_until`, checks the note fields against the stored note, consumes $x_w$ and $N^+$, records the pending withdrawal, and starts the configured challenge window (24 hours by default). The leaf stays in the tree.
+The proof is leaf-bound and root-free: it carries no Merkle path and the vault does not check any root, so no deposit can invalidate it. The vault verifies $\pi_{\text{wd}}$ and `now <= valid_until`, checks the note fields against the stored note, consumes $x_w$ and $N^+$, records the pending withdrawal, and starts the configured challenge window (24 hours in the deployment profile). The leaf stays in the tree.
 
-If the withdrawal is neither defeated nor raised during that window, anyone finalizes it and the contract settles the note as in the mutual-close path. Exits are blocked only while the vault is effectively paused; the pause is bounded to `MAX_PAUSE_DURATION` (7 days) with a `PAUSE_COOLDOWN` of 1 day, `claimExpired` is blocked while paused, and paused time extends each note's `claimableAt`. `retireClosedLeaf` (EVM) and `retire_closed_leaf` (Solana) are the permissionless, `Closed`-only calls that remove a closed leaf.
+If the withdrawal is neither defeated nor raised during that window, anyone finalizes it and the vault settles the note as in the mutual-close path. Exits are blocked only while the vault is effectively paused; the pause is bounded to `MAX_PAUSE_DURATION` (7 days) with a `PAUSE_COOLDOWN` of 1 day, `execute_claim_expired` is blocked while paused, and paused time extends each note's claimable time. `retire_closed_leaf` is the permissionless, `Closed`-only instruction that removes a closed leaf.
 
 ## Challenge Rule for Escape-Hatch Withdrawal
 
@@ -292,7 +295,7 @@ During the challenge window the escape can be answered in two ways:
 - **Defeat.** Anyone submits a valid request proof whose request nullifier equals the pending $N_{k+1}$. The pending payout is deleted, $N_k$ becomes `Challenged`, $N_{k+1}$ is released, the note stays `Active`, and the vault emits `EscapeWithdrawalDefeated`. Defeat needs no Merkle path and does not check the root, so a root-changing deposit cannot front-run it. There is no restore step: the leaf never left the tree.
 - **Raise.** A request proof at the escaped nullifier $N_k$ whose owed charge exceeds the proven concession $c$ raises it to $c' = \min(\text{amount}, sb, B)$ with $c' > c$. The pending payout becomes $B - c'$, the deadline is unchanged, a later defeat is still possible, and the vault emits `EscapeConcessionRaised`.
 
-After the deadline, `finalizeEscapeWithdrawal` is permissionless and pays the pending final balance to the destination and the rest of the deposit to the treasury. On EVM the payout push carries `ESCAPE_PAYOUT_GAS`; a destination that refuses it is credited instead (`claimEscapePayout`), so it can neither keep the note pending nor lock the operator share.
+After the deadline, `finalize_escape` is permissionless and pays the pending final balance to the destination and the rest of the deposit to the treasury. The destination is checked to be a writable, creditable account when the escape is initiated, so it can neither keep the note pending nor lock the operator share.
 
 **Concession rule and guarantees.** The escape statement reveals a concession $c$ (the in-flight amount the user concedes) with $B = B_{\text{final}} + c$ and $B \leq D$. The client releases at most one bound $b_k$ per state. With that rule:
 
@@ -306,9 +309,9 @@ This is the clean replacement for RLN-style secret-recovery slashing in the simp
 
 ## How the Server Gets Paid
 
-Because honest off-chain requests are unlinkable, the contract cannot settle funds on a per-request basis. Instead, it pays the server in aggregate when the note closes.
+Because honest off-chain requests are unlinkable, the vault cannot settle funds on a per-request basis. Instead, it pays the server in aggregate when the note closes.
 
-On either the instant mutual-close path or a successful escape-hatch withdrawal, the withdrawal proof reveals the user's final balance $B_{\text{final}}$. The contract then performs net settlement:
+On either the instant mutual-close path or a successful escape-hatch withdrawal, the withdrawal proof reveals the user's final balance $B_{\text{final}}$. The vault then performs net settlement:
 
 $$
 \text{payout to user} = B_{\text{final}}
@@ -325,10 +328,10 @@ This means the server is paid for the user's entire lifetime of API usage in one
 To handle abandoned accounts, each note carries the expiry time $T_{\text{exp}}$. If the note is still open and no withdrawal is in progress when it expires, the server may call:
 
 $$
-\text{claimExpired}(\text{noteId})
+\text{execute\_claim\_expired}(\text{noteId})
 $$
 
-The contract then closes the note and transfers the full deposit $D$ to the server treasury $A_{\text{srv}}$. `claimExpired` needs no Merkle path, is blocked while the vault is effectively paused, and is only allowed after the note's `claimableAt`, which includes accumulated paused time and the post-defeat `claimableAfter`.
+The vault then closes the note and credits the full deposit $D$ to the server treasury $A_{\text{srv}}$. `execute_claim_expired` needs no Merkle path, is blocked while the vault is effectively paused, and is only allowed after the note's claimable time, which includes accumulated paused time and the post-defeat `claimable_after`.
 
 This guarantees that the server is eventually paid even if the user disappears without withdrawing. An implementation may additionally offer a separate rollover / renewal transaction that extends $T_{\text{exp}}$, but that mechanism is orthogonal to the accounting model described here.
 
@@ -338,7 +341,7 @@ The current state anchor $\tau$ and the server signature $\sigma_{\text{srv}}$ s
 
 This is important because it prevents the server from trivially correlating requests by directly observing the user's carried state.
 
-In the mutual-close path, the server sees only the withdrawal nullifier $x_w$. The final balance and destination address are revealed only to the contract when the user actually closes the note.
+In the mutual-close path, the server sees only the withdrawal nullifier $x_w$. The final balance and destination address are revealed only to the vault when the user actually closes the note.
 
 The next anchor is derived from the request nullifier, $\tau_{\text{new}} = H(d_{\text{anchor}}, N)$, so the client and the vault can compute the successor nullifier without any server-supplied value. Server randomness stays only in the blinding delta.
 

@@ -3,7 +3,7 @@
 //! * [`export_r1cs`] writes the three circuits as snarkjs binary `.r1cs` files
 //!   (the input of `snarkjs zkey new`).
 //! * [`import_zkeys`] turns the ceremony's final `.zkey` files back into the
-//!   arkworks key/manifest/Solidity artifacts, using
+//!   arkworks key/manifest artifacts, using
 //!   [`KeyKind::Snarkjs`] key headers and the same artifact writers as
 //!   [`crate::compact::setup`].
 //!
@@ -298,8 +298,7 @@ fn ensure_empty_directory(path: &Path) -> Result<()> {
 /// (`request_final.zkey`, `withdrawal_final.zkey`, `transition_final.zkey`)
 /// into the repository's key layout below `out_dir`:
 ///
-/// * `out_dir/v2/{request,withdrawal}.{pk,vk}`, `manifest.json`,
-///   `Bn254Poseidon.sol`, `Groth16ProofAdapter.sol`;
+/// * `out_dir/v2/{request,withdrawal}.{pk,vk}`, `manifest.json`;
 /// * `out_dir/solana-transition-v1/transition.{pk,vk}`, `manifest.json`.
 ///
 /// Key files carry the `/snarkjs` headers, so provers use

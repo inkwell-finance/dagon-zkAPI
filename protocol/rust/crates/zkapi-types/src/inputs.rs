@@ -1,6 +1,7 @@
 //! Public input structs for request and withdrawal proofs.
 //!
-//! Field ordering matches the Groth16 circuits and Solidity Types.sol.
+//! Field ordering matches the Groth16 circuits and the Solana vault's
+//! `RequestInputs` / `WithdrawalInputs`.
 
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};

@@ -3,7 +3,7 @@
 //! cargo run --release -p zkapi-proof --example ceremony_import -- ZKEY_DIR OUT_DIR MANIFEST MANIFEST_SHA256
 //!
 //! Expects `ZKEY_DIR/{request,withdrawal,transition}_final.zkey` and writes
-//! `OUT_DIR/v2/*` (request/withdrawal keys, manifest, Solidity sources) and
+//! `OUT_DIR/v2/*` (request/withdrawal keys and manifest) and
 //! `OUT_DIR/solana-transition-v1/*`. Existing non-empty target directories are
 //! refused; nothing is ever written into the committed `protocol/setup`.
 

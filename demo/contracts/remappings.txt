@@ -1,3 +1,0 @@
-forge-std/=../../protocol/contracts/lib/forge-std/src/
-@openzeppelin/=../../protocol/contracts/lib/openzeppelin-contracts/
-zkapi-contracts/=../../protocol/contracts/src/

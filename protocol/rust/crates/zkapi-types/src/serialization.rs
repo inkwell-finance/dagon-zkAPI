@@ -8,9 +8,8 @@ use crate::Felt252;
 /// string representation.
 ///
 /// JavaScript cannot represent every Solana-derived chain identity exactly.
-/// Accepting the decimal string form lets browser clients preserve all 64 bits
-/// while remaining backwards compatible with existing EVM clients that send a
-/// JSON number.
+/// Accepting the decimal string form lets browser clients preserve all 64 bits;
+/// small values may still be sent as a plain JSON number.
 pub fn deserialize_u64_or_decimal_string<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
@@ -47,24 +46,6 @@ where
     serializer.serialize_str(&value.to_string())
 }
 
-/// Encode an Ethereum address (20 bytes) as a felt252.
-pub fn address_to_felt(addr: &[u8; 20]) -> Felt252 {
-    let mut bytes = [0u8; 32];
-    bytes[12..32].copy_from_slice(addr);
-    Felt252(bytes)
-}
-
-/// Extract an Ethereum address from a felt252.
-/// Returns None if the upper 12 bytes are not zero.
-pub fn felt_to_address(f: &Felt252) -> Option<[u8; 20]> {
-    if f.0[..12] != [0u8; 12] {
-        return None;
-    }
-    let mut addr = [0u8; 20];
-    addr.copy_from_slice(&f.0[12..32]);
-    Some(addr)
-}
-
 /// Encode a boolean as a felt252 (0 or 1).
 pub fn bool_to_felt(b: bool) -> Felt252 {
     if b {
@@ -97,16 +78,6 @@ mod tests {
             deserialize_with = "deserialize_u64_or_decimal_string"
         )]
         value: u64,
-    }
-
-    #[test]
-    fn test_address_roundtrip() {
-        let addr = [
-            0xdeu8, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-        ];
-        let felt = address_to_felt(&addr);
-        let back = felt_to_address(&felt).unwrap();
-        assert_eq!(addr, back);
     }
 
     #[test]

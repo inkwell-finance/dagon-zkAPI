@@ -18,7 +18,6 @@ fn clearance_signer() -> CompactSigner {
 fn config() -> BrowserWalletConfig {
     BrowserWalletConfig {
         protocol_version: 2,
-        ledger_backend: default_ledger_backend(),
         chain_id: 11_155_111,
         contract_address: Felt252::from_u64(99),
         request_charge_cap: BOUND,
@@ -172,7 +171,7 @@ fn assert_code(result: Result<impl std::fmt::Debug>, code: &str) {
 fn escape_args(conceded: u128) -> PrepareWithdrawalArgs {
     PrepareWithdrawalArgs {
         mode: "escape".into(),
-        destination: "0x1111111111111111111111111111111111111111".into(),
+        destination: bs58::encode([0x11u8; 32]).into_string(),
         conceded,
         valid_until: 1_800_010_800,
         clearance: None,
@@ -210,31 +209,16 @@ fn deployment_mismatch_is_rejected() {
 }
 
 #[test]
-fn address_parser_is_strict() {
-    assert_eq!(
-        parse_address("0x1111111111111111111111111111111111111111").unwrap(),
-        [0x11; 20]
-    );
-    assert_eq!(
-        parse_address("000102030405060708090a0B0c0D0e0F10111213").unwrap(),
-        std::array::from_fn(|index| index as u8)
-    );
-    assert!(parse_address("0x1234").is_err());
-    assert!(parse_address("0x111111111111111111111111111111111111111").is_err());
-    assert!(parse_address("0x11111111111111111111111111111111111111111").is_err());
-    assert!(parse_address("0xgg11111111111111111111111111111111111111").is_err());
-}
-
-#[test]
 fn solana_destination_is_bound_without_changing_the_withdrawal_statement() {
     let account = [7u8; 32];
     let encoded = bs58::encode(account).into_string();
     assert_eq!(
-        withdrawal_destination("dagon.solana.groth16.v1", &encoded).unwrap(),
+        withdrawal_destination(&encoded).unwrap(),
         zkapi_types::solana_destination_binding(&account)
     );
-    assert!(withdrawal_destination("dagon.solana.groth16.v1", "1111").is_err());
-    assert!(withdrawal_destination("unknown", &encoded).is_err());
+    assert!(withdrawal_destination("1111").is_err());
+    assert!(withdrawal_destination(&bs58::encode([0u8; 32]).into_string()).is_err());
+    assert!(withdrawal_destination("0x1111111111111111111111111111111111111111").is_err());
 }
 
 /// Threat: a withholding operator signs successors the client cannot spend
@@ -406,12 +390,12 @@ fn withdrawal_statements_bind_the_concession_and_successor() {
 #[test]
 fn withdrawal_args_accept_decimal_strings() {
     let args: PrepareWithdrawalArgs = serde_json::from_str(
-        r#"{"mode":"escape","destination":"0x1111111111111111111111111111111111111111","conceded":"340282366920938463463374607431768211455","valid_until":"1800000000"}"#,
+        r#"{"mode":"escape","destination":"11111111111111111111111111111112","conceded":"340282366920938463463374607431768211455","valid_until":"1800000000"}"#,
     )
     .unwrap();
     assert_eq!((args.conceded, args.valid_until), (u128::MAX, 1_800_000_000));
     let args: PrepareWithdrawalArgs = serde_json::from_str(
-        r#"{"mode":"mutual","destination":"0x1111111111111111111111111111111111111111","valid_until":5}"#,
+        r#"{"mode":"mutual","destination":"11111111111111111111111111111112","valid_until":5}"#,
     )
     .unwrap();
     assert_eq!(args.conceded, 0);

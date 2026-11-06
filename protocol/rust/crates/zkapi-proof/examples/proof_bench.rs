@@ -72,7 +72,7 @@ impl Distribution {
         let mut sorted = samples_ms.clone();
         sorted.sort_by(f64::total_cmp);
         let len = sorted.len();
-        let median_ms = if len % 2 == 0 {
+        let median_ms = if len.is_multiple_of(2) {
             (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0
         } else {
             sorted[len / 2]

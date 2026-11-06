@@ -1413,7 +1413,7 @@ mod tests {
         assert!(satisfied(genesis_request()));
 
         let mut insolvent = fixture();
-        insolvent.public.solvency_bound = u128::from(insolvent.witness.current_balance) + 1;
+        insolvent.public.solvency_bound = insolvent.witness.current_balance + 1;
         assert!(!satisfied(insolvent));
 
         let mut expired = fixture();

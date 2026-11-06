@@ -10,6 +10,10 @@ use zkapi_core::v2 as core;
 use zkapi_proof::compact::{CompactSigner, RequestVerifier, WithdrawalVerifier};
 use zkapi_types::{Felt252, MERKLE_DEPTH};
 
+const GENESIS_HASH: [u8; 32] = [3; 32];
+const PROGRAM_ID: [u8; 32] = [0x5a; 32];
+const VAULT_STATE: [u8; 32] = [0x7b; 32];
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     anyhow::ensure!(
@@ -27,14 +31,16 @@ fn main() -> Result<()> {
     );
     let root = core::merkle_root(0, &leaf, siblings.try_into().unwrap());
     let fixture = json!({
-        "config": { "protocol_version": 2, "chain_id": 31337, "contract_address": "0x1234",
+        "config": { "protocol_version": 2,
+            "chain_id": zkapi_types::solana_chain_id(&GENESIS_HASH).to_string(),
+            "contract_address": zkapi_types::solana_deployment_binding(&PROGRAM_ID, &VAULT_STATE, &GENESIS_HASH),
             "request_charge_cap": 500000, "policy_charge_cap": 500000, "policy_enabled": false,
             "state_signing_key": CompactSigner::from_seed(&Felt252::ONE).public_key(),
             "clearance_signing_key": CompactSigner::from_seed(&Felt252::from_u64(2)).public_key() },
         "deposit": { "secret": secret, "note_id": 0, "amount": 1000000, "expiry_ts": expiry },
         "request": { "payload": "browser artifact test", "active_root": root, "merkle_siblings": siblings,
             "client_request_id": "wasm-roundtrip", "request_time": 2000000000u64, "created_at_ms": 2000000000000u64 },
-        "withdrawal": { "mode": "escape", "destination": "0x1111111111111111111111111111111111111111", "conceded": 0, "valid_until": 1900000000u64 }
+        "withdrawal": { "mode": "escape", "destination": "29d2S7vB453rNYFdR5Ycwt7y9haRT5fwVwL9zTmBhfV2", "conceded": 0, "valid_until": 1900000000u64 }
     });
     let mut child = Command::new("node")
         .args(&args[1..])

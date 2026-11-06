@@ -10,13 +10,14 @@ pub enum ClientProofMode {
     Groth16 { setup_dir: String },
 }
 
-/// Configuration for the client SDK, matching the deployed contract parameters.
+/// Configuration for the client SDK, matching the deployed vault parameters.
 pub struct ClientConfig {
     /// Protocol version (must be 2).
     pub protocol_version: u16,
-    /// Chain ID of the target network.
+    /// Chain ID of the target network (`solana_chain_id(genesis_hash)`).
     pub chain_id: u64,
-    /// Address of the deployed ZkApiVault contract.
+    /// Deployment binding of the vault
+    /// (`solana_deployment_binding(program_id, vault_state, genesis_hash)`).
     pub contract_address: Felt252,
     /// Maximum charge the server may apply per ordinary request.
     pub request_charge_cap: u128,
@@ -30,7 +31,7 @@ pub struct ClientConfig {
     pub state_dir: String,
     /// Proof backend used for runtime proof generation.
     pub proof_mode: ClientProofMode,
-    /// Server signing keys pinned by the deployment contract/configuration.
+    /// Server signing keys pinned by the deployed vault.
     pub state_signing_key: CurvePointWire,
     pub clearance_signing_key: CurvePointWire,
     /// The deployment's settlement window W (seconds): how long a request

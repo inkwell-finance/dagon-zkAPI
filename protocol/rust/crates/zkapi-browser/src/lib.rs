@@ -75,8 +75,6 @@ fn invalid_successor(check: &str, detail: impl std::fmt::Display) -> anyhow::Err
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserWalletConfig {
     pub protocol_version: u16,
-    #[serde(default = "default_ledger_backend")]
-    pub ledger_backend: String,
     #[serde(
         serialize_with = "zkapi_types::serialization::serialize_u64_decimal",
         deserialize_with = "zkapi_types::serialization::deserialize_u64_or_decimal_string"
@@ -88,10 +86,6 @@ pub struct BrowserWalletConfig {
     pub policy_enabled: bool,
     pub state_signing_key: CurvePointWire,
     pub clearance_signing_key: CurvePointWire,
-}
-
-fn default_ledger_backend() -> String {
-    "evm.groth16.v1".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -697,7 +691,7 @@ fn withdrawal_statement(
     if args.valid_until == 0 {
         return Err(refusal(codes::WITHDRAWAL_ARGS, "valid_until must be set"));
     }
-    let destination = withdrawal_destination(&config.ledger_backend, &args.destination)?;
+    let destination = withdrawal_destination(&args.destination)?;
     if destination == [0u8; 20] {
         return Err(refusal(
             codes::WITHDRAWAL_ARGS,
@@ -918,39 +912,19 @@ where
     deserializer.deserialize_any(Visitor)
 }
 
-fn parse_address(value: &str) -> Result<[u8; 20]> {
-    let raw = value.strip_prefix("0x").unwrap_or(value);
-    if raw.len() != 40 {
-        bail!("destination must be a 20-byte hex address");
+/// The 20-byte statement binding of a canonical, nonzero base58 Solana
+/// destination account.
+fn withdrawal_destination(value: &str) -> Result<[u8; 20]> {
+    let bytes = bs58::decode(value)
+        .into_vec()
+        .context("destination is not a base58 Solana account")?;
+    let account: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("destination must be a 32-byte Solana account"))?;
+    if account == [0; 32] || bs58::encode(account).into_string() != value {
+        bail!("destination must be a canonical nonzero Solana account");
     }
-    let mut address = [0u8; 20];
-    for (index, chunk) in raw.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        address[index] = u8::from_str_radix(
-            std::str::from_utf8(chunk).context("address is not UTF-8")?,
-            16,
-        )
-        .context("address contains non-hex characters")?;
-    }
-    Ok(address)
-}
-
-fn withdrawal_destination(ledger_backend: &str, value: &str) -> Result<[u8; 20]> {
-    match ledger_backend {
-        "dagon.solana.groth16.v1" => {
-            let bytes = bs58::decode(value)
-                .into_vec()
-                .context("destination is not a base58 Solana account")?;
-            let account: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| anyhow!("destination must be a 32-byte Solana account"))?;
-            if account == [0; 32] || bs58::encode(account).into_string() != value {
-                bail!("destination must be a canonical nonzero Solana account");
-            }
-            Ok(zkapi_types::solana_destination_binding(&account))
-        }
-        "evm.groth16.v1" | "evm" => parse_address(value),
-        _ => bail!("unsupported wallet ledger backend"),
-    }
+    Ok(zkapi_types::solana_destination_binding(&account))
 }
 
 #[cfg(target_arch = "wasm32")]

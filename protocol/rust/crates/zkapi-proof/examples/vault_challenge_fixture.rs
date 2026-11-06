@@ -1,6 +1,12 @@
-//! Regenerate the real-proof vault regression fixture with the selected setup:
+//! Regenerate the real-proof Solana vault regression fixture with the
+//! committed setup (run from `protocol/rust`):
 //! cargo run --release -p zkapi-proof --example vault_challenge_fixture -- ../setup/v2 \
-//!   > ../contracts/test/fixtures/vault-challenge.json
+//!   > ../test-vectors/vault-challenge.json
+//!
+//! Every statement is bound to a fixed test deployment (genesis hash, program
+//! id and vault-state PDA below) through the Solana `chain_id` /
+//! `contract_address` derivations, and every withdrawal pays the Solana
+//! destination account `DESTINATION`.
 use anyhow::{Context, Result};
 use base64::Engine;
 use serde::Serialize;
@@ -17,12 +23,13 @@ use zkapi_types::{
 const TIMESTAMP: u64 = 2_000_000_000;
 const NOTE_TTL: u64 = 30 * 86_400;
 const DEPOSIT: u128 = 1_000_000;
-// CREATE from address(0xf00d), nonce 0. The Forge test deploys normally there.
-const VAULT: &str = "0xFb1b848e938aE6474F890bfb28f6a793a515BAcb";
+const GENESIS_HASH: [u8; 32] = [3; 32];
+const PROGRAM_ID: [u8; 32] = [0x5a; 32];
+const VAULT_STATE: [u8; 32] = [0x7b; 32];
+const DESTINATION: [u8; 32] = [0x11; 32];
 
 #[derive(Serialize)]
 struct Fixture {
-    inputs_abi: String,
     proof_hex: String,
     public_inputs: serde_json::Value,
     public_fields: Vec<Felt252>,
@@ -50,6 +57,7 @@ struct Generator {
     state_signer: CompactSigner,
     clearance_signer: CompactSigner,
     expiry: u64,
+    chain_id: u64,
     vault: Felt252,
 }
 
@@ -86,7 +94,7 @@ impl Generator {
         let nullifier = core::nullifier(&note.secret, note.id, &note.anchor);
         let public = RequestPublicInputsV2 {
             protocol_version: 2,
-            chain_id: 31_337,
+            chain_id: self.chain_id,
             contract_address: self.vault,
             active_root: core::merkle_root(note.id, &leaf, &siblings),
             state_signing_key_x: key.x,
@@ -119,7 +127,7 @@ impl Generator {
             self.request_verifier.verify(&public, &proof)?,
             "request proof failed"
         );
-        fixture(&public.to_field_elements(), &public.to_field_elements(), &proof, &public)
+        fixture(&public.to_field_elements(), &proof, &public)
     }
 
     fn withdrawal(
@@ -133,7 +141,7 @@ impl Generator {
         let nullifier = core::nullifier(&note.secret, note.id, &note.anchor);
         let public = WithdrawalPublicInputsV2 {
             protocol_version: 2,
-            chain_id: 31_337,
+            chain_id: self.chain_id,
             contract_address: self.vault,
             registration: core::registration_commitment(&note.secret),
             state_signing_key_x: key.x,
@@ -144,7 +152,7 @@ impl Generator {
             deposit_amount: DEPOSIT,
             expiry_ts: self.expiry,
             final_balance: note.balance - conceded,
-            destination: [0x11; 20],
+            destination: zkapi_types::solana_destination_binding(&DESTINATION),
             withdrawal_nullifier: nullifier,
             has_clearance: clearance,
             next_nullifier: if clearance { Felt252::ZERO } else {
@@ -165,7 +173,7 @@ impl Generator {
                 clearance_signature: clearance.then(|| {
                     self.clearance_signer.sign(&core::clearance_message(
                         2,
-                        31_337,
+                        self.chain_id,
                         &self.vault,
                         &nullifier,
                     ))
@@ -176,27 +184,13 @@ impl Generator {
             self.withdrawal_verifier.verify(&public, &proof)?,
             "withdrawal proof failed"
         );
-        // Solidity's tuple expands packed note_fields into n, D, e.
-        let fields = public.to_field_elements();
-        let mut abi = fields[..8].to_vec();
-        abi.extend([
-            Felt252::from_u64(public.note_id.into()),
-            core::field_to_felt(&ark_bn254::Fr::from(public.deposit_amount)),
-            Felt252::from_u64(public.expiry_ts),
-        ]);
-        abi.extend_from_slice(&fields[9..]);
-        fixture(&abi, &fields, &proof, &public)
+        fixture(&public.to_field_elements(), &proof, &public)
     }
 }
 
-fn fixture(inputs: &[Felt252], public_fields: &[Felt252], proof: &Groth16ProofWire, public: &impl Serialize) -> Result<Fixture> {
-    let inputs = inputs
-        .iter()
-        .flat_map(|field| field.as_bytes().iter().copied())
-        .collect::<Vec<_>>();
+fn fixture(public_fields: &[Felt252], proof: &Groth16ProofWire, public: &impl Serialize) -> Result<Fixture> {
     let proof = base64::engine::general_purpose::STANDARD.decode(&proof.proof)?;
     Ok(Fixture {
-        inputs_abi: format!("0x{}", hex::encode(inputs)),
         proof_hex: format!("0x{}", hex::encode(proof)),
         public_inputs: serde_json::to_value(public)?,
         public_fields: public_fields.to_vec(),
@@ -215,7 +209,8 @@ fn main() -> Result<()> {
         state_signer: CompactSigner::from_seed(&Felt252::from_u64(1)),
         clearance_signer: CompactSigner::from_seed(&Felt252::from_u64(2)),
         expiry: (TIMESTAMP + NOTE_TTL).div_ceil(86_400) * 86_400,
-        vault: Felt252::from_hex(VAULT).map_err(anyhow::Error::msg)?,
+        chain_id: zkapi_types::solana_chain_id(&GENESIS_HASH),
+        vault: zkapi_types::solana_deployment_binding(&PROGRAM_ID, &VAULT_STATE, &GENESIS_HASH),
     };
     let genesis = Note {
         id: 0,
@@ -235,7 +230,7 @@ fn main() -> Result<()> {
         next.blinding = zkapi_proof::compact::add_blindings(&previous.blinding, &Felt252::from_u64(9));
         let commitment = balance_commitment(next.balance, &next.blinding, &generator.leaf(&next));
         next.signature = Some(generator.state_signer.sign(&core::state_message(
-            2, 31_337, &generator.vault, &commitment.x, &commitment.y, &next.anchor,
+            2, generator.chain_id, &generator.vault, &commitment.x, &commitment.y, &next.anchor,
         )));
         next
     };

@@ -5,11 +5,6 @@ rust/target/
 
 target/
 
-# Foundry
-contracts/out/
-contracts/cache/
-contracts/broadcast/
-
 # mdBook
 docs/book/
 
@@ -20,4 +15,4 @@ docs/book/
 *.db-shm
 *.db-wal
 # The selected v2 Groth16 proving/verifying keys are versioned intentionally:
-# clients must use the exact setup bound into the deployed Solidity verifier.
+# clients must use the exact setup whose verifying keys the Solana vault embeds.
