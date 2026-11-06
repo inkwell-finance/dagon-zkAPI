@@ -1,17 +1,17 @@
 [
   {
     "id": "request",
-    "constraints": 30821,
+    "constraints": 31670,
     "instanceVariables": 13,
-    "witnessVariables": 30530,
+    "witnessVariables": 31378,
     "ptauPowerNeeded": 15
   },
   {
     "id": "withdrawal",
-    "constraints": 35969,
-    "instanceVariables": 15,
-    "witnessVariables": 35524,
-    "ptauPowerNeeded": 16
+    "constraints": 22222,
+    "instanceVariables": 17,
+    "witnessVariables": 21587,
+    "ptauPowerNeeded": 15
   },
   {
     "id": "transition",

@@ -14,15 +14,15 @@
       "id": "request",
       "r1cs": "request.r1cs",
       "publicInputs": 12,
-      "constraints": 30821,
-      "r1csSha256": "f652f7fe3e1dcf6233e3fa42647ed33b0a837ce286bc4139df611929fb4f4837"
+      "constraints": 31670,
+      "r1csSha256": "ed73c7919790d3cb75e9fc60373aa7ac3c5fb4820c43f2364451ebfdb7f14566"
     },
     {
       "id": "withdrawal",
       "r1cs": "withdrawal.r1cs",
-      "publicInputs": 14,
-      "constraints": 35969,
-      "r1csSha256": "75aafc61319371af849a00c4a1a3b51e22543bf09d46fbf795f82b2b6aa795ad"
+      "publicInputs": 16,
+      "constraints": 22222,
+      "r1csSha256": "a2b46576733aafbe90b816a26cfe8f40c613d76581fbf9e982026e191fa0c973"
     },
     {
       "id": "transition",

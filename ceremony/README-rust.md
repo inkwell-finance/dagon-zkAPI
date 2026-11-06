@@ -61,7 +61,7 @@ First run `verify-ceremony.mjs ... --strict --ceremony ceremony.json --checkpoin
 
 ## Key kind
 
-Files written by the import carry the headers `zkapi-v2-note-bound-v1/snarkjs\0`
+Files written by the import carry the headers `zkapi-v2-concession-v1/snarkjs\0`
 and `dagon-zkapi-solana-transition-v1/snarkjs\0`; the single-party keys keep their
 old headers and keep working. The loaders in `compact.rs` accept both and remember
 the kind; `RequestProver`/`WithdrawalProver`/`SolanaTransitionProver` prove with
