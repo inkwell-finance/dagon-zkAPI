@@ -729,5 +729,10 @@ mod tests {
             json!(Pubkey::new_from_array([8; 32]).to_string());
         assert!(parity_violations(&foreign_price, &foreign_price).is_empty());
         assert!(validate_effective_profile(&foreign_price).is_err());
+        let mut changed_tolerance = valid_effective_profile();
+        changed_tolerance["profile"]["pyth"]["max_supersession_bps"] =
+            json!(SharedProfile::embedded().pyth.max_supersession_bps + 1);
+        assert!(parity_violations(&changed_tolerance, &changed_tolerance).is_empty());
+        assert!(validate_effective_profile(&changed_tolerance).is_err());
     }
 }

@@ -34,28 +34,6 @@ services:
       retries: 6
       start_period: 60s
 
-  # Keeps the identity's Pyth SOL/USD push-oracle account fresh at the profile
-  # cadence. Untrusted: the server verifies every quote independently.
-  pyth-pusher:
-    <<: *daemon
-    command: ["pyth-pusher"]
-    env_file:
-      - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/deployment.env
-      - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/pyth-pusher.env
-    volumes:
-      - type: bind
-        source: ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/pyth-pusher-keypair.json
-        target: /run/dagon-zkapi/pyth-pusher-keypair.json
-        read_only: true
-        bind:
-          create_host_path: false
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "--max-time", "4", "http://127.0.0.1:3002/health"]
-      interval: 5s
-      timeout: 5s
-      retries: 3
-      start_period: 60s
-
   server:
     <<: *daemon
     command: ["server"]

@@ -1,10 +1,10 @@
 #!/bin/sh
 # Launch a Dagon zkAPI daemon from the deployment identity file, a finalized
 # Solana RPC endpoint and secrets. Every shared protocol parameter (program id,
-# circuit, vault policy, server timing, Pyth programs/feed/shard/policy and the
-# pusher cadence) is compiled into the binaries from solana/profile/shared.json;
-# none is configurable here. Keep private seeds, keypair paths, the Hermes API
-# key and provider credentials in the process environment.
+# circuit, vault policy, server timing, Pyth programs/feed/shard/policy) is
+# compiled into the binaries from solana/profile/shared.json; none is
+# configurable here. Keep private seeds, keypair paths and provider credentials
+# in the process environment.
 set -eu
 
 # Match the artifacts installed by docker/Dockerfile; allow an explicit override.
@@ -57,27 +57,8 @@ case "${1:-}" in
             --db-path /data/server.db --checkpoint /data/challenges.json \
             --proof-setup-dir "$ZKAPI_PROOF_SETUP_DIR"
         ;;
-    pyth-pusher)
-        # The Hermes API key stays in the environment (PYTH_HERMES_API_KEY);
-        # the pusher reads it there and never takes it as an argument.
-        require SOLANA_RPC_URL ZKAPI_PYTH_PUSHER_KEYPAIR PYTH_HERMES_API_KEY
-        set -- dagon-zkapi-pyth-pusher --solana-identity "$ZKAPI_SOLANA_IDENTITY" \
-            --solana-rpc-url "$SOLANA_RPC_URL" \
-            --payer-keypair "$ZKAPI_PYTH_PUSHER_KEYPAIR" \
-            --listen 0.0.0.0:3002
-        if [ -n "${PYTH_HERMES_URL:-}" ]; then
-            set -- "$@" --hermes-url "$PYTH_HERMES_URL"
-        fi
-        if [ -n "${ZKAPI_PYTH_PUSHER_PRIORITY_FEE_MICRO_LAMPORTS:-}" ]; then
-            set -- "$@" --priority-fee-micro-lamports "$ZKAPI_PYTH_PUSHER_PRIORITY_FEE_MICRO_LAMPORTS"
-        fi
-        if [ -n "${ZKAPI_PYTH_PUSHER_MIN_BALANCE_LAMPORTS:-}" ]; then
-            set -- "$@" --min-balance-lamports "$ZKAPI_PYTH_PUSHER_MIN_BALANCE_LAMPORTS"
-        fi
-        exec "$@"
-        ;;
     *)
-        echo "Usage: dagon-zkapi-run server|indexer|challenger|pyth-pusher" >&2
+        echo "Usage: dagon-zkapi-run server|indexer|challenger" >&2
         exit 2
         ;;
 esac

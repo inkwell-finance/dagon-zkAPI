@@ -7,6 +7,7 @@
 
 use std::{future::Future, pin::Pin};
 
+use dagon_zkapi_profile::PYTH_MAX_AGE_CEILING_SECONDS;
 use serde::{Deserialize, Serialize};
 use zkapi_types::Felt252;
 
@@ -31,6 +32,12 @@ pub trait BillingPriceSource: Send + Sync {
     fn assert_fresh(&self, quote: &BillingQuote, now: u64) -> Result<(), ServerError> {
         self.validate_identity(quote)?;
         quote.assert_fresh(now)
+    }
+
+    /// Recheck immediately before returning a quote or reserving a request.
+    /// Stateful sources additionally enforce their newest-observed price policy.
+    fn assert_admissible(&self, quote: &BillingQuote, now: u64) -> Result<(), ServerError> {
+        self.assert_fresh(quote, now)
     }
 }
 
@@ -98,7 +105,7 @@ impl BillingQuote {
             || pins.feed_account.is_empty()
             || pins.receiver_program.is_empty()
             || pins.max_age_seconds == 0
-            || pins.max_age_seconds > 60
+            || pins.max_age_seconds > PYTH_MAX_AGE_CEILING_SECONDS
             || !(1..=100).contains(&pins.max_confidence_bps)
             || self.publish_time == 0
             || self.expires_at
@@ -136,6 +143,40 @@ impl BillingQuote {
             return Err(ServerError::NativeQuoteExpired);
         }
         Ok(())
+    }
+
+    /// Whether a newer conservative price fell by more than the profile's
+    /// tolerance from this quote. Compare exact integers across exponents;
+    /// overflow while scaling one side proves it exceeds the other u128 side.
+    pub fn is_superseded_by(&self, newer: &Self, tolerance_bps: u16) -> Result<bool, ServerError> {
+        if tolerance_bps >= 10_000
+            || !(-18..=18).contains(&self.exponent)
+            || !(-18..=18).contains(&newer.exponent)
+        {
+            return Err(invalid("invalid SOL supersession policy or exponent"));
+        }
+        let conservative = |quote: &Self| -> Result<u128, ServerError> {
+            positive_price(&quote.price)?
+                .checked_sub(canonical_u64(&quote.confidence)?)
+                .filter(|price| *price > 0)
+                .map(u128::from)
+                .ok_or_else(|| invalid("SOL lower-bound price must be positive"))
+        };
+        let quoted = conservative(self)? * u128::from(10_000 - tolerance_bps);
+        let current = conservative(newer)? * 10_000;
+        if newer.publish_time <= self.publish_time {
+            return Ok(false);
+        }
+        let difference = self.exponent - newer.exponent;
+        Ok(if difference >= 0 {
+            quoted
+                .checked_mul(10u128.pow(difference as u32))
+                .is_none_or(|scaled| scaled > current)
+        } else {
+            current
+                .checked_mul(10u128.pow((-difference) as u32))
+                .is_some_and(|scaled| quoted > scaled)
+        })
     }
 
     /// Exact rational number of micro-USD per lamport. Reject unsupported
@@ -366,18 +407,18 @@ mod tests {
     #[test]
     fn production_confidence_age_and_exponent_boundaries() {
         let mut q = quote("15000000000", -8);
-        let mut pins = pins(&q, 60);
-        q.expires_at = 160;
+        let mut pins = pins(&q, PYTH_MAX_AGE_CEILING_SECONDS);
+        q.expires_at = 100 + PYTH_MAX_AGE_CEILING_SECONDS;
         q.confidence = "150000000".into();
         q.validate_identity(&pins).unwrap();
         q.confidence = "150000001".into();
         assert!(q.validate_identity(&pins).is_err());
         q.confidence = "0".into();
-        pins.max_age_seconds = 61;
-        q.expires_at = 161;
+        pins.max_age_seconds = PYTH_MAX_AGE_CEILING_SECONDS + 1;
+        q.expires_at = 100 + PYTH_MAX_AGE_CEILING_SECONDS + 1;
         assert!(q.validate_identity(&pins).is_err());
-        pins.max_age_seconds = 60;
-        q.expires_at = 160;
+        pins.max_age_seconds = PYTH_MAX_AGE_CEILING_SECONDS;
+        q.expires_at = 100 + PYTH_MAX_AGE_CEILING_SECONDS;
         for exponent in [-19, -18, 18, 19] {
             q.exponent = exponent;
             assert_eq!(
@@ -409,6 +450,60 @@ mod tests {
         assert_eq!(encoded["chain_id"], u64::MAX.to_string());
         q.confidence = q.price.clone();
         assert!(q.charge_units(0).is_err());
+    }
+
+    #[test]
+    fn supersession_compares_conservative_prices_at_the_exact_boundary() {
+        let tolerance = dagon_zkapi_profile::SharedProfile::embedded()
+            .pyth
+            .max_supersession_bps;
+        assert_eq!(tolerance, 100);
+        let older = quote("10000", -2);
+        for (price, superseded) in [
+            ("10100", false),
+            ("10000", false),
+            ("9901", false),
+            ("9900", false),
+            ("9899", true),
+        ] {
+            let mut newer = quote(price, -2);
+            newer.publish_time += 1;
+            assert_eq!(
+                older.is_superseded_by(&newer, tolerance).unwrap(),
+                superseded
+            );
+        }
+        let mut newer = quote("10000", -2);
+        newer.publish_time += 1;
+        newer.confidence = "100".into();
+        assert!(!older.is_superseded_by(&newer, tolerance).unwrap());
+        newer.price = "9999".into(); // raw drop <1%, conservative drop >1%
+        assert!(older.is_superseded_by(&newer, tolerance).unwrap());
+        let mut discounted = older.clone();
+        discounted.confidence = "100".into();
+        assert!(!discounted.is_superseded_by(&newer, tolerance).unwrap());
+        newer.publish_time = older.publish_time;
+        assert!(!older.is_superseded_by(&newer, tolerance).unwrap());
+    }
+
+    #[test]
+    fn supersession_handles_exponent_changes_without_rounding_or_overflow() {
+        let mut newer = quote("990000", -4);
+        newer.publish_time += 1;
+        let older = quote("100", 0);
+        assert!(!older.is_superseded_by(&newer, 100).unwrap());
+        newer.price = "989999".into();
+        assert!(older.is_superseded_by(&newer, 100).unwrap());
+        newer.price = i64::MAX.to_string();
+        newer.exponent = -18;
+        let large = quote(&i64::MAX.to_string(), 18);
+        assert!(large.is_superseded_by(&newer, 100).unwrap());
+        let small = quote("1", -18);
+        newer.exponent = 18;
+        assert!(!small.is_superseded_by(&newer, 100).unwrap());
+        newer.exponent = i32::MIN;
+        assert!(small.is_superseded_by(&newer, 100).is_err());
+        assert!(older.is_superseded_by(&older, 10_000).is_err());
     }
 
     #[test]

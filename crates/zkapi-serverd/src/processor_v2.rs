@@ -289,7 +289,12 @@ impl RequestProcessor {
     }
 
     pub async fn billing_quote(&self) -> Result<BillingQuote, ServerError> {
-        self.billing.quote(current_timestamp()).await
+        let quote = self.billing.quote(current_timestamp()).await?;
+        // A finalized RPC read can cross expiry or a concurrent observation.
+        // Recheck both policies before returning a quote, as at admission.
+        self.billing
+            .assert_admissible(&quote, current_timestamp())?;
+        Ok(quote)
     }
 
     fn lease_authorization(
@@ -411,7 +416,7 @@ impl RequestProcessor {
             // Oracle reads may span expiry; no await may separate this check
             // from the synchronous proof validation and reservation below.
             self.billing
-                .assert_fresh(&billing_quote, current_timestamp())?;
+                .assert_admissible(&billing_quote, current_timestamp())?;
         }
         if self.validate_and_reserve(request)?.is_some() {
             return Err(ServerError::Replay);
@@ -1335,12 +1340,11 @@ impl RequestProcessor {
             ));
         }
 
-        // Proof verification is synchronous but can be slow. Recheck at the
-        // actual reservation boundary, while issue_openrouter_lease retains
-        // its serialization lock. A matching existing reservation returned
-        // above and keeps its original quote even after expiration.
+        // Proof verification is synchronous but can be slow. Recheck expiry
+        // and newest-observed price at reservation, under the issuance lock.
+        // An exact existing reservation returned above keeps its frozen quote.
         self.billing
-            .assert_fresh(&self.lease_authorization(request)?.1, current_timestamp())?;
+            .assert_admissible(&self.lease_authorization(request)?.1, current_timestamp())?;
         self.store.reserve_openrouter_lease(request)?;
         Ok(None)
     }
@@ -3471,6 +3475,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_quote_rechecks_expiry_after_delayed_oracle_read() {
+        use crate::billing::{BillingFuture, BillingPins};
+        use std::time::Duration;
+
+        struct DelayedQuote {
+            pins: BillingPins,
+            quote: BillingQuote,
+        }
+        impl BillingPriceSource for DelayedQuote {
+            fn quote(&self, now: u64) -> BillingFuture<'_, BillingQuote> {
+                Box::pin(async move {
+                    self.assert_fresh(&self.quote, now)?;
+                    while current_timestamp() < self.quote.expires_at {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Ok(self.quote.clone())
+                })
+            }
+
+            fn validate_identity(&self, quote: &BillingQuote) -> Result<(), ServerError> {
+                quote.validate_identity(&self.pins)
+            }
+
+            fn validate<'a>(&'a self, quote: &'a BillingQuote, now: u64) -> BillingFuture<'a, ()> {
+                Box::pin(async move { self.assert_fresh(quote, now) })
+            }
+        }
+
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        let mut processor = oa_lease_processor(store);
+        let expires_at = current_timestamp() + 2;
+        let billing = Arc::new(DelayedQuote {
+            pins: processor.config.billing_pins(),
+            quote: quote(
+                &processor.config,
+                expires_at - processor.config.profile.pyth.max_age_seconds,
+                "250000000000",
+            ),
+        });
+        let ledger = processor.ledger.clone();
+        processor.replace_backends(ledger, billing);
+        let result = tokio::time::timeout(Duration::from_secs(5), processor.billing_quote())
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(ServerError::NativeQuoteExpired)));
+    }
+
+    #[tokio::test]
     async fn native_issuance_rechecks_expiry_after_delayed_oracle_read() {
         use std::time::Duration;
         use tokio::sync::Notify;
@@ -3701,6 +3753,77 @@ mod tests {
             &key,
         )
         .unwrap();
+        // Simulate a newer adverse observation after RPC validation and then
+        // after Groth16 verification. Neither boundary may reserve the request.
+        struct SupersedingBilling {
+            pins: crate::billing::BillingPins,
+            quote: BillingQuote,
+            checks: std::sync::atomic::AtomicUsize,
+            reject_after: usize,
+        }
+        impl BillingPriceSource for SupersedingBilling {
+            fn quote(&self, _: u64) -> crate::billing::BillingFuture<'_, BillingQuote> {
+                Box::pin(async { Ok(self.quote.clone()) })
+            }
+
+            fn validate_identity(&self, quote: &BillingQuote) -> Result<(), ServerError> {
+                quote.validate_identity(&self.pins)
+            }
+
+            fn validate<'a>(
+                &'a self,
+                quote: &'a BillingQuote,
+                now: u64,
+            ) -> crate::billing::BillingFuture<'a, ()> {
+                Box::pin(async move { self.assert_fresh(quote, now) })
+            }
+
+            fn assert_admissible(&self, quote: &BillingQuote, now: u64) -> Result<(), ServerError> {
+                self.assert_fresh(quote, now)?;
+                if self
+                    .checks
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    >= self.reject_after
+                {
+                    Err(ServerError::NativeQuoteSuperseded)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for reject_after in [0, 1] {
+            let mut guarded = browser_processor(None);
+            guarded.update_root(tree.root());
+            let billing = Arc::new(SupersedingBilling {
+                pins: guarded.config.billing_pins(),
+                quote: quote.clone(),
+                checks: std::sync::atomic::AtomicUsize::new(0),
+                reject_after,
+            });
+            let ledger = guarded.ledger.clone();
+            guarded.replace_backends(ledger, billing.clone());
+            assert!(matches!(
+                guarded.issue_openrouter_lease(&prepared.request).await,
+                Err(ServerError::NativeQuoteSuperseded)
+            ));
+            assert_eq!(
+                billing.checks.load(std::sync::atomic::Ordering::SeqCst),
+                reject_after + 1
+            );
+            assert!(guarded
+                .store
+                .lookup_by_nullifier(&prepared.request.public_inputs.request_nullifier)
+                .is_none());
+            assert!(guarded
+                .store
+                .lookup_openrouter_lease(&prepared.request.client_request_id)
+                .is_none());
+            // The quote response performs the same post-read check.
+            assert!(matches!(
+                guarded.billing_quote().await,
+                Err(ServerError::NativeQuoteSuperseded)
+            ));
+        }
         assert_eq!(prepared.request.payload, payload);
         let serialized = serde_json::to_string(&prepared.journal).unwrap();
         let journal: zkapi_browser::PendingRequestJournal =

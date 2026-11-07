@@ -10,9 +10,9 @@ pub enum ServerError {
     #[error("native billing quote expired before request acceptance")]
     NativeQuoteExpired,
 
-    /// The quote is neither one this server observed from the finalized
-    /// price account nor the current finalized update.
-    /// Recover this exact request before preparing another proof.
+    /// The quote is unobserved or exceeds the newest-observed price tolerance.
+    /// Retry with a new quote/proof only after recovering this exact request;
+    /// resending the same proof does not fix supersession.
     #[error("native billing quote superseded before request acceptance")]
     NativeQuoteSuperseded,
 
@@ -93,7 +93,7 @@ impl ServerError {
     pub fn is_retriable(&self) -> bool {
         match self {
             ServerError::NativeQuoteExpired => true,
-            ServerError::NativeQuoteSuperseded => false,
+            ServerError::NativeQuoteSuperseded => true,
             ServerError::StaleRoot { .. } => true,
             ServerError::Internal(_) => true,
             ServerError::Database(_) => true,

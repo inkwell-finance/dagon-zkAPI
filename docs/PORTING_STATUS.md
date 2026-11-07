@@ -144,10 +144,13 @@ Release gates are now:
    at the declared program id as canonical loader-v3 accounts with upgrade
    authority `None` (the state after a final authority revocation), clones the
    mainnet Pyth receiver/oracle accounts, keeps the price account fresh only
-   through the operator pusher (`dagon-zkapi-pyth-pusher`) fed recorded real
-   signed Hermes updates, initializes the vault with `dagon-zkapi-deploy init-vault`, and must pass
+   by replaying the real guardian-signed updates of Pyth's sponsored feed as
+   they land on mainnet (its ~60 s cadence), initializes the vault with
+   `dagon-zkapi-deploy init-vault`, and must pass
    `scripts/check-solana-parity.mjs` against the mainnet reference before the
-   full end-to-end lifecycle runs. The validator is the pinned, isolated Agave
+   full end-to-end lifecycle runs (the vault lifecycle plus the sponsored-feed
+   freshness test, which stalls the replay past the 90 s maximum age and
+   requires quoting to fail closed). The validator is the pinned, isolated Agave
    4.4.1 release (`scripts/localnet/install-validator.sh`) with mainnet's
    feature set cloned. The parity check requires equal activation for every
    feature ID 4.4.1 knows, lists the reviewed retired (hardwired) mainnet IDs

@@ -1188,34 +1188,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dagon-zkapi-pyth-pusher"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "byteorder",
- "clap",
- "dagon-zkapi-profile",
- "pythnet-sdk",
- "rand 0.8.5",
- "reqwest",
- "serde_json",
- "sha2 0.10.9",
- "solana-compute-budget-interface",
- "solana-hash",
- "solana-instruction",
- "solana-keypair",
- "solana-message",
- "solana-pubkey",
- "solana-signer",
- "solana-system-interface",
- "tokio",
- "tracing",
- "tracing-subscriber 0.3.23",
-]
-
-[[package]]
 name = "dagon-zkapi-solana"
 version = "0.1.0"
 dependencies = [

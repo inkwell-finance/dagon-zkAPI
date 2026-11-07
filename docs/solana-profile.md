@@ -19,7 +19,7 @@ feature activation equals mainnet's for every feature that release knows (see
 | `program` | `program_id` `7NdY5ZVP2He8gSiDHZbkfmNfSgKWV2tkZmZgty2C1d8H`, upgradeable loader, `upgrade_authority: null`, `executable_sha256` |
 | `vault` | `version` 1, `request_charge_cap` 11000000, `note_ttl_seconds` 2592000, `challenge_period_seconds` 86400, `max_pause_seconds` 604800, `pause_cooldown_seconds` 86400 |
 | `server` | `lease_ttl_seconds` 300, `settlement_grace_seconds` 5, `settlement_poll_seconds` 2, `raise_lead_seconds` 3600 |
-| `pyth` | `receiver_program` `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`, `push_oracle_program` `pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT`, `wormhole_program` `HDwcJBJXjL9FpJ7UBsYBtaDjsBUhuLCUYoz3zr8SWWaQ`, SOL/USD `feed_id`, `push_shard_id` 0, `max_age_seconds` 30, `max_confidence_bps` 100, `push_interval_seconds` 5 |
+| `pyth` | `receiver_program` `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`, `push_oracle_program` `pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT`, `wormhole_program` `HDwcJBJXjL9FpJ7UBsYBtaDjsBUhuLCUYoz3zr8SWWaQ`, SOL/USD `feed_id`, `push_shard_id` 0, `max_age_seconds` 90, `max_confidence_bps` 100, `max_supersession_bps` 100 |
 
 `request_charge_cap` is the smallest lease: the server signs no request whose
 proof bound is below it, so every lease is funded with at least 11,000,000
@@ -30,10 +30,21 @@ new vault.
 
 `push_shard_id` and `feed_id` determine the one SOL/USD account every
 deployment pins: the push-oracle PDA `[push_shard_id (u16 LE), feed_id]`,
-`7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE` for shard 0.
-`push_interval_seconds` is the cadence of the operator Pyth pusher
-(`dagon-zkapi-pyth-pusher`, see [the Solana server](SOLANA_SERVER.md#operator-pyth-pusher));
-the profile requires it to be at most a third of `max_age_seconds`.
+`7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE` for shard 0, which Pyth's
+sponsor keeps updated for free (60 s heartbeat, and on any 0.5% move).
+`max_age_seconds` is 90: one heartbeat plus 30 s for landing, finalization
+and RPC lag. The profile and the server accept at most 90
+(`PYTH_MAX_AGE_CEILING_SECONDS`); see
+[the Solana server](SOLANA_SERVER.md#pyth-sponsored-feed) for the
+justification, timing budget and fail-closed behaviour.
+
+New lease admission reads a fresh finalized price even for an observed quote.
+Older quotes are superseded only when the newest observed conservative price
+(`price - confidence`) is more than 1% below their conservative price, using
+`max_supersession_bps`. Quote responses and reservation recheck the same policy.
+This bounds quote-selection disparity, not market risk during the 300 s frozen
+lease or a sponsor stall before the 90 s age limit. The setting is shared, not
+a network-identity exception or runtime option.
 
 There are no flags or environment variables for any of these. Changing one is a
 source change that produces new binaries.
@@ -154,15 +165,20 @@ rebuild every operator binary afterwards.
   activation for every feature 4.4.1 knows;
 - the real mainnet Pyth receiver, push-oracle and Wormhole programs and
   accounts (including the identity's SOL/USD price account) are cloned. The
-  price account is then written only by the operator pusher binary
-  (`dagon-zkapi-pyth-pusher`, built like the other operator binaries): a local
-  recorded Hermes (`scripts/localnet/pyth-replay.mjs`) serves the real
-  guardian-signed SOL/USD updates carried by mainnet's own push-oracle
-  transactions, re-encoded exactly as Hermes serves them and behind the same
-  Bearer API-key check, and the pusher posts each through the cloned Wormhole
-  guardian set (full verification) and push oracle. Mainnet records new
-  updates only about once a minute, so a fresh finalized window is not
-  available at every moment locally;
+  price account is then written only by the replay of Pyth's sponsored feed
+  (`scripts/localnet/pyth-replay.mjs`). It follows every signed mainnet
+  push-oracle update of that account as it lands, whoever paid for it, and
+  posts the newest one locally under the sponsor's target policy: once the
+  local price is 60 s old (the heartbeat) or when the newest price has moved
+  by 0.5%. Third parties may push the mainnet account more often (one pushed
+  it every ~10 s on 2026-11-06); the replay targets the sponsor's policy rather
+  than that optional extra cadence. A posted update carries the same
+  signed instructions as on mainnet: the guardian-signed VAA verified against
+  the cloned Wormhole guardian set (full verification) and the Merkle-proven
+  message posted through the cloned push oracle. Nothing is fabricated or
+  re-signed; only the fee payer and the temporary encoded-VAA account are
+  local. The local price therefore ages like a sponsor-only mainnet account,
+  plus the replay's polling, posting and local finalization delay;
 - a localnet identity is written, the vault is initialized with
   `dagon-zkapi-deploy init-vault`, and the stack is diffed against the mainnet
   reference before any test runs.
@@ -172,8 +188,7 @@ ZKAPI_STATE_SEED=... ZKAPI_CLEAR_SEED=... \
   node scripts/localnet/stack.mjs --run-dir PATH [--bin-dir PATH]
 ```
 
-`--bin-dir` (default `target/release`) must hold `dagon-zkapi-deploy` and
-`dagon-zkapi-pyth-pusher`.
+`--bin-dir` (default `target/release`) must hold `dagon-zkapi-deploy`.
 
 Under a Node version-manager shim such as Volta, launch the real Node process with `"$(node -p process.execPath)" scripts/localnet/stack.mjs ...` so signals sent to the background PID reach Node rather than the shim.
 
@@ -192,23 +207,47 @@ not run `agave-install`, change the active release or touch `PATH`. The
 launcher uses `.../agave-v4.4.1/solana-release/bin/solana-test-validator`
 unless `DAGON_SOLANA_TEST_VALIDATOR` names another binary.
 
-`MAINNET_RPC_URL` optionally selects the mainnet RPC used for cloning, recording
-updates and the reference (a public endpoint by default; a live RPC is
-required). The stack logs the pusher to `RUN_DIR/pyth-pusher.log`. The JS API
-for end-to-end tests is
-`startLocalStack({ root, runDir, binDir, log })` from
+`MAINNET_RPC_URL` optionally selects the mainnet RPC used for cloning, following
+the sponsored updates and the reference (a public endpoint by default; a live
+RPC is required). The CLI prints `{ rpcUrl, identityPath, authorityKeypairPath,
+payerKeypairPath, treasury, replayControlUrl }` once ready. The JS API for
+end-to-end tests is `startLocalStack({ root, runDir, binDir, log })` from
 `scripts/localnet/stack.mjs`, returning `{ rpcUrl, identityPath, identity,
-authorityKeypairPath, payerKeypairPath, treasury, pusherMetricsUrl,
-awaitFreshQuote, stop() }` after `init-vault`, a passing parity check and one
-fresh-quote wait.
+authorityKeypairPath, payerKeypairPath, treasury, replayControlUrl,
+stallReplay(), resumeReplay(), replayStatus(), awaitFreshQuote, stop() }` after
+`init-vault`, a passing parity check and one fresh-quote wait.
 
 `awaitFreshQuote({ minRemainingSeconds = 5, timeoutMs = 180000 } = {})` waits
 until the finalized price account holds a quote newer than the cloned one
-(so one the pusher posted) with at least `minRemainingSeconds` of its maximum
+(so one the replay posted) with at least `minRemainingSeconds` of its maximum
 age left, and returns that account's
 `publishTime`, age and `postedSlot` (not a server billing quote). It only
 waits; it never changes the maximum age, the clock or the quote. Call it before
 starting the server and before each quote → prove → lease cycle.
+
+`stallReplay()` stops posting, as when Pyth's sponsor stalls, and resolves
+once no replayed update is in flight; the local price then ages past the
+maximum age and the server must refuse quotes, leases and startup.
+`resumeReplay()` lets the heartbeat post the newest mainnet update at once, as
+a recovering sponsor would. `replayStatus()` reports `{ stalled,
+heartbeat_seconds, deviation_bps, mainnet_updates_seen, updates_posted,
+last_mainnet_tx, last_publish_time, last_reason }`. Tests outside the stack's
+process use the loopback `replayControlUrl` instead: `POST /stall`,
+`POST /resume` and `GET /status` answer the same status as JSON.
+
+The lifecycle gate runs two ignored tests against one stack, concurrently or
+in turn: the vault lifecycle and the sponsored-feed freshness test, which
+checks quoting under the replayed cadence, stalls the replay until the price
+is older than 90 s, requires the server's quote, lease admission and startup
+to refuse it, and resumes:
+
+```sh
+DAGON_SOLANA_RPC_URL=<rpcUrl> \
+  cargo test --release -p dagon-zkapi-solana-ledger --test localnet -- --ignored
+ZKAPI_STATE_SEED=... ZKAPI_CLEAR_SEED=... DAGON_SOLANA_RPC_URL=<rpcUrl> \
+  DAGON_SOLANA_IDENTITY=<identityPath> DAGON_PYTH_REPLAY_CONTROL_URL=<replayControlUrl> \
+  cargo test --release -p zkapi-serverd --test localnet_pyth -- --ignored
+```
 
 Check a running stack (or any deployment) against the mainnet reference:
 

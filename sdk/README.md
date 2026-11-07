@@ -243,6 +243,14 @@ expires or is superseded before acceptance is discarded only after the
 read-only `POST /v2/openrouter/leases/{id}/expire` endpoint confirms that exact
 saved request was never accepted under the server's issuance lock.
 
+New admission always refreshes the finalized oracle account. Older observed
+quotes remain acceptable only if the newest observed conservative price
+(`price - confidence`) is no more than 1% lower than the submitted quote's
+conservative price (`pyth.max_supersession_bps` in the shared profile).
+Larger drops return retriable `409 native_quote_superseded` without reserving
+the new request. This does not reprice accepted leases or remove SOL market
+risk during their 300 s lifetime.
+
 A model adapter must select one of `CHAT_SPENDING_TIER_USD` (`1`, `2`, `3`,
 `4.5`, `6`) without disclosing the user's exact balance. The SDK settles and
 rekeys when a selected cap changes; only actual usage is charged.

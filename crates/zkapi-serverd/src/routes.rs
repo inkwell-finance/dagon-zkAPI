@@ -147,7 +147,7 @@ pub async fn prepare_solana_backends(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
-    billing.assert_fresh(&quote, now)?;
+    billing.assert_admissible(&quote, now)?;
     Ok(ValidatedSolanaBackends {
         ledger,
         billing,
@@ -799,6 +799,15 @@ mod rate_limit_tests {
             let actual_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(actual_body, expected_body);
         }
+    }
+
+    #[test]
+    fn superseded_quote_maps_to_retriable_409() {
+        let (status, _, Json(response)) =
+            build_error_response(&ServerError::NativeQuoteSuperseded, "lease-request", None);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(response.error_code, "native_quote_superseded");
+        assert!(response.retriable);
     }
 
     #[test]

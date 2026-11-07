@@ -2,7 +2,9 @@
 use anchor_lang::{AccountSerialize, Owner};
 use axum::{extract::State, routing::post, Json, Router};
 use base64::Engine;
-use dagon_zkapi_profile::{executable_sha256, to_hex, vault_state_address, SharedProfile};
+use dagon_zkapi_profile::{
+    executable_sha256, to_hex, vault_state_address, SharedProfile, PYTH_MAX_AGE_CEILING_SECONDS,
+};
 use dagon_zkapi_vault::VaultState;
 use pyth_solana_receiver_sdk::price_update::{PriceFeedMessage, PriceUpdateV2, VerificationLevel};
 use serde_json::{json, Value};
@@ -353,6 +355,75 @@ async fn observed_quotes_survive_newer_price_updates() {
 }
 
 #[tokio::test]
+async fn admission_reads_new_prices_and_rejects_adverse_supersession_without_cache_fallback() {
+    let mut f = Fixture::new("unused.db".into());
+    f.price.price_message.publish_time = now() as i64 - 80;
+    f.price.price_message.price = 10_000_000_000;
+    f.price.price_message.conf = 0;
+    let rpc = start_rpc(&mut f, |_| {}, false, false, false).await;
+    let oracle = PythBillingOracle::new(&f.config).unwrap();
+    let older = oracle.quote(now()).await.unwrap();
+    let original_account = f.price_account();
+
+    for (price, conf, rejected) in [
+        (10_100_000_000, 0, false),
+        (9_900_000_000, 0, false), // exactly 1% lower is allowed
+        (9_899_999_999, 0, true),
+        (9_950_000_000, 60_000_000, true), // conservative, not raw price
+        (10_100_000_000, 0, false),        // a newer recovery permits the old quote
+    ] {
+        f.price.price_message.publish_time += 1;
+        f.price.price_message.price = price;
+        f.price.price_message.conf = conf;
+        rpc.accounts
+            .lock()
+            .unwrap()
+            .insert(f.price_key(), f.price_account());
+        // Do not call quote first: validation itself must fetch the update.
+        let result = oracle.validate(&older, now()).await;
+        if rejected {
+            assert!(matches!(result, Err(ServerError::NativeQuoteSuperseded)));
+            assert!(matches!(
+                oracle.assert_admissible(&older, now()),
+                Err(ServerError::NativeQuoteSuperseded)
+            ));
+        } else {
+            result.unwrap();
+        }
+    }
+
+    f.price.price_message.publish_time += 1;
+    f.price.price_message.price = 9_400_000_000;
+    rpc.accounts
+        .lock()
+        .unwrap()
+        .insert(f.price_key(), f.price_account());
+    assert!(matches!(
+        oracle.validate(&older, now()).await,
+        Err(ServerError::NativeQuoteSuperseded)
+    ));
+    // A lagging RPC response cannot erase the newer, lower observation.
+    rpc.accounts
+        .lock()
+        .unwrap()
+        .insert(f.price_key(), original_account);
+    assert!(matches!(
+        oracle.quote(now()).await,
+        Err(ServerError::NativeQuoteSuperseded)
+    ));
+    assert!(matches!(
+        oracle.validate(&older, now()).await,
+        Err(ServerError::NativeQuoteSuperseded)
+    ));
+    rpc.accounts.lock().unwrap().remove(&f.price_key());
+    assert!(matches!(
+        oracle.validate(&older, now()).await,
+        Err(ServerError::InvalidRequest(_))
+    ));
+    rpc.task.abort();
+}
+
+#[tokio::test]
 async fn invalid_authoritative_reads_fail_before_database_creation() {
     for case in 0..41 {
         let dir = tempfile::tempdir().unwrap();
@@ -372,7 +443,11 @@ async fn invalid_authoritative_reads_fail_before_database_creation() {
             9 => f.vault.clearance_signing_key_y = [0; 32],
             10 => f.price.verification_level = VerificationLevel::Partial { num_signatures: 10 },
             11 => f.price.price_message.feed_id = [0; 32],
-            12 => f.price.price_message.publish_time = now() as i64 - 31,
+            // A stalled sponsor: the finalized price is exactly the maximum age old.
+            12 => {
+                f.price.price_message.publish_time =
+                    now() as i64 - f.config.profile.pyth.max_age_seconds as i64
+            }
             13 => f.price.price_message.publish_time = now() as i64 + 31,
             14 => f.price.price_message.price = 0,
             15 => f.price.price_message.price = -1,
@@ -475,7 +550,7 @@ fn identity_profile_and_oracle_bounds_reject_before_transport() {
         match case {
             0 => config.identity.vault_state = [1; 32],
             1 => config.identity.vault_authority = [1; 32],
-            2 => config.profile.pyth.max_age_seconds = 61,
+            2 => config.profile.pyth.max_age_seconds = PYTH_MAX_AGE_CEILING_SECONDS + 1,
             3 => config.profile.pyth.max_confidence_bps = 101,
             4 => config.profile.pyth.feed_id = "another-feed".into(),
             5 => config.profile.pyth.receiver_program = Pubkey::new_from_array([6; 32]).to_string(),

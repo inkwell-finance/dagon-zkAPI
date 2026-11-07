@@ -103,7 +103,7 @@ profile; the identity's price account must be the profile's push-oracle account)
 - Price account: the push-oracle PDA `[push_shard_id (u16 LE), feed_id]`
   (`7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE`, shard 0), declared in the
   identity file and checked against the profile; never supplied by the API caller.
-- Maximum age: 30 seconds.
+- Maximum age: 90 seconds (the ceiling; see [Pyth sponsored feed](#pyth-sponsored-feed)).
 - Maximum confidence: 100 bps (1%).
 - Full verification only; partial guardian verification is rejected.
 - Non-executable data account, exact official allocated length, canonical official
@@ -116,237 +116,173 @@ The strict zero-padding rule deliberately rejects noncanonical allocation data.
 Review this against the actual pinned receiver account before release: an account
 with nonzero unused padding fails closed rather than being silently accepted.
 
-### Mainnet freshness
+## Pyth sponsored feed
 
-Measured on mainnet-beta in November 2026: the only continuously updated
-SOL/USD `PriceUpdateV2` account is the sponsored push-oracle shard 0
-(`7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE`). Pyth's sponsor refreshes it
-about every 53–55 s, so at finalized commitment its age ranged 2–58 s and was
-within the 30 s maximum age in only about half of the samples; every other
-fully verified SOL/USD account was days stale. On its own, a server pinned to
-it fails closed for roughly half of each cycle. The operator therefore runs
-`dagon-zkapi-pyth-pusher`, which keeps the same account fresh at the profile's
-`push_interval_seconds` (5 s). The 30 s maximum age is unchanged.
+### Source
 
-## Operator Pyth pusher
+The pinned account is the push-oracle price account of the SOL/USD feed on
+shard 0, `7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE` (the PDA
+`[push_shard_id (u16 LE), feed_id]` of
+`pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT`, owned by the receiver). Pyth
+sponsors this feed on Solana for free: it posts a new guardian-verified update
+at least once a minute (heartbeat) and whenever the price moves by 0.5%
+([Pyth sponsored feeds](https://docs.pyth.network/pro/sponsored-feeds)). Dagon
+runs no price pusher and holds no Hermes key or price-posting payer; the server
+only reads the account.
 
-### Who may write the pinned account
+Every write goes through the push oracle's `update_price_feed`, which the
+receiver applies only after the Wormhole core bridge
+(`HDwcJBJXjL9FpJ7UBsYBtaDjsBUhuLCUYoz3zr8SWWaQ`) has verified the VAA against
+the current guardian set (`VerifyEncodedVaaV1`, recorded as `Full`), the
+message's Merkle proof matches the signed root, the message carries the
+account's feed, and the update is newer than the stored one. The server trusts
+no writer: it reads the finalized account itself and checks owner, canonical
+layout, full verification, feed, publish time, age and confidence (above).
 
-The pinned account is a Pyth **push-oracle** price feed account: the PDA
-`[shard_id (u16 LE), feed_id]` of `pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT`,
-owned by the receiver `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`, with the
-PDA itself as its write authority. The push oracle's `update_price_feed` is
-permissionless: any fee payer may call it, and the program signs for the PDA
-when it CPIs into the receiver's `post_update`. The receiver writes only after
+Measured on mainnet-beta on 2026-11-06 (finalized commitment). Earlier that
+day the account was pushed about every 53–55 s and its age ranged 2–58 s; the
+payer then was `4p16wya1Vw2u9w22oah4yXQgySb6eWKRRLMsEXCreish`, which pushes
+many other feeds and is most likely the sponsor. In a later 15-minute window a third party
+(`U91Qk9dq4MavGViv6pqWteUc8JaPcLXGAARQyQJvg8B`) pushed it every 10–30 s:
+414 samples, all fully verified, age 2.3–30.9 s (median 8.4 s), and each new
+update was readable at finalized commitment 2.3–5.4 s after its publish time.
+The sponsor then had nothing to push, as its heartbeat never came due. Such
+third-party pushes come and go and are not relied on: the bound below assumes
+only the sponsor. Every other fully verified SOL/USD account was days stale.
 
-- the Wormhole core bridge (`HDwcJBJXjL9FpJ7UBsYBtaDjsBUhuLCUYoz3zr8SWWaQ`)
-  has verified the VAA against the current guardian set
-  (`VerifyEncodedVaaV1`, full verification, recorded as `Full` in the account);
-- the price message's Merkle proof matches the VAA's signed root;
-- the message carries the account's feed; and
-- the push oracle has checked that the update is newer than the stored one
-  (an older or equal update is a successful no-op).
+### Maximum age: 90 s
 
-So a third party, such as the operator, can push into the exact account the
-server already pins; no operator-owned account, identity change or new trust
-is needed. Pyth's sponsor keeps pushing the same account, so a pusher outage
-falls back to the sponsored cadence rather than to no updates. A dedicated
-shard would be just as permissionless and lose that fallback; an
-operator-owned `post_update` account (write authority = operator key) would
-make the operator key a single point of failure. Both were rejected. The
-profile pins `push_shard_id` 0, and every binary, the SDK build and the
-parity check require the identity's `pyth_price_account` to be exactly
-`PDA(push_shard_id, feed_id)`, so the server reads the account the pusher
-writes.
+`pyth.max_age_seconds` is 90, and 90 is also the ceiling the profile parser,
+the server's quote validation and the SDK enforce
+(`dagon_zkapi_profile::PYTH_MAX_AGE_CEILING_SECONDS`, mirrored by the SDK's
+`PYTH_MAX_AGE_CEILING_SECONDS`; the single-profile parity rule is unchanged):
 
-### Trust
+- **Why not less.** A healthy sponsor leaves the finalized account up to one
+  heartbeat (60 s) plus the time to land and finalize the next update old. Any
+  limit below that refuses quotes for part of every heartbeat although nothing
+  is wrong: at the former 30 s, about half the time.
+- **Why 90.** 60 s heartbeat plus 30 s for landing, finalization (legacy
+  finality alone is about 13 s; measured publish→finalized 2–5 s) and RPC lag.
+- **Why not more.** 90 s is an availability allowance, not a bound on price
+  movement: a price can become economically stale before it expires. Older
+  prices are refused to limit that exposure in time. Raising the ceiling is a
+  source change to the profile crate and SDK requiring a new risk assessment.
+  Pyth explicitly warns that sponsored updates can be delayed; neither the
+  heartbeat nor the 0.5% trigger guarantees landing or finalization latency.
 
-The pusher holds no protocol authority. It cannot write a price the guardians
-did not sign, cannot move the account backwards, and cannot change what the
-server accepts: the server still reads the finalized account itself and
-checks owner, canonical layout, full verification, feed, publish time, age and
-confidence (above). A compromised Hermes cannot forge guardian signatures or
-Merkle inclusion. It can withhold updates and induce failed paid write attempts;
-the payment protections below bound that exposure. A compromised pusher process
-can spend its own dedicated hot key, but its container mounts no server seeds,
-vault authority, or other payer. Pyth's sponsor remains independent.
+### Timing budget
 
-### What one push does
+| Window | Value | Relation to the 90 s maximum age |
+| --- | --- | --- |
+| Quote life | `expires_at = publish_time + 90` | a quote is usable from its read until then |
+| Age at quote read, healthy sponsor | nominally 60 s heartbeat + publication/landing/finalization/RPC delay | 15–25 s remaining is an estimate under 15–5 s delay, not a minimum; a successful quote may be arbitrarily close to expiry |
+| Client proof and submission | quote → lease 1.2 s warm, 3.7 s cold (previous native parity-stack measurements) | illustrative only; browser proof times are not measured here |
+| Admission | every new request reads `getGenesisHash` then finalized `getAccountInfo`, each with a 15 s timeout; expiry and supersession recheck after I/O, Groth16 verification, recheck at reservation | unexpired, previously observed quotes remain usable only within the 1% conservative-price tolerance; otherwise retriable `409` and nothing is reserved |
+| Request time | `request_time` within 300 s back, 30 s ahead | longer than 90 s; not binding |
+| Lease TTL, settlement grace | 300 s and 5 s from issuance; settlement uses the accepted quote without a freshness check | independent of the price age |
+| Challenge timing (`check_challenge_timing`) | TTL 300 + 2 × grace 5 + 2 × poll 2 + usage read 600 + raise lead 3,600 + margin 1,800 = 6,314 s ≤ 86,400 s | the price age is not a term; unchanged |
+| Startup | one fresh finalized quote, checked again after RPC | fails if no valid unexpired quote is available, even with a healthy sponsor but slow RPC |
 
-Every `push_interval_seconds` (5 s) the pusher reads the price account
-(confirmed and finalized), fetches `GET /v2/updates/price/latest?ids[]=<feed>
-&encoding=base64` from Hermes with `Authorization: Bearer <key>`, decodes the
-PNAU accumulator update, and skips the push if the update is not newer than the
-confirmed on-chain one. Otherwise it sends two legacy transactions, each
-signed only by the payer:
+The 90 s policy accommodates the nominal sponsored cadence; it does not
+guarantee every proof or RPC completes before expiry. The two sequential RPC
+calls can consume nearly 30 s, apart from scheduling. The quote endpoint and
+startup recheck expiry and supersession after I/O; admission rechecks after I/O
+and proof verification. A device that misses expiry gets `409 native_quote_expired`
+without a new reservation; the SDK confirms nonacceptance before releasing
+the request. Browser proof latency and production RPC/finality tails must be
+measured separately. The published mainnet samples above are observations,
+not a worst-case bound.
 
-1. `create_account_with_seed` (address `create_with_seed(payer,
-   "dagon-pyth-vaa", wormhole)`, so no second signer), `init_encoded_vaa`,
-   `write_encoded_vaa` (the whole VAA when it fits; larger VAAs get extra
-   write packets);
-2. `verify_encoded_vaa_v1`, the push oracle's `update_price_feed` (random
-   receiver treasury id, as Pyth's SDK does), `close_encoded_vaa` (refunds the
-   encoded VAA's rent).
+### Pricing exposure
 
-Instruction bytes equal those of mainnet's own push transactions (a unit test
-compares them byte for byte against a recorded one). An encoded VAA left by an
-interrupted push is closed at the start of the next cycle
-(`leftover_vaas_closed_total`).
+An older server-observed quote remains usable until `publish_time + 90` only
+if it passes the shared profile's `pyth.max_supersession_bps = 100` policy.
+For quoted conservative price `Q = price - confidence` and the newest observed
+conservative price `Qnew`, reject when `Qnew < 0.99 * Q`. Exactly 1% lower,
+unchanged and higher newer prices remain acceptable. The comparison uses exact
+integer arithmetic, including differing price exponents. The tolerance comes
+only from `solana/profile/shared.json`, with the same profile/parity rules as
+the age limit; it is not a runtime override.
 
-Retries and backoff: every RPC and Hermes call is retried up to 4 times with
-exponential backoff and jitter on transport errors, HTTP 429 and 5xx; a 401/403
-from Hermes is not retried. Transactions are rebroadcast every 2 s until
-confirmed or until the push deadline (3 intervals) passes. After failed cycles
-the next cycle waits 5, 10, then at most 15 s (half the maximum age), jittered.
+Every new admission performs a fresh finalized RPC read, even for a previously
+observed quote. A failed read has no cached fallback. The quote endpoint,
+startup and the final reservation check also enforce the newest-observed
+policy. A lower observation arriving during proof verification therefore
+causes `409 native_quote_superseded` before reservation; the SDK uses the
+existing nonacceptance recovery flow before preparing another proof. Exact
+retries of already reserved requests and settlement retain their frozen quote.
 
-Payment safety: every packet (including orphan cleanup) is simulated before
-broadcast. Its quoted total fee must be at most **50,000 lamports**, its net
-simulated debit across payer plus encoded-VAA account must be at most that
-amount, and its resulting payer balance must preserve `--min-balance-lamports`
-(default **2 SOL**). Counting both accounts prevents rent recycling from hiding
-receiver fees. The fixed CU price never follows a network fee spike upward.
-Future or expired Hermes updates are not posted; response size is bounded
-to 128 KiB and VAAs to 4 KiB.
+This bounds **selection/gaming disparity against the newest observed price**:
+`Q/Qnew <= 1/0.99`, approximately 1.010101. At billed usage `U`, the value
+shortfall measured at `Qnew` is at most `0.01 * U`, inside a 5% markup's
+`U - U/1.05` margin before other costs. Both sides subtract actual confidence;
+the 100 bps confidence limit is an uncertainty ceiling, not an additional
+guaranteed 1% buffer. The sponsor's 0.5% trigger is an update policy, not a
+market-movement bound.
 
-Three failed cycles that paid for a transaction (one with a recorded on-chain
-status, including a late landing after the cycle timed out) latch further
-payments off (`payments_paused = 1`) until an operator investigates and
-restarts the process. Before broadcasting, the pusher retains the signed
-transaction's signature and blockhash, even if the RPC response is lost.
-An unresolved transaction blocks all subsequent payments until its status is
-confirmed/finalized, or the finalized block height has passed its blockhash's
-`lastValidBlockHeight` and a subsequent historical status lookup still finds no transaction. A late
-status counts toward the original failed cycle exactly once. Rejected or
-expired unseen sends do not count, so congestion without paid failures cannot
-latch payments off by itself. This also prevents a new payment's reserve
-simulation from overlooking an outstanding transaction's debit.
-Unpaid skips cannot clear this latch. Account observations continue so sponsor
-updates still count toward health. A single reusable encoded-VAA account bounds
-orphan rent; its next cleanup is simulated like every other payment. Inspect
-and restart to reclaim it after a latched failure. Do not run multiple pushers
-with the same payer, auto-restart a live paused process, or auto-refill it.
-The reserve is checked against the chain balance; the failure latch and pending
-signature are process-local. After stopping a process with an unresolved
-transaction, wait for its confirmation or blockhash expiry before restarting.
-RPC and the pinned on-chain programs remain
-trusted: simulation is not an on-chain spending covenant, and a stolen hot key
-can spend its entire balance outside this binary.
-An attacker-prefunded empty system account at the predictable seed address is
-recovered with the payer's seeded-transfer authority, rather than repeatedly
-trying Wormhole close on an account Wormhole does not own.
+After acceptance the price stays frozen through the 300 s lease TTL. That
+inherent SOL market risk is borne by the operator: for later realizable price
+`S`, billed-value shortfall is `U * max(0, 1 - S/Q)`, ignoring protective
+integer rounding. `U` is bounded by `ZKAPI_MAX_LEASE_USD` (default $10, configurable)
+per lease, not across all leases. Relative to the admission market price, the
+additional TTL exposure scales with that budget times the adverse SOL move;
+there is no guaranteed bound on the move itself. A sponsor stall is covered
+only by the 90 s age limit; RPC failure refuses admission, but an RPC returning
+a valid aged account can still lag the market. Neither the tolerance nor the
+fee insures against these unobserved or post-acceptance moves.
 
-Regression gate (built WSL-native checkout):
-`ZKAPI_STATE_SEED=0x1 ZKAPI_CLEAR_SEED=0x2 node scripts/localnet/pusher-security.mjs /tmp/pusher-security-unique`.
-It runs cloned real programs, rejects a corrupted guardian signature and a
-mutated message under a valid signed root, checks the payment latch and reserve,
-recovers prefunded/orphan accounts, and stops its validator.
+### When the sponsor stalls: fail closed
 
-The Hermes key stays in the environment and a Bearer header, never argv or
-logs. Redirects are disabled (including HTTPS-to-HTTP redirects), URLs cannot
-contain embedded credentials/query strings/fragments, and transport errors
-omit URLs. Protect the environment file with mode 0600; Docker administrators
-and same-privilege process inspection can still read environment secrets.
+From the moment the finalized price is 90 s old (`now >= publish_time + 90`):
 
-Freshness budget: measure actual finalization rather than assuming the legacy
-32-slot (~13 s) delay. A read-only mainnet sample on 2026-11-06 saw finalized
-block timestamps 0.9–1.9 s behind wall time, with no measurable
-confirmed→finalized slot gap. This short sample is not a latency guarantee.
+- `GET /v2/billing/quote` answers `409 native_quote_expired`;
+- a new lease request answers `409 native_quote_expired` before any nullifier
+  is reserved or key minted, whether its quote was observed earlier or not;
+- server startup fails (the compose restart policy retries it);
+- there is no fallback: no other account, no Hermes read, no cached or
+  extrapolated price.
 
-### Configuration
+Everything that needs no new price keeps working: `/health`, the tree,
+deposits, withdrawal clearances and closes, settlement and retirement of
+already issued leases (each with the quote it was accepted with), exact retries
+of requests reserved before the stall, and the challenger. Quoting resumes by
+itself with the sponsor's next update; no restart is needed.
 
-| Input | Source |
-| --- | --- |
-| Feed, shard, programs, cadence, maximum age | compiled-in profile |
-| `--solana-identity` | identity file; its `pyth_price_account` must be the push-oracle account |
-| `--solana-rpc-url` | RPC with `sendTransaction` and confirmed/finalized reads; its genesis must match the identity |
-| `--payer-keypair` | Solana CLI keypair of the dedicated, funded fee payer (secret) |
-| `PYTH_HERMES_API_KEY` | Hermes API key from Pyth Terminal; environment only (secret) |
-| `--hermes-url` | default `https://hermes.pyth.network`; HTTPS required except on loopback |
-| `--priority-fee-micro-lamports` | default 10,000 µlamports/CU |
-| `--min-balance-lamports` | default 2 SOL; protected reserve checked before every payment, not merely an alarm |
-| `--listen` | default `0.0.0.0:3002`: `/health`, `/metrics` |
+The parity stack exercises this: the lifecycle gate's `localnet_pyth` test
+stalls the replayed feed until the price is older than 90 s and requires the
+server's quote, lease admission and startup to refuse it, then resumes, and the
+gateway's `zkapi-full` e2e requires `409 native_quote_expired` from the running
+server between its two leases.
 
-The operator image ships the binary; `docker/aws/compose.yml` runs it as the
-`pyth-pusher` service (`dagon-zkapi-run pyth-pusher`). The server does **not**
-depend on its health; the server's own finalized-price checks fail closed when
-needed, without blocking sponsor-backed startup. See `docker/aws/README.md`.
+### Monitoring and alerting
 
-### Cost
+No paid service is needed. Probe the server's own quote endpoint, which reads
+the pinned account through the server's RPC exactly as clients see it, from the
+host every 15 s (cron or a systemd timer), through the gateway published on
+`127.0.0.1:8080` by `docker/aws/compose.yml`:
 
-Measured on the local parity stack against the cloned mainnet programs with a
-3-signature mainnet VAA: the first packet uses 3,019 CU, the second
-132,085–135,094 CU; the payer's balance fell by exactly the transaction fees
-(the receiver's update fee is 0). With the shipped compute limits (20,000 and
-120,000 + 30,000 per signature = 210,000) and the default 10,000 µlamports/CU:
-
-| Per push | Lamports |
-| --- | --- |
-| 2 signatures × 5,000 | 10,000 |
-| priority fee (230,000 CU × 0.01) | 2,300 |
-| encoded-VAA rent (refunded in the same push) | 0 net |
-| **total** | **12,300** |
-
-Pyth publishes a newer SOL/USD price far more often than every 5 s, so nearly
-every cycle pushes: 17,280 pushes a day, **about 0.21 SOL a day** (0.17 SOL
-of it base fees), about $19 a day or $7,000 a year at $90/SOL. Raising the
-priority fee to 50,000 µlamports/CU makes it 0.37 SOL a day. Fund the payer
-for several weeks (for example 10 SOL provides 8 SOL spendable above the default
-2 SOL reserve, about 37.6 days at 0.212544 SOL/day). Alert before reaching the
-reserve. Hermes sees one request per cycle (17,280 a day); choose a Pyth plan
-that covers it.
-
-The cheapest cadence within the current profile's safety constraint
-(`interval <= max_age / 3`) is **10 s**, recommended for the next profile build:
-**0.106272 SOL/day**, half the 5 s cost. Observed native cold quote→lease time
-was 3.660 s (warm 1.225 s). Budgeting 2 s for observed finalization, 2 s for
-fetch/post, 10 s for scheduling and 3.660 s for proof/admission leaves about
-12.3 s under the 30 s age. The shipped profile remains 5 s in this review.
-Before rollout, confirm production Hermes, RPC and browser/cold-proof tails:
-no real Hermes API key was available for this replay-based review. If the
-legacy 13 s finalization delay returns, retain 5 s instead. Never relax the
-30 s maximum age to mask a slow pusher.
-
-### Metrics and alerting
-
-`/health` returns 200 while the finalized price account is within the maximum
-age and was observed within the last 3 intervals, else 503 (the compose
-healthcheck). `/metrics` (Prometheus text) exposes, with prefix
-`dagon_pyth_pusher_`: `onchain_age_seconds{commitment}` and
-`onchain_publish_time_seconds{commitment}` (finalized is what the server reads),
-`hermes_publish_time_seconds`, `pushes_total{result="landed"|"not_newer"}`,
-`failures_total{stage="hermes_auth"|"hermes"|"rpc"|"transaction"}`,
-`consecutive_failures`, `last_success_timestamp_seconds`,
-`last_push_duration_seconds`, `leftover_vaas_closed_total`,
-`lamports_spent_total` (observed payer-plus-rent equity decreases, including
-failed cycles), `payer_balance_lamports`, `payer_balance_low`,
-`payments_paused`, `push_interval_seconds` and `max_age_seconds`.
-
-Alert on:
+```sh
+# Prints the price age in seconds. Exits non-zero, naming the server's
+# error_code (native_quote_expired for a stale price), when it refuses to quote;
+# a connection failure leaves jq no input and also exits non-zero.
+curl -sS --max-time 10 http://127.0.0.1:8080/v2/billing/quote \
+  | jq -e 'if .publish_time then (now | floor) - .publish_time else error(.error_code // "no quote") end'
+```
 
 | Condition | Severity | Meaning |
 | --- | --- | --- |
-| `onchain_age_seconds{commitment="finalized"} > 25` for 1 min, or `/health` failing | page | quotes are about to fail closed |
-| `consecutive_failures >= 6` (30 s) | page | pushes are not landing |
-| `increase(failures_total{stage="hermes_auth"}[5m]) > 0` | page | the Hermes key is revoked, expired or over quota |
-| `payments_paused == 1` or `payer_balance_low == 1` | page | investigate failures or refill above the protected reserve before restarting |
-| `rate(pushes_total{result="landed"}[10m]) < 0.15` | warn | below the expected 0.2 pushes/s |
-| `increase(leftover_vaas_closed_total[1h]) > 3` | warn | second packets are being dropped; raise the priority fee or change RPC |
-| `rate(lamports_spent_total[1d])` | track | daily cost |
+| the probe reports `native_quote_expired`, or the age exceeds 90 s | page | the sponsor has stalled: the server refuses every new quote and lease |
+| the probe fails otherwise (connection, 5xx, another `error_code`) | page | server, gateway or RPC unavailable, not a price problem |
+| the age exceeds 70 s on two consecutive probes | warn | the sponsor missed its 60 s heartbeat; quoting stops at 90 s |
 
-### Operator setup
+To check the account independently of the server, read it from any RPC
+(`getAccountInfo`, `encoding: base64`, `commitment: finalized`): the
+134-byte `PriceUpdateV2` data has the verification level at byte 40 (1 =
+`Full`) and `publish_time` as a little-endian `i64` at byte offset 93; its age
+is now minus that value.
 
-1. Get a Hermes API key at Pyth Terminal; put it in
-   `/etc/zkapi/pyth-pusher.env` as `PYTH_HERMES_API_KEY` (mode 0600).
-2. Create a dedicated payer: `solana-keygen new --no-bip39-passphrase -o
-   /etc/zkapi/pyth-pusher-keypair.json`, readable only by uid 10001. Fund it
-   (for example 10 SOL).
-3. Use an RPC that accepts `sendTransaction` (a paid endpoint for mainnet).
-4. `docker compose -f docker/aws/compose.yml up -d pyth-pusher`, wait for it
-   to turn healthy, then start the indexer and server.
-5. Scrape `pyth-pusher:3002/metrics` and add the alerts above.
-
-The local parity stack runs this binary as the only writer of the cloned
-account, fed a recorded Hermes that serves real mainnet-signed updates (see
+The local parity stack replays the sponsor's real mainnet updates instead of
+running a writer of its own (see
 [the Solana profile](solana-profile.md#local-parity-stack)).
 
 ## Pricing and the stable HTTP/proof envelope

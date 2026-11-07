@@ -33,6 +33,16 @@ pub const MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw
 pub const UPGRADEABLE_LOADER: &str = "BPFLoaderUpgradeab1e11111111111111111111111";
 /// Seed prefix of the vault-state PDA: `["vault", authority]`.
 pub const VAULT_SEED: &[u8] = b"vault";
+/// Largest `pyth.max_age_seconds` a profile may set, and the server's ceiling.
+///
+/// The pinned price account is Pyth's sponsored SOL/USD push feed, which Pyth
+/// updates on a 60 s heartbeat and on any 0.5% price move. While the sponsor
+/// is healthy the finalized account is therefore at most one heartbeat plus
+/// its landing and finalization delay old. 90 s is that heartbeat plus 30 s
+/// for landing, finalization and RPC lag (legacy finality alone is ~13 s). A
+/// price older than this means the sponsor missed its heartbeat, so the
+/// server must refuse to quote from it rather than accept a staler price.
+pub const PYTH_MAX_AGE_CEILING_SECONDS: u64 = 90;
 
 /// The only keys that may differ between two deployments of the profile.
 ///
@@ -114,19 +124,22 @@ pub struct ServerProfile {
 #[serde(deny_unknown_fields)]
 pub struct PythProfile {
     pub receiver_program: String,
-    /// Pyth push oracle: permissionless `update_price_feed` into the price
-    /// account PDA `[push_shard_id (u16 LE), feed_id]`, posted through the
-    /// receiver after Wormhole guardian verification.
+    /// Pyth push oracle: owner of the price account PDA
+    /// `[push_shard_id (u16 LE), feed_id]` that Pyth's sponsor updates
+    /// through the receiver after Wormhole guardian verification.
     pub push_oracle_program: String,
     /// The Wormhole core bridge the receiver verifies VAAs against.
     pub wormhole_program: String,
     pub feed_id: String,
-    /// Push-oracle shard of the price account every deployment pins.
+    /// Push-oracle shard of the sponsored price account every deployment pins.
     pub push_shard_id: u16,
+    /// Oldest finalized price the server quotes from; at most
+    /// [`PYTH_MAX_AGE_CEILING_SECONDS`].
     pub max_age_seconds: u64,
     pub max_confidence_bps: u16,
-    /// Cadence of the operator price pusher (`dagon-zkapi-pyth-pusher`).
-    pub push_interval_seconds: u64,
+    /// Maximum fall from a submitted conservative price to the newest
+    /// observed conservative price before an unaccepted quote is superseded.
+    pub max_supersession_bps: u16,
 }
 
 /// Decode a canonical, nonzero base58 32-byte Solana identity.
@@ -234,19 +247,16 @@ impl SharedProfile {
             .ok_or_else(|| anyhow::anyhow!("Pyth feed ID must be 0x-prefixed"))?;
         parse_hex_32("Pyth feed ID", feed)?;
         ensure!(
-            (1..=60).contains(&self.pyth.max_age_seconds),
-            "Pyth max age must be in 1..=60 seconds"
+            (1..=PYTH_MAX_AGE_CEILING_SECONDS).contains(&self.pyth.max_age_seconds),
+            "Pyth max age must be in 1..={PYTH_MAX_AGE_CEILING_SECONDS} seconds"
         );
         ensure!(
             (1..=100).contains(&self.pyth.max_confidence_bps),
             "Pyth max confidence must be in 1..=100 bps"
         );
-        // Pushed updates are finalized ~13 s after landing; the pusher's
-        // cadence must leave most of the age window for quote -> proof -> use.
         ensure!(
-            self.pyth.push_interval_seconds >= 1
-                && 3 * self.pyth.push_interval_seconds <= self.pyth.max_age_seconds,
-            "Pyth push interval must be at least 1 s and at most a third of the max age"
+            self.pyth.max_supersession_bps < 10_000,
+            "Pyth max supersession must be below 10000 bps"
         );
         Ok(())
     }
@@ -269,8 +279,8 @@ impl SharedProfile {
     }
 
     /// The push-oracle price account of the profile's feed and shard: the
-    /// only SOL/USD account an identity may pin, and the one the operator
-    /// pusher keeps fresh.
+    /// only SOL/USD account an identity may pin. Shard 0 is the account
+    /// Pyth's sponsor keeps updated.
     pub fn pyth_push_account(&self) -> [u8; 32] {
         let program = parse_base58_32("Pyth push oracle program", &self.pyth.push_oracle_program)
             .expect("validated");
@@ -375,7 +385,7 @@ impl NetworkIdentity {
 
     /// The declared Pyth price account, which must be the profile's
     /// push-oracle account ([`SharedProfile::pyth_push_account`]): the server
-    /// reads exactly the account the operator pusher writes.
+    /// reads exactly the account Pyth's sponsor updates.
     pub fn pyth_price_account(&self, shared: &SharedProfile) -> anyhow::Result<[u8; 32]> {
         let value = self.pyth_price_account.as_deref().ok_or_else(|| {
             anyhow::anyhow!("{} identity has no pyth_price_account", self.network)
@@ -519,15 +529,34 @@ mod tests {
     }
 
     #[test]
-    fn push_cadence_must_stay_well_inside_the_max_age() {
-        for (interval, ok) in [(0, false), (1, true), (10, true), (11, false)] {
+    fn max_age_is_bounded_by_the_sponsored_heartbeat_ceiling() {
+        for (age, ok) in [
+            (0, false),
+            (1, true),
+            (PYTH_MAX_AGE_CEILING_SECONDS, true),
+            (PYTH_MAX_AGE_CEILING_SECONDS + 1, false),
+        ] {
             let mut value: Value = serde_json::from_str(SHARED_PROFILE_JSON).unwrap();
-            value["pyth"]["push_interval_seconds"] = json!(interval);
+            value["pyth"]["max_age_seconds"] = json!(age);
             assert_eq!(
                 SharedProfile::parse(&value.to_string()).is_ok(),
                 ok,
-                "{interval}"
+                "{age}"
             );
+        }
+    }
+
+    #[test]
+    fn supersession_policy_is_required_and_bounded() {
+        let mut value: Value = serde_json::from_str(SHARED_PROFILE_JSON).unwrap();
+        value["pyth"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_supersession_bps");
+        assert!(SharedProfile::parse(&value.to_string()).is_err());
+        for (bps, ok) in [(0, true), (100, true), (9_999, true), (10_000, false)] {
+            value["pyth"]["max_supersession_bps"] = json!(bps);
+            assert_eq!(SharedProfile::parse(&value.to_string()).is_ok(), ok);
         }
     }
 

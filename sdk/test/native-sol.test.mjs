@@ -7,7 +7,7 @@ import { base58Encode } from '../services/zkapiSolanaTransport.mjs';
 import { assertSolanaDepositsOpen, assertSolanaVault, confirmFinalizedSolanaTransaction, decodeSolanaNoteState,
     decodeSolanaPendingWithdrawal, decodeSolanaVaultState, readFinalizedSolanaOperationState,
     readFinalizedSolanaTime, sendSignedSolanaTransaction, solanaUnitsForUsd, solanaUsdMicros, UPGRADEABLE_LOADER,
-    SOLANA_QUOTE_FIELDS, validateSolanaFunding, validateSolanaQuote, sameSolanaQuote }
+    PYTH_MAX_AGE_CEILING_SECONDS, SOLANA_QUOTE_FIELDS, validateSolanaFunding, validateSolanaQuote, sameSolanaQuote }
     from '../services/zkapiNativeSol.mjs';
 
 let rpcHandler = null;
@@ -85,6 +85,16 @@ test('native SOL pins and quotes retain full-u64 identity and conservative Pyth 
     assert.equal(solanaUsdMicros(1_000_000_000n, quote), 148_500_000n);
     assert.equal(solanaUnitsForUsd('148.5', quote), 1_000_000_000n);
     assert.equal(solanaUnitsForUsd('1', quote), 6_734_007n);
+});
+
+test('the Pyth maximum age is bounded by the server ceiling for the sponsored feed', async () => {
+    const source = await readFile(new URL('../../crates/dagon-zkapi-profile/src/lib.rs', import.meta.url), 'utf8');
+    assert.match(source, new RegExp(`pub const PYTH_MAX_AGE_CEILING_SECONDS: u64 = ${PYTH_MAX_AGE_CEILING_SECONDS};`));
+    for (const [age, ok] of [[0, false], [1, true], [PYTH_MAX_AGE_CEILING_SECONDS, true], [PYTH_MAX_AGE_CEILING_SECONDS + 1, false]]) {
+        const candidate = { ...funding, pyth_max_age_seconds: age };
+        if (ok) assert.equal(validateSolanaFunding(candidate), candidate);
+        else assert.throws(() => validateSolanaFunding(candidate), /Pyth safety bounds/);
+    }
 });
 
 test('native SOL quote validation fails closed on deployment, confidence, time, and chain changes', () => {

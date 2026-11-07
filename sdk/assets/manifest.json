@@ -1,13 +1,13 @@
 {
   "schema": 1,
-  "protocolRevision": "cc2183327343a4b3bdb236f2b6d01ff875feea85",
+  "protocolRevision": "cf18d00131b6507ea5f3b3f443814860c993c878",
   "extractedFromRevision": "f7e3d089b32cd85954d9db268228c7bf640174e9",
   "files": {
     "wasm/zkapi_browser.js": "95a510fe67db994c090a53912449a4b99136db088b866797e9a2704c7619f3a0",
     "wasm/zkapi_browser_bg.wasm": "7be1ae22426b251688a1d5962c9482d6fc5a989bbab18f022738807a76bc2bcf",
     "assets/proofs/request.pk": "28db26517500ebd2376b88fe729820912ebcbc2f92830e816ea894e968ad8591",
     "assets/proofs/withdrawal.pk": "30c7cccf1b0fc2ab136b37273c5c19e84e90bf388a35088157dccc053efb479a",
-    "assets/config/profile.json": "7f51f9b6fd597604cb9ebec207eea07fa5f739775b766d9bfc766ae425b1e996",
+    "assets/config/profile.json": "ff404fb6e80bcebebfda7268383e6f879369be29e90c03e6fa7ac7649984c348",
     "assets/config/mainnet-beta.identity.json": "57d036f3f7d07f419165b5f1d55ac980d3e396b126c090a9ebd49a9879e3e6b5"
   },
   "circuitId": "zkapi-v2-concession-v1"

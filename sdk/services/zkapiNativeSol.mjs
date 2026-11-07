@@ -28,6 +28,10 @@ export function requestBillingQuote(request) {
 
 export const LAMPORTS_PER_SOL = 1_000_000_000n;
 const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+// The server's ceiling on the profile's Pyth maximum age
+// (`dagon_zkapi_profile::PYTH_MAX_AGE_CEILING_SECONDS`): the sponsored feed's
+// 60 s heartbeat plus 30 s for landing, finalization and RPC lag.
+export const PYTH_MAX_AGE_CEILING_SECONDS = 90;
 const UPGRADEABLE_LOADER = 'BPFLoaderUpgradeab1e11111111111111111111111';
 const VAULT_DISCRIMINATOR = Uint8Array.from([228, 196, 82, 165, 98, 210, 235, 152]);
 const NOTE_DISCRIMINATOR = Uint8Array.from([148, 41, 201, 122, 175, 58, 113, 83]);
@@ -98,7 +102,7 @@ export function validateSolanaFunding(funding) {
     ]) account(value, label);
     trustedRpcUrl(funding.rpc_url);
     if (!Number.isSafeInteger(funding.pyth_max_age_seconds)
-        || funding.pyth_max_age_seconds < 1 || funding.pyth_max_age_seconds > 60
+        || funding.pyth_max_age_seconds < 1 || funding.pyth_max_age_seconds > PYTH_MAX_AGE_CEILING_SECONDS
         || !Number.isSafeInteger(funding.pyth_max_confidence_bps)
         || funding.pyth_max_confidence_bps < 1 || funding.pyth_max_confidence_bps > 100) {
         throw new Error('The native SOL deployment has invalid Pyth safety bounds.');

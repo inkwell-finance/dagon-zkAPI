@@ -1,29 +1,20 @@
 import { mkdir, readFile, writeFile, open } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
-import { createServer } from 'node:net';
-import { randomBytes } from 'node:crypto';
+import { createServer } from 'node:http';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, execFile } from 'node:child_process';
 import { promisify, parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Connection, Keypair, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } from '@solana/web3.js';
 import { checkParity } from '../check-solana-parity.mjs';
-import { latestPlan, startHermesReplay, priceFreshness, rpc, RECEIVER, PUSH, WORMHOLE } from './pyth-replay.mjs';
+import { latestPlan, startReplay, priceFreshness, rpc, RECEIVER, PUSH, WORMHOLE } from './pyth-replay.mjs';
 const exec = promisify(execFile);
 const defaultRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 
-async function freePort() {
-  const server = createServer();
-  await new Promise((done, fail) => { server.once('error', fail); server.listen(0, '127.0.0.1', done); });
-  const { port } = server.address();
-  await new Promise(done => server.close(done));
-  return port;
-}
-
-// The receiver pays its update fee into treasury PDA `["treasury", [id]]`;
-// the pusher picks the id at random per push, like Pyth's SDK. Mainnet has all
-// 256 funded. Local funding only (lamports, no data): rent-exempt balances.
+// The receiver pays its update fee into treasury PDA `["treasury", [id]]`, and
+// each replayed mainnet update names the id its sponsor transaction picked.
+// Mainnet has all 256 funded. Local funding only (lamports, no data).
 async function fundReceiverTreasuries(connection, payer) {
   const receiver = new PublicKey(RECEIVER);
   const treasuries = Array.from({ length: 256 }, (_, id) => PublicKey.findProgramAddressSync([Buffer.from('treasury'), Buffer.from([id])], receiver)[0]);
@@ -64,6 +55,23 @@ async function immutableProgramAccounts(root, runDir, profile) {
   return flags;
 }
 
+/**
+ * Loopback control of the replay for tests that run outside this process:
+ * `POST /stall` (resolves once no replayed update is in flight), `POST /resume`
+ * and `GET /status`, each answering the replay status as JSON.
+ */
+async function startReplayControl(replay) {
+  const server = createServer((request, response) => {
+    const send = (status, body) => { response.writeHead(status, { 'content-type': 'application/json' }); response.end(JSON.stringify(body)); };
+    const route = `${request.method} ${new URL(request.url, 'http://control.local').pathname}`;
+    const action = { 'POST /stall': () => replay.stall(), 'POST /resume': () => replay.resume(), 'GET /status': () => replay.status() }[route];
+    if (!action) return send(404, { error: 'not found' });
+    Promise.resolve(action()).then(status => send(200, status), error => send(500, { error: error.message }));
+  });
+  await new Promise((done, fail) => { server.once('error', fail); server.listen(0, '127.0.0.1', done); });
+  return { url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise(done => { server.close(done); server.closeAllConnections?.(); }) };
+}
+
 export async function startLocalStack({ root = defaultRoot, runDir, binDir = join(root, 'target/release'), log = console.log, rpcPort = 8899, signal }) {
   if (!runDir) throw new Error('runDir is required (must be a new directory)');
   if (!process.env.ZKAPI_STATE_SEED || !process.env.ZKAPI_CLEAR_SEED) throw new Error('set ZKAPI_STATE_SEED and ZKAPI_CLEAR_SEED; use the same seeds for serverd');
@@ -77,43 +85,34 @@ export async function startLocalStack({ root = defaultRoot, runDir, binDir = joi
   const binary = join(binDir, 'dagon-zkapi-deploy');
   const mainnetUrl = process.env.MAINNET_RPC_URL ?? 'https://api.mainnet-beta.solana.com';
   const rpcUrl = `http://127.0.0.1:${rpcPort}`;
-  const authority = Keypair.generate(); const payer = Keypair.generate(); const pusherPayer = Keypair.generate(); const treasury = Keypair.generate().publicKey.toBase58();
+  const authority = Keypair.generate(); const payer = Keypair.generate(); const replayPayer = Keypair.generate(); const treasury = Keypair.generate().publicKey.toBase58();
   const authorityKeypairPath = join(runDir, 'authority.json'); const payerKeypairPath = join(runDir, 'payer.json'); const identityPath = join(runDir, 'localnet.identity.json');
-  const pusherKeypairPath = join(runDir, 'pyth-pusher-payer.json');
   await writeFile(authorityKeypairPath, JSON.stringify([...authority.secretKey]), { mode: 0o600 });
   await writeFile(payerKeypairPath, JSON.stringify([...payer.secretKey]), { mode: 0o600 });
-  await writeFile(pusherKeypairPath, JSON.stringify([...pusherPayer.secretKey]), { mode: 0o600 });
-  // The recorded Hermes demands a Bearer key exactly like Hermes; the pusher
-  // reads it from PYTH_HERMES_API_KEY as in production.
-  const hermesApiKey = randomBytes(24).toString('hex');
   const abort = new AbortController();
-  let validator; let pusher; let hermes; let stopTask; let stopped = false; let failed; let clonedPublishTime;
+  let validator; let replay; let control; let stopTask; let stopped = false; let failed; let clonedPublishTime;
   const validatorLog = await open(join(runDir, 'validator.log'), 'a');
-  const pusherLog = await open(join(runDir, 'pyth-pusher.log'), 'a');
   const running = child => child?.exitCode === null && child.signalCode === null;
   // exit cannot await stop(). Kill synchronously on fatal errors/forced CLI
-  // exit too, so an interrupted cleanup cannot leave a child behind.
+  // exit too, so an interrupted cleanup cannot leave the validator behind.
   function terminateValidator() {
     stopped = true;
     abort.abort();
-    for (const child of [pusher, validator]) if (running(child)) child.kill('SIGKILL');
-  }
-  async function terminate(child) {
-    if (!running(child)) return;
-    const exited = new Promise(done => child.once('exit', done));
-    child.kill('SIGTERM');
-    const kill = setTimeout(() => child.kill('SIGKILL'), 5000);
-    await exited; clearTimeout(kill);
+    if (running(validator)) validator.kill('SIGKILL');
   }
   function stop() {
     if (stopTask) return stopTask;
     stopped = true;
     abort.abort();
     stopTask = (async () => {
-      await terminate(pusher);
-      await terminate(validator);
-      await hermes?.stop();
-      await pusherLog.close();
+      await control?.close();
+      if (running(validator)) {
+        const exited = new Promise(done => validator.once('exit', done));
+        validator.kill('SIGTERM');
+        const kill = setTimeout(() => validator.kill('SIGKILL'), 5000);
+        await exited; clearTimeout(kill);
+      }
+      await replay?.done;
       await validatorLog.close();
     })().finally(() => {
       signal?.removeEventListener('abort', onAbort);
@@ -130,18 +129,19 @@ export async function startLocalStack({ root = defaultRoot, runDir, binDir = joi
   // before server startup and before quote -> prove -> lease work. The return
   // value describes the finalized account; obtain the billing quote from serverd.
   // Only an update newer than the cloned account counts: the local account has
-  // no writer but the operator pusher, so freshness always relies on it.
+  // no writer but the replay, so freshness always comes from a replayed update.
   async function awaitFreshQuote({ minRemainingSeconds = 5, timeoutMs = 180_000 } = {}) {
     if (!Number.isFinite(minRemainingSeconds) || minRemainingSeconds < 0 || minRemainingSeconds >= profile.pyth.max_age_seconds) throw new Error('invalid fresh-window duration');
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (failed) throw failed;
       if (stopped) throw new Error('local stack is stopped');
+      if (replay.status().stalled) throw new Error('the Pyth replay is stalled; resume it first');
       const quote = await priceFreshness(rpcUrl, priceAccount);
       if (quote.finalized && quote.publishTime > clonedPublishTime && quote.age >= 0 && quote.age < profile.pyth.max_age_seconds - minRemainingSeconds) return quote;
       await delay(500, undefined, { signal: abort.signal });
     }
-    throw new Error('the Pyth pusher did not produce the requested fresh finalized window');
+    throw new Error('the Pyth replay did not produce the requested fresh finalized window');
   }
   try {
     signal?.throwIfAborted();
@@ -151,7 +151,6 @@ export async function startLocalStack({ root = defaultRoot, runDir, binDir = joi
     const discoveryDeadline = Date.now() + 180_000;
     while (!plan && Date.now() < discoveryDeadline) { plan = await latestPlan(mainnetUrl, priceAccount, seen, abort.signal); if (!plan) await delay(2000); }
     if (!plan) throw new Error('no self-contained, fully verified mainnet SOL/USD update found');
-    hermes = await startHermesReplay({ mainnetUrl, priceAccount, apiKey: hermesApiKey, initialPlan: plan, log, signal: abort.signal });
     const bridge = PublicKey.findProgramAddressSync([Buffer.from('Bridge')], new PublicKey(WORMHOLE))[0].toBase58();
     const args = ['--ledger', join(runDir, 'ledger'), '--rpc-port', String(rpcPort), '--faucet-port', String(rpcPort + 101), '--gossip-port', String(rpcPort + 102), '--bind-address', '127.0.0.1', '--url', mainnetUrl,
       '--clone-feature-set',
@@ -171,31 +170,27 @@ export async function startLocalStack({ root = defaultRoot, runDir, binDir = joi
     if (!ready) throw new Error('local validator readiness deadline exceeded');
     clonedPublishTime = (await priceFreshness(rpcUrl, priceAccount)).publishTime;
     const connection = new Connection(rpcUrl, 'confirmed');
-    for (const key of [authority.publicKey, payer.publicKey, pusherPayer.publicKey]) {
+    for (const key of [authority.publicKey, payer.publicKey, replayPayer.publicKey]) {
       const signature = await connection.requestAirdrop(key, 50_000_000_000);
       await connection.confirmTransaction(signature, 'finalized');
     }
-    await fundReceiverTreasuries(connection, payer);
+    await fundReceiverTreasuries(connection, replayPayer);
+    // Replay signed mainnet updates under the sponsor's heartbeat/deviation policy.
+    replay = startReplay({ mainnetUrl, rpcUrl, priceAccount, payer: replayPayer, log, signal: abort.signal,
+      onFailure: error => { failed = error; log(`Pyth replay failed; stopping validator: ${error.stack}`); terminateValidator(); } });
+    control = await startReplayControl(replay);
     await exec(binary, ['identity', '--network', 'localnet', '--solana-rpc-url', rpcUrl, '--vault-authority', authority.publicKey.toBase58(), '--treasury', treasury, '--pyth-price-account', priceAccount, '--out', identityPath]);
-    // The operator pusher binary, exactly as deployed: Hermes (recorded) ->
-    // Wormhole guardian verification -> push oracle -> the pinned account.
-    const pusherMetricsUrl = `http://127.0.0.1:${await freePort()}`;
-    pusher = spawn(join(binDir, 'dagon-zkapi-pyth-pusher'), ['--solana-identity', identityPath, '--solana-rpc-url', rpcUrl,
-      '--payer-keypair', pusherKeypairPath, '--hermes-url', hermes.url, '--listen', new URL(pusherMetricsUrl).host],
-    { cwd: runDir, env: { ...process.env, PYTH_HERMES_API_KEY: hermesApiKey, RUST_LOG: process.env.RUST_LOG ?? 'info' }, stdio: ['ignore', pusherLog.fd, pusherLog.fd] });
-    pusher.on('error', e => { failed = e; });
-    pusher.on('exit', (code, signal) => {
-      if (!stopped) { failed = new Error(`Pyth pusher exited ${code ?? signal}; see ${join(runDir, 'pyth-pusher.log')}`); log(failed.message); terminateValidator(); }
-    });
     const initialized = await exec(binary, ['init-vault', '--solana-identity', identityPath, '--solana-rpc-url', rpcUrl, '--authority-keypair', authorityKeypairPath]);
     log(initialized.stdout.trim());
     await checkParity({ identityPath, rpcUrl, binDir, mainnetRpcUrl: mainnetUrl, log });
     // Initialization and parity can take a finalization window. Only return
-    // after a pushed update is finalized after that work, never a stale clone.
+    // after a replayed update is finalized after that work, never a stale clone.
     await awaitFreshQuote();
     if (failed) throw failed;
     const identity = JSON.parse(await readFile(identityPath, 'utf8'));
-    return { rpcUrl, identityPath, identity, authorityKeypairPath, payerKeypairPath, treasury, pusherMetricsUrl, awaitFreshQuote, stop };
+    return { rpcUrl, identityPath, identity, authorityKeypairPath, payerKeypairPath, treasury,
+      replayControlUrl: control.url, stallReplay: () => replay.stall(), resumeReplay: () => replay.resume(), replayStatus: () => replay.status(),
+      awaitFreshQuote, stop };
   } catch (error) { await stop(); throw error; }
 }
 
@@ -218,7 +213,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   try {
     stack = await startLocalStack({ runDir: values['run-dir'], binDir: values['bin-dir'], rpcPort: values['rpc-port'] ? Number(values['rpc-port']) : undefined, signal: controller.signal });
     if (shuttingDown) { await stack.stop(); process.exit(0); }
-    console.log(JSON.stringify({ rpcUrl: stack.rpcUrl, identityPath: stack.identityPath, authorityKeypairPath: stack.authorityKeypairPath, payerKeypairPath: stack.payerKeypairPath, treasury: stack.treasury, pusherMetricsUrl: stack.pusherMetricsUrl }));
+    console.log(JSON.stringify({ rpcUrl: stack.rpcUrl, identityPath: stack.identityPath, authorityKeypairPath: stack.authorityKeypairPath, payerKeypairPath: stack.payerKeypairPath, treasury: stack.treasury, replayControlUrl: stack.replayControlUrl }));
   } catch (error) {
     if (!shuttingDown) console.error(error);
     process.exit(shuttingDown ? 0 : 1);

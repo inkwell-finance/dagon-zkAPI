@@ -34,11 +34,11 @@ fixtures, development setup keys, or generated artifacts as production pins.
 - Server startup verifies the pinned cluster, immutable program deployment and
   its executable hash, vault-state PDA, finalized vault metadata, and Pyth
   SOL/USD source before opening durable state.
-- The operator image ships `dagon-zkapi-pyth-pusher`, which keeps the pinned
-  Pyth SOL/USD push-oracle account within the 30 s maximum age by posting
-  guardian-verified Hermes updates every 5 s. It is untrusted: the server
-  verifies every quote itself (see
-  [the Solana server](docs/SOLANA_SERVER.md#operator-pyth-pusher)).
+- SOL/USD comes from Pyth's free sponsored push feed (60 s heartbeat, and on
+  any 0.5% move); the server quotes only from a fully verified finalized price
+  at most 90 s old and otherwise refuses new quotes and leases, so a stalled
+  sponsor fails closed rather than mispricing (see
+  [the Solana server](docs/SOLANA_SERVER.md#pyth-sponsored-feed)).
 - Encrypt/FHE is intentionally absent from the default dependency graph and the
   trusted money path. A future experimental ledger may implement `CreditLedger`
   without changing the request API or vault semantics.

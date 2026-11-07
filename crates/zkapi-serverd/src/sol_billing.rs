@@ -1,10 +1,13 @@
 //! Official Pyth Receiver account adapter; no account type crosses this module.
 //!
-//! The SOL/USD price account updates every few seconds while a request proof
-//! takes longer than that to build, so a quote cannot be required to still be
-//! the latest finalized update when the request arrives. Instead the oracle
-//! remembers every quote it has itself decoded from the finalized account
-//! until that quote expires, and accepts a fresh quote it observed.
+//! The pinned SOL/USD account is Pyth's sponsored push feed: it updates on a
+//! 60 s heartbeat and on any 0.5% move, so a new update may land while a
+//! request proof is being built. A quote therefore cannot be required to still
+//! be the latest finalized update when the request arrives. Instead the oracle
+//! remembers quotes it decoded until expiry, but requires a fresh finalized
+//! read at admission and supersedes a quote if the newest observed conservative
+//! price has fallen beyond the profile's tolerance. Quote responses and the
+//! reservation boundary recheck this policy; expiry remains fail-closed.
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -19,8 +22,8 @@ use crate::billing::{
 use crate::config::ServerConfig;
 use crate::error::ServerError;
 
-/// Bound on remembered quotes. At one update per second and a 60 s maximum
-/// age, live quotes never exceed this; on overflow the oldest is forgotten.
+/// Bound on remembered quotes. On overflow forget the oldest publication,
+/// never the newest observation used by the supersession check.
 const MAX_OBSERVED_QUOTES: usize = 256;
 
 /// Quotes this process decoded from the finalized price account, kept until
@@ -39,7 +42,17 @@ impl ObservedQuotes {
             return;
         }
         if self.0.len() == MAX_OBSERVED_QUOTES {
-            self.0.remove(0);
+            let oldest = self
+                .0
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, quote)| quote.publish_time)
+                .map(|(index, _)| index)
+                .expect("full observed quote cache");
+            if quote.publish_time < self.0[oldest].publish_time {
+                return;
+            }
+            self.0.remove(oldest);
         }
         self.0.push(quote.clone());
     }
@@ -48,6 +61,19 @@ impl ObservedQuotes {
         self.prune(now);
         self.0.contains(quote)
     }
+
+    fn assert_not_superseded(
+        &self,
+        quote: &BillingQuote,
+        tolerance_bps: u16,
+    ) -> Result<(), ServerError> {
+        if let Some(newest) = self.0.iter().max_by_key(|quote| quote.publish_time) {
+            if quote.is_superseded_by(newest, tolerance_bps)? {
+                return Err(ServerError::NativeQuoteSuperseded);
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct PythBillingOracle {
@@ -55,6 +81,7 @@ pub struct PythBillingOracle {
     genesis_hash: [u8; 32],
     pins: BillingPins,
     feed_id: [u8; 32],
+    max_supersession_bps: u16,
     http: reqwest::Client,
     observed: Mutex<ObservedQuotes>,
 }
@@ -90,6 +117,7 @@ impl PythBillingOracle {
             genesis_hash: config.identity.genesis_hash,
             pins,
             feed_id,
+            max_supersession_bps: config.profile.pyth.max_supersession_bps,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::none())
@@ -237,22 +265,34 @@ impl PythBillingOracle {
 
 impl BillingPriceSource for PythBillingOracle {
     fn quote(&self, now: u64) -> BillingFuture<'_, BillingQuote> {
-        Box::pin(self.finalized_quote(now))
+        Box::pin(async move {
+            let quote = self.finalized_quote(now).await?;
+            self.assert_admissible(&quote, now)?;
+            Ok(quote)
+        })
     }
 
     fn validate_identity(&self, quote: &BillingQuote) -> Result<(), ServerError> {
         quote.validate_identity(&self.pins)
     }
 
-    /// Accept a fresh quote this oracle decoded from the finalized account,
-    /// even if a newer update has since been published. A quote it has not
-    /// observed (e.g. one fetched before a restart) is accepted only if it is
-    /// the current finalized update; any other quote is superseded.
+    fn assert_admissible(&self, quote: &BillingQuote, now: u64) -> Result<(), ServerError> {
+        self.assert_fresh(quote, now)?;
+        self.observed
+            .lock()
+            .expect("observed quote lock")
+            .assert_not_superseded(quote, self.max_supersession_bps)
+    }
+
+    /// Authenticate against a fresh finalized read on every new admission.
+    /// Previously observed quotes remain usable only within the profile's
+    /// conservative-price tolerance against the newest observation.
     fn validate<'a>(&'a self, quote: &'a BillingQuote, now: u64) -> BillingFuture<'a, ()> {
         Box::pin(async move {
             self.assert_fresh(quote, now)?;
-            if self.was_observed(quote, now) || &self.finalized_quote(now).await? == quote {
-                Ok(())
+            self.finalized_quote(now).await?;
+            if self.was_observed(quote, now) {
+                self.assert_admissible(quote, now)
             } else {
                 Err(ServerError::NativeQuoteSuperseded)
             }
@@ -303,6 +343,32 @@ mod tests {
     }
 
     #[test]
+    fn favourable_observed_quote_is_superseded_before_its_ninety_second_expiry() {
+        let mut observed = ObservedQuotes::default();
+        let mut older = quote(100, "10000000000");
+        older.expires_at = 190;
+        let mut newer = quote(180, "9400000000");
+        newer.expires_at = 270;
+        observed.record(&older, 101);
+        observed.record(&newer, 181);
+        assert!(observed.contains(&older, 189));
+        older.assert_fresh(189).unwrap();
+        // It remains authenticated and unexpired, but cannot be admitted.
+        assert!(matches!(
+            observed.assert_not_superseded(
+                &older,
+                dagon_zkapi_profile::SharedProfile::embedded()
+                    .pyth
+                    .max_supersession_bps,
+            ),
+            Err(ServerError::NativeQuoteSuperseded)
+        ));
+        assert_eq!(older.limit_micro_usd(100_000_000).unwrap(), 10_000_000);
+        assert_eq!(newer.limit_micro_usd(100_000_000).unwrap(), 9_400_000);
+        assert!(!observed.contains(&older, 190));
+    }
+
+    #[test]
     fn unobserved_mutated_and_expired_quotes_are_unknown() {
         let mut observed = ObservedQuotes::default();
         let seen = quote(100, "15000000000");
@@ -328,5 +394,15 @@ mod tests {
         }
         assert_eq!(observed.0.len(), MAX_OBSERVED_QUOTES);
         assert!(!observed.contains(&quote(1_000, "15000000000"), 1_001));
+        let newest = quote(1_002, "10000000000");
+        observed.record(&newest, 1_003);
+        for price in 0..(MAX_OBSERVED_QUOTES as u64 + 10) {
+            observed.record(&quote(1_000, &(16_000_000_000 + price).to_string()), 1_003);
+        }
+        assert!(observed.contains(&newest, 1_003));
+        assert!(matches!(
+            observed.assert_not_superseded(&quote(1_000, "16000000000"), 100),
+            Err(ServerError::NativeQuoteSuperseded)
+        ));
     }
 }

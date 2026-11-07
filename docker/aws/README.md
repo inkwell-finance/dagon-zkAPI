@@ -1,12 +1,16 @@
 # Dagon zkAPI operator deployment
 
-The operator image runs the Dagon server, finalized tree indexer, Pyth price
-pusher and optional escape challenger against the Solana vault, and ships
-`dagon-zkapi-deploy`. Every shared protocol parameter (program id and
-executable hash, circuit, vault policy, server timing, Pyth programs, feed,
-shard, policy and push cadence) is compiled into the binaries from
-`solana/profile/shared.json`; operators supply only the network identity file,
-a finalized RPC URL and secrets. See `docs/solana-profile.md`.
+The operator image runs the Dagon server, finalized tree indexer and optional
+escape challenger against the Solana vault, and ships `dagon-zkapi-deploy`.
+Every shared protocol parameter (program id and executable hash, circuit, vault
+policy, server timing, Pyth programs, feed, shard and policy) is compiled into
+the binaries from `solana/profile/shared.json`; operators supply only the
+network identity file, a finalized RPC URL and secrets. See
+`docs/solana-profile.md`.
+
+The SOL/USD price comes from Pyth's free sponsored push feed (shard 0 of the
+push oracle). The operator posts no prices and needs no Hermes API key or fee
+payer for them. See `docs/SOLANA_SERVER.md`, "Pyth sponsored feed".
 
 This is release-candidate packaging, not a populated production deployment.
 The fresh SBF build and full funded local-validator lifecycle have passed, but
@@ -25,7 +29,6 @@ sudo install -m 0644 docker/aws/deployment.env.example /etc/zkapi/deployment.env
 sudo install -m 0600 docker/aws/indexer.env.example /etc/zkapi/indexer.env
 sudo install -m 0600 docker/aws/server.env.example /etc/zkapi/server.env
 sudo install -m 0600 docker/aws/challenge.env.example /etc/zkapi/challenge.env
-sudo install -m 0600 docker/aws/pyth-pusher.env.example /etc/zkapi/pyth-pusher.env
 ```
 
 Replace every placeholder. Never commit the populated files.
@@ -37,18 +40,11 @@ Replace every placeholder. Never commit the populated files.
 | `server.env` | Distinct signing seeds and exactly one lease-issuer credential |
 | `challenge.env` | Challenger keypair path and optional dedicated RPC |
 | `challenge-keypair.json` | Dedicated rent/transaction payer; mode `0600` |
-| `pyth-pusher.env` | Hermes API key, pusher keypair path, optional RPC/Hermes URL, priority fee and balance alarm |
-| `pyth-pusher-keypair.json` | Dedicated, funded Pyth push fee payer; mode `0600` |
 | `config.json` | Public browser deployment manifest served by the gateway |
 
-The challenger mounts `/etc/zkapi` read-only; the Pyth pusher mounts **only**
-`pyth-pusher-keypair.json`, never the directory containing server signing seeds
-or other payers. Bind-mount any public identity separately (below). Each
-keypair must be dedicated to its daemon: not the vault treasury, vault
-authority, the other daemon's keypair or any user wallet. Create the pusher payer with
-`solana-keygen new --no-bip39-passphrase -o /etc/zkapi/pyth-pusher-keypair.json`,
-make it readable by uid 10001 only, and fund it (see
-`docs/SOLANA_SERVER.md`, "Operator Pyth pusher", for the daily cost).
+The challenger mounts `/etc/zkapi` read-only. Bind-mount any public identity
+separately (below). The challenger keypair must be dedicated to it: not the
+vault treasury, vault authority or any user wallet.
 
 ## Network identity
 
@@ -59,23 +55,24 @@ only the allowed per-network values (genesis hash, vault authority, vault state,
 treasury, Pyth price account, which must be the profile's push-oracle
 account). To run against a different deployment, produce a
 file with `dagon-zkapi-deploy identity ...`, bind-mount it read-only into the
-indexer, server, challenger and Pyth pusher (for example at
+indexer, server and challenger (for example at
 `/run/dagon-zkapi-identity/identity.json`) and set `ZKAPI_SOLANA_IDENTITY` in
 `deployment.env`. Unknown keys and shared parameters are rejected.
 
 ## Start Solana services
 
-Build and start the Pyth pusher, indexer and server:
+Build and start the indexer and server:
 
 ```sh
 docker compose -f docker/aws/compose.yml build
-docker compose -f docker/aws/compose.yml up -d pyth-pusher indexer server gateway
+docker compose -f docker/aws/compose.yml up -d indexer server gateway
 ```
 
-The server does not depend on pusher health: it independently requires a fresh,
-fully verified finalized price at startup and for each quote. A broken pusher
-must not block startup while Pyth's sponsor provides a valid price. Monitor
-pusher health separately; sponsor-only service has intermittent fresh windows.
+The server refuses to start unless the sponsored Pyth account holds a fully
+verified finalized price younger than the profile's 90 s maximum age. Pyth's
+sponsor refreshes it at least once a minute, so this holds unless the sponsor
+has stalled; the `unless-stopped` restart policy then retries startup until
+the feed recovers.
 
 After the server is healthy, enable the challenger profile:
 
@@ -105,7 +102,7 @@ price account satisfies the profile's receiver/feed/age/confidence policy.
   seeds requires a new vault identity and client configuration.
 - Monitor `/health`, finalized RPC availability, quote freshness, settlement
   retries and challenger progress. Stop funded operation on any identity drift.
-- Scrape the pusher's `/metrics` (port 3002, inside the backend network) and
-  alert as described in `docs/SOLANA_SERVER.md` ("Operator Pyth pusher"):
-  finalized price age, consecutive failures, Hermes authentication failures and
-  the payer balance.
+- Alert on the age of the sponsored Pyth price (page above 90 s, when the
+  server refuses every new quote and lease): probe `/v2/billing/quote` through
+  the gateway as described in `docs/SOLANA_SERVER.md` ("Monitoring and
+  alerting"). No paid service is needed.
