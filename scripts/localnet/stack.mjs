@@ -1,28 +1,40 @@
-import { mkdir, readFile, writeFile, open } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, open, access } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
-import { createServer } from 'node:http';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, execFile } from 'node:child_process';
 import { promisify, parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
-import { Connection, Keypair, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } from '@solana/web3.js';
+import { Connection, Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction, sendAndConfirmTransaction } from '@solana/web3.js';
 import { checkParity } from '../check-solana-parity.mjs';
-import { latestPlan, startReplay, priceFreshness, rpc, RECEIVER, PUSH, WORMHOLE } from './pyth-replay.mjs';
 const exec = promisify(execFile);
 const defaultRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 
-// The receiver pays its update fee into treasury PDA `["treasury", [id]]`, and
-// each replayed mainnet update names the id its sponsor transaction picked.
-// Mainnet has all 256 funded. Local funding only (lamports, no data).
-async function fundReceiverTreasuries(connection, payer) {
-  const receiver = new PublicKey(RECEIVER);
-  const treasuries = Array.from({ length: 256 }, (_, id) => PublicKey.findProgramAddressSync([Buffer.from('treasury'), Buffer.from([id])], receiver)[0]);
-  const lamports = await connection.getMinimumBalanceForRentExemption(0);
-  for (let i = 0; i < treasuries.length; i += 20) {
-    const tx = new Transaction().add(...treasuries.slice(i, i + 20).map(toPubkey => SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey, lamports })));
-    await sendAndConfirmTransaction(connection, tx, [payer], { commitment: 'confirmed' });
-  }
+/** Fixed local id of the test-only PDA signer (`solana/test-programs/pda-signer`). */
+export const PDA_SIGNER_PROGRAM_ID = 'FrGKWj9gdt9d7VcjWN6zucZxYgYqyRDeGXdCWeQybr3u';
+const PDA_SIGNER_SO = 'target/deploy-test/dagon_zkapi_test_pda_signer.so';
+const BPF_LOADER_2 = 'BPFLoader2111111111111111111111111111111111';
+// Faucet balance: 1,000,000 USDC in base units (fabricated local state).
+const FAUCET_BALANCE = 1_000_000_000_000n;
+
+// Agave genesis Rent::default(): 3480 lamports/byte-year, exemption
+// threshold 2, and 128 bytes of account-storage overhead.
+const rentExempt = bytes => (bytes + 128) * 3480 * 2;
+
+async function rpc(url, method, params) {
+  const response = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(30_000) });
+  if (!response.ok) throw new Error(`${method}: HTTP ${response.status}`);
+  const body = await response.json();
+  if (body.error) throw new Error(`${method}: ${JSON.stringify(body.error)}`);
+  return body.result;
+}
+
+async function writeAccountFixture(runDir, address, { lamports, data, owner, executable = false }) {
+  const path = join(runDir, `${address.toBase58()}.json`);
+  await writeFile(path, JSON.stringify({ pubkey: address.toBase58(), account: {
+    lamports, data: [data.toString('base64'), 'base64'], owner: owner.toBase58(), executable, rentEpoch: 0,
+  } }));
+  return ['--account', address.toBase58(), path];
 }
 
 async function immutableProgramAccounts(root, runDir, profile) {
@@ -43,36 +55,89 @@ async function immutableProgramAccounts(root, runDir, profile) {
   executable.copy(dataBytes, 45);
   const flags = [];
   for (const [address, data, executableAccount] of [[program, programBytes, true], [programData, dataBytes, false]]) {
-    const path = join(runDir, `${address.toBase58()}.json`);
-    // Agave 3.1.11 genesis Rent::default(): 3480 lamports/byte-year,
-    // exemption threshold 2, and 128 bytes of account-storage overhead.
-    await writeFile(path, JSON.stringify({ pubkey: address.toBase58(), account: {
-      lamports: (data.length + 128) * 3480 * 2, data: [data.toString('base64'), 'base64'],
-      owner: loader.toBase58(), executable: executableAccount, rentEpoch: 0,
-    } }));
-    flags.push('--account', address.toBase58(), path);
+    flags.push(...await writeAccountFixture(runDir, address, { lamports: rentExempt(data.length), data, owner: loader, executable: executableAccount }));
   }
   return flags;
 }
 
-/**
- * Loopback control of the replay for tests that run outside this process:
- * `POST /stall` (resolves once no replayed update is in flight), `POST /resume`
- * and `GET /status`, each answering the replay status as JSON.
- */
-async function startReplayControl(replay) {
-  const server = createServer((request, response) => {
-    const send = (status, body) => { response.writeHead(status, { 'content-type': 'application/json' }); response.end(JSON.stringify(body)); };
-    const route = `${request.method} ${new URL(request.url, 'http://control.local').pathname}`;
-    const action = { 'POST /stall': () => replay.stall(), 'POST /resume': () => replay.resume(), 'GET /status': () => replay.status() }[route];
-    if (!action) return send(404, { error: 'not found' });
-    Promise.resolve(action()).then(status => send(200, status), error => send(500, { error: error.message }));
-  });
-  await new Promise((done, fail) => { server.once('error', fail); server.listen(0, '127.0.0.1', done); });
-  return { url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise(done => { server.close(done); server.closeAllConnections?.(); }) };
+export function usdcAssociatedTokenAddress(profile, owner) {
+  const { token_program: token, mint, associated_token_program: ata } = profile.asset;
+  return PublicKey.findProgramAddressSync([owner.toBuffer(), new PublicKey(token).toBuffer(), new PublicKey(mint).toBuffer()], new PublicKey(ata))[0];
 }
 
-export async function startLocalStack({ root = defaultRoot, runDir, binDir = join(root, 'target/release'), log = console.log, rpcPort = 8899, signal }) {
+/**
+ * A classic-Token USDC account fixture at `owner`'s canonical ATA. Its balance
+ * and state are fabricated local state; only the mint it names is mainnet's.
+ */
+async function usdcTokenAccountFixture(runDir, profile, owner, { amount, state }) {
+  const address = usdcAssociatedTokenAddress(profile, owner);
+  const data = Buffer.alloc(165);
+  new PublicKey(profile.asset.mint).toBuffer().copy(data, 0);
+  owner.toBuffer().copy(data, 32);
+  data.writeBigUInt64LE(amount, 64);
+  data[108] = state; // 1 = initialized, 2 = frozen; no delegate, not native, no close authority.
+  return { address, flags: await writeAccountFixture(runDir, address, { lamports: rentExempt(165), data, owner: new PublicKey(profile.asset.token_program) }) };
+}
+
+/**
+ * Clone flags that make the local Token and ATA programs mainnet's exact
+ * executables, whichever loader mainnet currently uses for each (the parity
+ * check then compares their executable hashes).
+ */
+async function mainnetProgramClones(mainnetUrl, programs) {
+  const flags = [];
+  for (const address of programs) {
+    const account = (await rpc(mainnetUrl, 'getAccountInfo', [address, { encoding: 'base64', dataSlice: { offset: 0, length: 0 } }])).value;
+    if (!account?.executable) throw new Error(`mainnet program ${address} is absent or not executable`);
+    if (account.owner === 'BPFLoaderUpgradeab1e11111111111111111111111') flags.push('--clone-upgradeable-program', address);
+    else if (account.owner === BPF_LOADER_2) flags.push('--clone', address);
+    else throw new Error(`mainnet program ${address} has unsupported loader ${account.owner}`);
+  }
+  return flags;
+}
+
+async function writeKeypair(path, keypair) {
+  await writeFile(path, JSON.stringify([...keypair.secretKey]), { mode: 0o600 });
+  return path;
+}
+
+async function ensurePdaSigner(root, log) {
+  const path = join(root, PDA_SIGNER_SO);
+  try { await access(path); } catch {
+    log(`building ${PDA_SIGNER_SO}`);
+    await exec('bash', [join(root, 'scripts/localnet/build-test-programs.sh')], { cwd: root, maxBuffer: 64 * 1024 * 1024 });
+  }
+  return path;
+}
+
+/**
+ * Seconds to add to the validator's wall clock so that, at `now`, it reads
+ * `secondsBefore` seconds before a UTC midnight: the next one, or the one
+ * after when the next is less than `secondsBefore` away (the shim only moves
+ * the clock forward). The chain clock then advances in real time from there.
+ */
+export function clockOffsetBeforeUtcMidnight(secondsBefore, now = Date.now()) {
+  if (!Number.isInteger(secondsBefore) || secondsBefore < 0 || secondsBefore >= 86_400) throw new Error('seconds before UTC midnight must be an integer in 0..86399');
+  const nowSeconds = Math.floor(now / 1000);
+  const midnight = (Math.floor(nowSeconds / 86_400) + 1) * 86_400;
+  const offset = midnight - secondsBefore - nowSeconds;
+  return offset >= 0 ? offset : offset + 86_400;
+}
+
+/**
+ * Test-only: build the LD_PRELOAD shim (`clock-offset.c`) that shifts the
+ * validator's CLOCK_REALTIME, and so its Clock sysvar from genesis on, by
+ * `clockOffsetSeconds`. Never used by a deployment; parity is unaffected.
+ */
+async function clockOffsetEnv(root, runDir, clockOffsetSeconds) {
+  if (!Number.isSafeInteger(clockOffsetSeconds) || clockOffsetSeconds < 0) throw new Error('clockOffsetSeconds must be a nonnegative integer');
+  if (clockOffsetSeconds === 0) return process.env;
+  const shim = join(runDir, 'clock-offset.so');
+  await exec('gcc', ['-shared', '-fPIC', '-O2', '-o', shim, join(root, 'scripts/localnet/clock-offset.c')]);
+  return { ...process.env, LD_PRELOAD: shim, DAGON_CLOCK_OFFSET_SECONDS: String(clockOffsetSeconds) };
+}
+
+export async function startLocalStack({ root = defaultRoot, runDir, binDir = join(root, 'target/release'), log = console.log, rpcPort = 8899, clockOffsetSeconds = 0, signal }) {
   if (!runDir) throw new Error('runDir is required (must be a new directory)');
   if (!process.env.ZKAPI_STATE_SEED || !process.env.ZKAPI_CLEAR_SEED) throw new Error('set ZKAPI_STATE_SEED and ZKAPI_CLEAR_SEED; use the same seeds for serverd');
   root = resolve(root); runDir = resolve(runDir); binDir = resolve(binDir);
@@ -80,17 +145,18 @@ export async function startLocalStack({ root = defaultRoot, runDir, binDir = joi
   const lock = await open(join(runDir, 'stack.lock'), 'wx');
   await lock.close();
   const profile = JSON.parse(await readFile(join(root, 'solana/profile/shared.json'), 'utf8'));
-  const mainnetIdentity = JSON.parse(await readFile(join(root, 'solana/profile/mainnet-beta.identity.json'), 'utf8'));
-  const priceAccount = new PublicKey(mainnetIdentity.pyth_price_account).toBase58();
   const binary = join(binDir, 'dagon-zkapi-deploy');
   const mainnetUrl = process.env.MAINNET_RPC_URL ?? 'https://api.mainnet-beta.solana.com';
   const rpcUrl = `http://127.0.0.1:${rpcPort}`;
-  const authority = Keypair.generate(); const payer = Keypair.generate(); const replayPayer = Keypair.generate(); const treasury = Keypair.generate().publicKey.toBase58();
-  const authorityKeypairPath = join(runDir, 'authority.json'); const payerKeypairPath = join(runDir, 'payer.json'); const identityPath = join(runDir, 'localnet.identity.json');
-  await writeFile(authorityKeypairPath, JSON.stringify([...authority.secretKey]), { mode: 0o600 });
-  await writeFile(payerKeypairPath, JSON.stringify([...payer.secretKey]), { mode: 0o600 });
+  const authority = Keypair.generate(); const payer = Keypair.generate(); const treasuryOwner = Keypair.generate();
+  const faucet = Keypair.generate(); const frozenOwner = Keypair.generate();
+  const authorityKeypairPath = await writeKeypair(join(runDir, 'authority.json'), authority);
+  const payerKeypairPath = await writeKeypair(join(runDir, 'payer.json'), payer);
+  const usdcFaucetKeypairPath = await writeKeypair(join(runDir, 'usdc-faucet.json'), faucet);
+  const frozenUsdcOwnerKeypairPath = await writeKeypair(join(runDir, 'frozen-usdc-owner.json'), frozenOwner);
+  const identityPath = join(runDir, 'localnet.identity.json');
   const abort = new AbortController();
-  let validator; let replay; let control; let stopTask; let stopped = false; let failed; let clonedPublishTime;
+  let validator; let stopTask; let stopped = false; let failed;
   const validatorLog = await open(join(runDir, 'validator.log'), 'a');
   const running = child => child?.exitCode === null && child.signalCode === null;
   // exit cannot await stop(). Kill synchronously on fatal errors/forced CLI
@@ -105,14 +171,12 @@ export async function startLocalStack({ root = defaultRoot, runDir, binDir = joi
     stopped = true;
     abort.abort();
     stopTask = (async () => {
-      await control?.close();
       if (running(validator)) {
         const exited = new Promise(done => validator.once('exit', done));
         validator.kill('SIGTERM');
         const kill = setTimeout(() => validator.kill('SIGKILL'), 5000);
         await exited; clearTimeout(kill);
       }
-      await replay?.done;
       await validatorLog.close();
     })().finally(() => {
       signal?.removeEventListener('abort', onAbort);
@@ -125,77 +189,68 @@ export async function startLocalStack({ root = defaultRoot, runDir, binDir = joi
   process.on('exit', terminateValidator);
   process.on('uncaughtExceptionMonitor', terminateValidator);
   signal?.addEventListener('abort', onAbort, { once: true });
-  // Timing only: never extend max_age or manufacture an oracle quote. Call
-  // before server startup and before quote -> prove -> lease work. The return
-  // value describes the finalized account; obtain the billing quote from serverd.
-  // Only an update newer than the cloned account counts: the local account has
-  // no writer but the replay, so freshness always comes from a replayed update.
-  async function awaitFreshQuote({ minRemainingSeconds = 5, timeoutMs = 180_000 } = {}) {
-    if (!Number.isFinite(minRemainingSeconds) || minRemainingSeconds < 0 || minRemainingSeconds >= profile.pyth.max_age_seconds) throw new Error('invalid fresh-window duration');
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (failed) throw failed;
-      if (stopped) throw new Error('local stack is stopped');
-      if (replay.status().stalled) throw new Error('the Pyth replay is stalled; resume it first');
-      const quote = await priceFreshness(rpcUrl, priceAccount);
-      if (quote.finalized && quote.publishTime > clonedPublishTime && quote.age >= 0 && quote.age < profile.pyth.max_age_seconds - minRemainingSeconds) return quote;
-      await delay(500, undefined, { signal: abort.signal });
-    }
-    throw new Error('the Pyth replay did not produce the requested fresh finalized window');
-  }
   try {
     signal?.throwIfAborted();
     await exec(process.execPath, [join(root, 'scripts/localnet/executable-hash.mjs'), join(root, 'target/deploy/dagon_zkapi_vault.so'), join(root, 'solana/profile/shared.json'), '--check']);
-    let plan;
-    const seen = new Set();
-    const discoveryDeadline = Date.now() + 180_000;
-    while (!plan && Date.now() < discoveryDeadline) { plan = await latestPlan(mainnetUrl, priceAccount, seen, abort.signal); if (!plan) await delay(2000); }
-    if (!plan) throw new Error('no self-contained, fully verified mainnet SOL/USD update found');
-    const bridge = PublicKey.findProgramAddressSync([Buffer.from('Bridge')], new PublicKey(WORMHOLE))[0].toBase58();
+    const pdaSignerPath = await ensurePdaSigner(root, log);
+    const faucetAccount = await usdcTokenAccountFixture(runDir, profile, faucet.publicKey, { amount: FAUCET_BALANCE, state: 1 });
+    const frozenAccount = await usdcTokenAccountFixture(runDir, profile, frozenOwner.publicKey, { amount: 0n, state: 2 });
     const args = ['--ledger', join(runDir, 'ledger'), '--rpc-port', String(rpcPort), '--faucet-port', String(rpcPort + 101), '--gossip-port', String(rpcPort + 102), '--bind-address', '127.0.0.1', '--url', mainnetUrl,
       '--clone-feature-set',
       ...await immutableProgramAccounts(root, runDir, profile),
-      '--clone-upgradeable-program', RECEIVER, '--clone-upgradeable-program', PUSH, '--clone-upgradeable-program', WORMHOLE,
-      ...[plan.config, plan.guardian, bridge, priceAccount].flatMap(a => ['--clone', a]), '--log'];
+      // The real mainnet USDC mint, byte-identical at clone time.
+      '--clone', profile.asset.mint,
+      ...await mainnetProgramClones(mainnetUrl, [profile.asset.token_program, profile.asset.associated_token_program]),
+      ...faucetAccount.flags, ...frozenAccount.flags,
+      '--bpf-program', PDA_SIGNER_PROGRAM_ID, pdaSignerPath,
+      '--log'];
     const validatorPath = process.env.DAGON_SOLANA_TEST_VALIDATOR ?? join(process.env.XDG_DATA_HOME ?? join(homedir(), '.local/share'), 'dagon-zkapi/agave-v4.4.1/solana-release/bin/solana-test-validator');
+    const validatorEnv = await clockOffsetEnv(root, runDir, clockOffsetSeconds);
     abort.signal.throwIfAborted();
-    validator = spawn(validatorPath, args, { cwd: runDir, stdio: ['ignore', validatorLog.fd, validatorLog.fd] });
+    validator = spawn(validatorPath, args, { cwd: runDir, env: validatorEnv, stdio: ['ignore', validatorLog.fd, validatorLog.fd] });
     validator.on('error', e => { failed = e; });
     validator.on('exit', (code, signal) => { if (!stopped) { failed = new Error(`validator exited ${code ?? signal}; see ${join(runDir, 'validator.log')}`); abort.abort(); } });
     let ready = false;
     for (let i = 0; i < 180; i++) {
       if (failed) throw failed;
-      try { await rpc(rpcUrl, 'getHealth', []); ready = true; break; } catch { await delay(500); }
+      try { await rpc(rpcUrl, 'getHealth', []); ready = true; break; } catch { await delay(500, undefined, { signal: abort.signal }); }
     }
     if (!ready) throw new Error('local validator readiness deadline exceeded');
-    clonedPublishTime = (await priceFreshness(rpcUrl, priceAccount)).publishTime;
     const connection = new Connection(rpcUrl, 'confirmed');
-    for (const key of [authority.publicKey, payer.publicKey, replayPayer.publicKey]) {
+    // Fee/rent SOL for every local signer; the faucet and frozen-account
+    // owners sign their own USDC transfers and account creations in tests.
+    for (const key of [authority.publicKey, payer.publicKey, faucet.publicKey, frozenOwner.publicKey]) {
       const signature = await connection.requestAirdrop(key, 50_000_000_000);
       await connection.confirmTransaction(signature, 'finalized');
     }
-    await fundReceiverTreasuries(connection, replayPayer);
-    // Replay signed mainnet updates under the sponsor's heartbeat/deviation policy.
-    replay = startReplay({ mainnetUrl, rpcUrl, priceAccount, payer: replayPayer, log, signal: abort.signal,
-      onFailure: error => { failed = error; log(`Pyth replay failed; stopping validator: ${error.stack}`); terminateValidator(); } });
-    control = await startReplayControl(replay);
-    await exec(binary, ['identity', '--network', 'localnet', '--solana-rpc-url', rpcUrl, '--vault-authority', authority.publicKey.toBase58(), '--treasury', treasury, '--pyth-price-account', priceAccount, '--out', identityPath]);
+    // The treasury's canonical USDC ATA, created through the cloned ATA
+    // program (CreateIdempotent) as any operator would on mainnet.
+    const treasuryTokenAccount = usdcAssociatedTokenAddress(profile, treasuryOwner.publicKey);
+    const createTreasury = new TransactionInstruction({ programId: new PublicKey(profile.asset.associated_token_program), data: Buffer.from([1]), keys: [
+      { pubkey: payer.publicKey, isSigner: true, isWritable: true },
+      { pubkey: treasuryTokenAccount, isSigner: false, isWritable: true },
+      { pubkey: treasuryOwner.publicKey, isSigner: false, isWritable: false },
+      { pubkey: new PublicKey(profile.asset.mint), isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: new PublicKey(profile.asset.token_program), isSigner: false, isWritable: false },
+    ] });
+    await sendAndConfirmTransaction(connection, new Transaction().add(createTreasury), [payer], { commitment: 'finalized' });
+    await exec(binary, ['identity', '--network', 'localnet', '--solana-rpc-url', rpcUrl, '--vault-authority', authority.publicKey.toBase58(), '--treasury-token-account', treasuryTokenAccount.toBase58(), '--out', identityPath]);
     const initialized = await exec(binary, ['init-vault', '--solana-identity', identityPath, '--solana-rpc-url', rpcUrl, '--authority-keypair', authorityKeypairPath]);
     log(initialized.stdout.trim());
     await checkParity({ identityPath, rpcUrl, binDir, mainnetRpcUrl: mainnetUrl, log });
-    // Initialization and parity can take a finalization window. Only return
-    // after a replayed update is finalized after that work, never a stale clone.
-    await awaitFreshQuote();
     if (failed) throw failed;
     const identity = JSON.parse(await readFile(identityPath, 'utf8'));
-    return { rpcUrl, identityPath, identity, authorityKeypairPath, payerKeypairPath, treasury,
-      replayControlUrl: control.url, stallReplay: () => replay.stall(), resumeReplay: () => replay.resume(), replayStatus: () => replay.status(),
-      awaitFreshQuote, stop };
+    return { rpcUrl, identityPath, identity, authorityKeypairPath, payerKeypairPath, treasuryTokenAccount: treasuryTokenAccount.toBase58(),
+      usdcFaucetKeypairPath, usdcFaucetTokenAccount: faucetAccount.address.toBase58(),
+      frozenUsdcOwnerKeypairPath, frozenUsdcTokenAccount: frozenAccount.address.toBase58(),
+      pdaSignerProgramId: PDA_SIGNER_PROGRAM_ID, clockOffsetSeconds, stop };
   } catch (error) { await stop(); throw error; }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  const { values } = parseArgs({ options: { 'run-dir': { type: 'string' }, 'bin-dir': { type: 'string' }, 'rpc-port': { type: 'string' } } });
+  const { values } = parseArgs({ options: { 'run-dir': { type: 'string' }, 'bin-dir': { type: 'string' }, 'rpc-port': { type: 'string' },
+    'clock-offset-seconds': { type: 'string' }, 'clock-before-utc-midnight': { type: 'string' } } });
   const controller = new AbortController();
   let stack; let shuttingDown = false;
   function shutdown() {
@@ -211,9 +266,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   // with SIGINT inherited as SIG_IGN. Keep handlers for repeated signals.
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, shutdown);
   try {
-    stack = await startLocalStack({ runDir: values['run-dir'], binDir: values['bin-dir'], rpcPort: values['rpc-port'] ? Number(values['rpc-port']) : undefined, signal: controller.signal });
+    if (values['clock-offset-seconds'] !== undefined && values['clock-before-utc-midnight'] !== undefined) throw new Error('use --clock-offset-seconds or --clock-before-utc-midnight, not both');
+    const integer = (name, text) => { if (!/^\d+$/.test(text)) throw new Error(`--${name} must be a nonnegative integer`); return Number(text); };
+    const clockOffsetSeconds = values['clock-before-utc-midnight'] !== undefined
+      ? clockOffsetBeforeUtcMidnight(integer('clock-before-utc-midnight', values['clock-before-utc-midnight']))
+      : values['clock-offset-seconds'] !== undefined ? integer('clock-offset-seconds', values['clock-offset-seconds']) : 0;
+    stack = await startLocalStack({ runDir: values['run-dir'], binDir: values['bin-dir'], rpcPort: values['rpc-port'] ? Number(values['rpc-port']) : undefined, clockOffsetSeconds, signal: controller.signal });
     if (shuttingDown) { await stack.stop(); process.exit(0); }
-    console.log(JSON.stringify({ rpcUrl: stack.rpcUrl, identityPath: stack.identityPath, authorityKeypairPath: stack.authorityKeypairPath, payerKeypairPath: stack.payerKeypairPath, treasury: stack.treasury, replayControlUrl: stack.replayControlUrl }));
+    const { stop: _stop, ...fields } = stack;
+    console.log(JSON.stringify(fields));
   } catch (error) {
     if (!shuttingDown) console.error(error);
     process.exit(shuttingDown ? 0 : 1);

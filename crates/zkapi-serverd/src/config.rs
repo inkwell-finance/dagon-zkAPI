@@ -1,13 +1,11 @@
 //! Server configuration.
 //!
-//! Every shared parameter (protocol, vault, lease timing, Pyth oracle) comes
+//! Every shared parameter (protocol, USDC asset, vault, lease timing) comes
 //! from the deployment profile; a network differs only through its identity.
 
 pub use dagon_zkapi_profile::{ResolvedIdentity, SharedProfile, MAINNET_BETA};
 pub use dagon_zkapi_solana_ledger::SolanaLedgerConfig;
 use zkapi_types::Felt252;
-
-use crate::billing::BillingPins;
 
 /// Source used to provision prompt-private, short-lived OpenRouter keys.
 #[derive(Clone)]
@@ -179,7 +177,7 @@ impl ServerConfig {
         )
     }
 
-    /// Minimum proof-bound lease budget in lamports.
+    /// Minimum proof-bound lease budget in USDC base units ($1).
     pub fn request_charge_cap(&self) -> u128 {
         u128::from(self.profile.vault.request_charge_cap)
     }
@@ -192,24 +190,6 @@ impl ServerConfig {
             &self.profile,
             &self.identity,
         )
-    }
-
-    /// Operator-owned quote pins: the identity's price account, everything
-    /// else Pyth from the profile.
-    pub fn billing_pins(&self) -> BillingPins {
-        let pyth = &self.profile.pyth;
-        BillingPins {
-            chain_id: self.chain_id(),
-            deployment_binding: self.contract_address(),
-            backend: "dagon.solana.groth16.v1".into(),
-            network: self.network.clone(),
-            vault: bs58::encode(self.identity.vault_state).into_string(),
-            feed_id: pyth.feed_id.clone(),
-            feed_account: bs58::encode(self.identity.pyth_price_account).into_string(),
-            receiver_program: pyth.receiver_program.clone(),
-            max_age_seconds: pyth.max_age_seconds,
-            max_confidence_bps: pyth.max_confidence_bps,
-        }
     }
 
     /// Reject incomplete or unsafe configurations before startup opens any
@@ -229,7 +209,6 @@ impl ServerConfig {
             "identity vault state is not the vault PDA of its authority"
         );
         dagon_zkapi_solana_ledger::SolanaCreditLedger::new(self.ledger_config())?;
-        crate::sol_billing::PythBillingOracle::new(self)?;
         match &self.lease_source {
             OpenRouterLeaseSourceConfig::OpenRouter { management_key, .. } => anyhow::ensure!(
                 !management_key.is_empty(),

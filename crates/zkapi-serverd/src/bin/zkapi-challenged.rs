@@ -19,7 +19,7 @@ use zkapi_serverd::{
              v2 server evidence database"
 )]
 struct Args {
-    /// Network identity file (genesis hash, vault, treasury, Pyth account).
+    /// Network identity file (genesis hash, vault, treasury token account).
     #[arg(long, env = "ZKAPI_SOLANA_IDENTITY")]
     solana_identity: PathBuf,
     /// Solana JSON-RPC endpoint of the identity's cluster (may carry an API key).

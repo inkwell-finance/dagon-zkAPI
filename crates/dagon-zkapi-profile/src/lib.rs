@@ -1,7 +1,7 @@
 //! The Dagon zkAPI Solana deployment profile.
 //!
 //! `solana/profile/shared.json` is the single source of truth for every
-//! protocol, economic, oracle and program-build parameter. It is compiled into
+//! protocol, economic, asset and program-build parameter. It is compiled into
 //! every operator binary, so no deployment can change it at runtime and a local
 //! validator stack runs exactly the parameters mainnet runs.
 //!
@@ -33,25 +33,24 @@ pub const MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw
 pub const UPGRADEABLE_LOADER: &str = "BPFLoaderUpgradeab1e11111111111111111111111";
 /// Seed prefix of the vault-state PDA: `["vault", authority]`.
 pub const VAULT_SEED: &[u8] = b"vault";
-/// Largest `pyth.max_age_seconds` a profile may set, and the server's ceiling.
-///
-/// The pinned price account is Pyth's sponsored SOL/USD push feed, which Pyth
-/// updates on a 60 s heartbeat and on any 0.5% price move. While the sponsor
-/// is healthy the finalized account is therefore at most one heartbeat plus
-/// its landing and finalization delay old. 90 s is that heartbeat plus 30 s
-/// for landing, finalization and RPC lag (legacy finality alone is ~13 s). A
-/// price older than this means the sponsor missed its heartbeat, so the
-/// server must refuse to quote from it rather than accept a staler price.
-pub const PYTH_MAX_AGE_CEILING_SECONDS: u64 = 90;
+/// Seed prefix of the vault's USDC token account PDA: `["vault-token", vault_state]`.
+pub const VAULT_TOKEN_SEED: &[u8] = b"vault-token";
+/// The only asset: Circle USDC on Solana, under the classic SPL Token program.
+pub const USDC_SYMBOL: &str = "USDC";
+pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+/// One base unit is one micro-USDC, which the protocol bills as one micro-USD.
+pub const USDC_DECIMALS: u8 = 6;
+/// Classic SPL Token. Token-2022 is rejected everywhere.
+pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+pub const ASSOCIATED_TOKEN_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 
 /// The only keys that may differ between two deployments of the profile.
 ///
 /// `network`, `rpc_url` and `genesis_hash` name the cluster; `chain_id` and
 /// `deployment_binding` are derived from the genesis hash, program and vault.
-/// The vault authority, vault PDA and treasury are per-deployment accounts.
-/// The Pyth price account is declared per network but must be the profile's
-/// push-oracle account (checked like the vault PDA), and the signing keys are
-/// derived from per-deployment secret seeds.
+/// The vault authority, vault PDA and treasury token account are
+/// per-deployment accounts, and the signing keys are derived from
+/// per-deployment secret seeds.
 pub const IDENTITY_KEYS: &[&str] = &[
     "network",
     "rpc_url",
@@ -60,8 +59,7 @@ pub const IDENTITY_KEYS: &[&str] = &[
     "deployment_binding",
     "vault_authority",
     "vault_state",
-    "treasury",
-    "pyth_price_account",
+    "treasury_token_account",
     "state_signing_key",
     "clearance_signing_key",
 ];
@@ -72,9 +70,9 @@ pub struct SharedProfile {
     pub schema: String,
     pub protocol: ProtocolProfile,
     pub program: ProgramProfile,
+    pub asset: AssetProfile,
     pub vault: VaultProfile,
     pub server: ServerProfile,
-    pub pyth: PythProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,10 +96,23 @@ pub struct ProgramProfile {
     pub executable_sha256: String,
 }
 
+/// The vault's only asset. Validation pins exactly Circle USDC (6 decimals)
+/// under the classic SPL Token program.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssetProfile {
+    pub symbol: String,
+    pub mint: String,
+    pub decimals: u8,
+    pub token_program: String,
+    pub associated_token_program: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultProfile {
     pub version: u8,
+    /// Smallest lease, in USDC base units (micro-USD).
     pub request_charge_cap: u64,
     pub note_ttl_seconds: u64,
     pub challenge_period_seconds: u64,
@@ -118,28 +129,6 @@ pub struct ServerProfile {
     pub settlement_grace_seconds: u64,
     pub settlement_poll_seconds: u64,
     pub raise_lead_seconds: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PythProfile {
-    pub receiver_program: String,
-    /// Pyth push oracle: owner of the price account PDA
-    /// `[push_shard_id (u16 LE), feed_id]` that Pyth's sponsor updates
-    /// through the receiver after Wormhole guardian verification.
-    pub push_oracle_program: String,
-    /// The Wormhole core bridge the receiver verifies VAAs against.
-    pub wormhole_program: String,
-    pub feed_id: String,
-    /// Push-oracle shard of the sponsored price account every deployment pins.
-    pub push_shard_id: u16,
-    /// Oldest finalized price the server quotes from; at most
-    /// [`PYTH_MAX_AGE_CEILING_SECONDS`].
-    pub max_age_seconds: u64,
-    pub max_confidence_bps: u16,
-    /// Maximum fall from a submitted conservative price to the newest
-    /// observed conservative price before an unaccepted quote is superseded.
-    pub max_supersession_bps: u16,
 }
 
 /// Decode a canonical, nonzero base58 32-byte Solana identity.
@@ -215,6 +204,15 @@ impl SharedProfile {
             "the program upgrade authority must be revoked (null)"
         );
         parse_hex_32("program executable sha256", &self.program.executable_sha256)?;
+        let asset = &self.asset;
+        ensure!(
+            asset.symbol == USDC_SYMBOL
+                && asset.mint == USDC_MINT
+                && asset.decimals == USDC_DECIMALS
+                && asset.token_program == TOKEN_PROGRAM
+                && asset.associated_token_program == ASSOCIATED_TOKEN_PROGRAM,
+            "the asset must be Circle USDC (6 decimals) under the classic SPL Token program"
+        );
         let vault = &self.vault;
         ensure!(vault.version > 0, "vault version is required");
         ensure!(
@@ -237,27 +235,6 @@ impl SharedProfile {
             "settlement poll must be positive"
         );
         ensure!(server.raise_lead_seconds > 0, "raise lead must be positive");
-        parse_base58_32("Pyth receiver program", &self.pyth.receiver_program)?;
-        parse_base58_32("Pyth push oracle program", &self.pyth.push_oracle_program)?;
-        parse_base58_32("Wormhole program", &self.pyth.wormhole_program)?;
-        let feed = self
-            .pyth
-            .feed_id
-            .strip_prefix("0x")
-            .ok_or_else(|| anyhow::anyhow!("Pyth feed ID must be 0x-prefixed"))?;
-        parse_hex_32("Pyth feed ID", feed)?;
-        ensure!(
-            (1..=PYTH_MAX_AGE_CEILING_SECONDS).contains(&self.pyth.max_age_seconds),
-            "Pyth max age must be in 1..={PYTH_MAX_AGE_CEILING_SECONDS} seconds"
-        );
-        ensure!(
-            (1..=100).contains(&self.pyth.max_confidence_bps),
-            "Pyth max confidence must be in 1..=100 bps"
-        );
-        ensure!(
-            self.pyth.max_supersession_bps < 10_000,
-            "Pyth max supersession must be below 10000 bps"
-        );
         Ok(())
     }
 
@@ -270,26 +247,20 @@ impl SharedProfile {
             .expect("validated")
     }
 
-    pub fn pyth_receiver_program(&self) -> [u8; 32] {
-        parse_base58_32("Pyth receiver program", &self.pyth.receiver_program).expect("validated")
+    pub fn usdc_mint(&self) -> [u8; 32] {
+        parse_base58_32("USDC mint", &self.asset.mint).expect("validated")
     }
 
-    pub fn pyth_feed_id(&self) -> [u8; 32] {
-        parse_hex_32("Pyth feed ID", &self.pyth.feed_id[2..]).expect("validated")
+    pub fn token_program(&self) -> [u8; 32] {
+        parse_base58_32("token program", &self.asset.token_program).expect("validated")
     }
 
-    /// The push-oracle price account of the profile's feed and shard: the
-    /// only SOL/USD account an identity may pin. Shard 0 is the account
-    /// Pyth's sponsor keeps updated.
-    pub fn pyth_push_account(&self) -> [u8; 32] {
-        let program = parse_base58_32("Pyth push oracle program", &self.pyth.push_oracle_program)
-            .expect("validated");
-        Pubkey::find_program_address(
-            &[&self.pyth.push_shard_id.to_le_bytes(), &self.pyth_feed_id()],
-            &Pubkey::new_from_array(program),
+    pub fn associated_token_program(&self) -> [u8; 32] {
+        parse_base58_32(
+            "associated token program",
+            &self.asset.associated_token_program,
         )
-        .0
-        .to_bytes()
+        .expect("validated")
     }
 
     /// The profile as compared by [`parity_violations`] (without its schema tag).
@@ -325,6 +296,29 @@ pub fn vault_state_address(program_id: &[u8; 32], authority: &[u8; 32]) -> [u8; 
     .to_bytes()
 }
 
+/// The vault's USDC token account: PDA `["vault-token", vault_state]` of the
+/// program, created by `initialize` with the vault state as token authority.
+pub fn vault_token_address(program_id: &[u8; 32], vault_state: &[u8; 32]) -> [u8; 32] {
+    Pubkey::find_program_address(
+        &[VAULT_TOKEN_SEED, vault_state],
+        &Pubkey::new_from_array(*program_id),
+    )
+    .0
+    .to_bytes()
+}
+
+/// The canonical USDC associated token account of `owner`:
+/// PDA `[owner, token_program, mint]` of the associated token program.
+pub fn usdc_associated_token_address(owner: &[u8; 32]) -> [u8; 32] {
+    let profile = SharedProfile::embedded();
+    Pubkey::find_program_address(
+        &[owner, &profile.token_program(), &profile.usdc_mint()],
+        &Pubkey::new_from_array(profile.associated_token_program()),
+    )
+    .0
+    .to_bytes()
+}
+
 /// A network identity file. Undeployed accounts are `null`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -334,8 +328,9 @@ pub struct NetworkIdentity {
     pub genesis_hash: String,
     pub vault_authority: Option<String>,
     pub vault_state: Option<String>,
-    pub treasury: Option<String>,
-    pub pyth_price_account: Option<String>,
+    /// The classic-Token USDC account (any owner) that receives treasury
+    /// withdrawals, pinned in the vault at initialization.
+    pub treasury_token_account: Option<String>,
 }
 
 /// A complete identity ready for operator use.
@@ -344,8 +339,7 @@ pub struct ResolvedIdentity {
     pub genesis_hash: [u8; 32],
     pub vault_authority: [u8; 32],
     pub vault_state: [u8; 32],
-    pub treasury: [u8; 32],
-    pub pyth_price_account: [u8; 32],
+    pub treasury_token_account: [u8; 32],
 }
 
 impl NetworkIdentity {
@@ -383,23 +377,8 @@ impl NetworkIdentity {
         Self::parse(MAINNET_IDENTITY_JSON).expect("checked-in mainnet identity is valid")
     }
 
-    /// The declared Pyth price account, which must be the profile's
-    /// push-oracle account ([`SharedProfile::pyth_push_account`]): the server
-    /// reads exactly the account Pyth's sponsor updates.
-    pub fn pyth_price_account(&self, shared: &SharedProfile) -> anyhow::Result<[u8; 32]> {
-        let value = self.pyth_price_account.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("{} identity has no pyth_price_account", self.network)
-        })?;
-        let account = parse_base58_32("pyth_price_account", value)?;
-        ensure!(
-            account == shared.pyth_push_account(),
-            "pyth_price_account is not the push-oracle account of the profile's feed and shard"
-        );
-        Ok(account)
-    }
-
     /// Require every account; check the vault PDA against the profile's
-    /// program and the price account against the profile's push oracle.
+    /// program and that the treasury is neither the vault nor its token account.
     pub fn resolve(&self, shared: &SharedProfile) -> anyhow::Result<ResolvedIdentity> {
         let required = |name: &str, value: &Option<String>| -> anyhow::Result<[u8; 32]> {
             let value = value.as_deref().ok_or_else(|| {
@@ -411,20 +390,28 @@ impl NetworkIdentity {
             genesis_hash: parse_base58_32("genesis hash", &self.genesis_hash)?,
             vault_authority: required("vault_authority", &self.vault_authority)?,
             vault_state: required("vault_state", &self.vault_state)?,
-            treasury: required("treasury", &self.treasury)?,
-            pyth_price_account: self.pyth_price_account(shared)?,
+            treasury_token_account: required(
+                "treasury_token_account",
+                &self.treasury_token_account,
+            )?,
         };
         ensure!(
             resolved.vault_state
                 == vault_state_address(&shared.program_id(), &resolved.vault_authority),
             "vault_state is not the vault PDA of vault_authority under the profile program"
         );
+        ensure!(
+            resolved.treasury_token_account != resolved.vault_state
+                && resolved.treasury_token_account
+                    != vault_token_address(&shared.program_id(), &resolved.vault_state),
+            "treasury_token_account must not be the vault or its token account"
+        );
         Ok(resolved)
     }
 }
 
 /// Build an effective profile: the shared profile, a network identity, and
-/// optional facts observed on chain (program bytes, vault fields, oracle).
+/// optional facts observed on chain (program bytes, vault fields, asset accounts).
 pub fn effective_profile(
     shared: &SharedProfile,
     identity: Map<String, Value>,
@@ -506,6 +493,23 @@ mod tests {
     fn profile_matches_the_constants_compiled_into_the_program() {
         let profile = SharedProfile::embedded();
         assert_eq!(profile.program_id(), dagon_zkapi_vault::ID.to_bytes());
+        assert_eq!(
+            profile.usdc_mint(),
+            dagon_zkapi_vault::token::USDC_MINT.to_bytes()
+        );
+        assert_eq!(
+            profile.token_program(),
+            dagon_zkapi_vault::token::TOKEN_PROGRAM_ID.to_bytes()
+        );
+        assert_ne!(
+            profile.token_program(),
+            dagon_zkapi_vault::token::TOKEN_2022_PROGRAM_ID.to_bytes()
+        );
+        assert_eq!(
+            profile.asset.decimals,
+            dagon_zkapi_vault::token::USDC_DECIMALS
+        );
+        assert_eq!(VAULT_TOKEN_SEED, dagon_zkapi_vault::VAULT_TOKEN_SEED);
         assert_eq!(profile.vault.version, dagon_zkapi_vault::VAULT_VERSION);
         assert_eq!(
             profile.vault.max_pause_seconds,
@@ -529,49 +533,70 @@ mod tests {
     }
 
     #[test]
-    fn max_age_is_bounded_by_the_sponsored_heartbeat_ceiling() {
-        for (age, ok) in [
-            (0, false),
-            (1, true),
-            (PYTH_MAX_AGE_CEILING_SECONDS, true),
-            (PYTH_MAX_AGE_CEILING_SECONDS + 1, false),
+    fn request_charge_cap_is_exactly_one_dollar_of_usdc() {
+        let profile = SharedProfile::embedded();
+        assert_eq!(profile.vault.request_charge_cap, 1_000_000);
+        assert_eq!(
+            profile.vault.request_charge_cap,
+            10u64.pow(u32::from(profile.asset.decimals)),
+            "1_000_000 base units at 6 decimals is exactly $1.00"
+        );
+    }
+
+    #[test]
+    fn asset_is_pinned_to_classic_usdc() {
+        for (field, value) in [
+            ("symbol", json!("USDT")),
+            (
+                "mint",
+                json!("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"),
+            ),
+            ("decimals", json!(9)),
+            (
+                "token_program",
+                json!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"),
+            ),
+            (
+                "associated_token_program",
+                json!("11111111111111111111111111111111"),
+            ),
         ] {
-            let mut value: Value = serde_json::from_str(SHARED_PROFILE_JSON).unwrap();
-            value["pyth"]["max_age_seconds"] = json!(age);
-            assert_eq!(
-                SharedProfile::parse(&value.to_string()).is_ok(),
-                ok,
-                "{age}"
+            let mut value_json: Value = serde_json::from_str(SHARED_PROFILE_JSON).unwrap();
+            value_json["asset"][field] = value;
+            assert!(
+                SharedProfile::parse(&value_json.to_string()).is_err(),
+                "{field}"
             );
         }
-    }
-
-    #[test]
-    fn supersession_policy_is_required_and_bounded() {
         let mut value: Value = serde_json::from_str(SHARED_PROFILE_JSON).unwrap();
-        value["pyth"]
-            .as_object_mut()
-            .unwrap()
-            .remove("max_supersession_bps");
+        value.as_object_mut().unwrap().remove("asset");
         assert!(SharedProfile::parse(&value.to_string()).is_err());
-        for (bps, ok) in [(0, true), (100, true), (9_999, true), (10_000, false)] {
-            value["pyth"]["max_supersession_bps"] = json!(bps);
-            assert_eq!(SharedProfile::parse(&value.to_string()).is_ok(), ok);
-        }
     }
 
     #[test]
-    fn mainnet_price_account_is_the_push_oracle_shard_account() {
+    fn token_addresses_are_the_canonical_pdas() {
+        // ATA seeds are `[owner, token program, mint]` under the ATA program.
+        let owner = [5u8; 32];
         let profile = SharedProfile::embedded();
-        assert_eq!(
-            bs58::encode(profile.pyth_push_account()).into_string(),
-            "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE"
+        let expected = Pubkey::find_program_address(
+            &[
+                &owner,
+                &Pubkey::from_str_const(TOKEN_PROGRAM).to_bytes(),
+                &Pubkey::from_str_const(USDC_MINT).to_bytes(),
+            ],
+            &Pubkey::from_str_const(ASSOCIATED_TOKEN_PROGRAM),
+        )
+        .0
+        .to_bytes();
+        assert_eq!(usdc_associated_token_address(&owner), expected);
+        let vault = vault_state_address(&profile.program_id(), &[5; 32]);
+        let (address, _) = Pubkey::find_program_address(
+            &[dagon_zkapi_vault::VAULT_TOKEN_SEED, &vault],
+            &dagon_zkapi_vault::ID,
         );
         assert_eq!(
-            NetworkIdentity::mainnet()
-                .pyth_price_account(profile)
-                .unwrap(),
-            profile.pyth_push_account()
+            vault_token_address(&profile.program_id(), &vault),
+            address.to_bytes()
         );
     }
 
@@ -584,8 +609,7 @@ mod tests {
                 "genesis_hash": bs58::encode([7u8; 32]).into_string(),
                 "vault_authority": bs58::encode(authority).into_string(),
                 "vault_state": bs58::encode(vault_state_address(&program, &authority)).into_string(),
-                "treasury": bs58::encode([9u8; 32]).into_string(),
-                "pyth_price_account": "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE",
+                "treasury_token_account": bs58::encode(usdc_associated_token_address(&[9u8; 32])).into_string(),
             })
             .to_string(),
         )
@@ -599,6 +623,24 @@ mod tests {
         let mut wrong = identity.clone();
         wrong.vault_state = Some(bs58::encode([8u8; 32]).into_string());
         assert!(wrong.resolve(SharedProfile::embedded()).is_err());
+        let mut wrong = identity.clone();
+        wrong.treasury_token_account = None;
+        assert!(wrong.resolve(SharedProfile::embedded()).is_err());
+        let mut wrong = identity.clone();
+        let program = SharedProfile::embedded().program_id();
+        let vault = vault_state_address(&program, &[5; 32]);
+        wrong.treasury_token_account =
+            Some(bs58::encode(vault_token_address(&program, &vault)).into_string());
+        assert!(
+            wrong.resolve(SharedProfile::embedded()).is_err(),
+            "the vault's own token account cannot be the treasury"
+        );
+        let mut value = serde_json::to_value(&identity).unwrap();
+        value["treasury"] = json!(bs58::encode([9u8; 32]).into_string());
+        assert!(
+            NetworkIdentity::parse(&value.to_string()).is_err(),
+            "the removed treasury wallet key is rejected"
+        );
         let mut value = serde_json::to_value(&identity).unwrap();
         value["challenge_period_seconds"] = json!(40);
         assert!(
@@ -618,17 +660,6 @@ mod tests {
         let mainnet = NetworkIdentity::mainnet();
         assert_eq!(mainnet.network, MAINNET_BETA);
         assert!(mainnet.resolve(SharedProfile::embedded()).is_err());
-    }
-
-    #[test]
-    fn identity_must_pin_the_profiles_push_oracle_account() {
-        let mut identity = local_identity([5; 32]);
-        identity.pyth_price_account = Some(bs58::encode([8u8; 32]).into_string());
-        let error = identity.resolve(SharedProfile::embedded()).unwrap_err();
-        assert!(error.to_string().contains("push-oracle account"), "{error}");
-        let mut other_shard = SharedProfile::embedded().clone();
-        other_shard.pyth.push_shard_id = 1;
-        assert!(local_identity([5; 32]).resolve(&other_shard).is_err());
     }
 
     fn effective(identity: &NetworkIdentity, observed: Value) -> Value {
@@ -658,7 +689,7 @@ mod tests {
         reference["observed"]["vault"]["challenge_period_seconds"] = json!(86400);
 
         let mut drifted = local.clone();
-        drifted["profile"]["pyth"]["max_age_seconds"] = json!(60);
+        drifted["profile"]["asset"]["decimals"] = json!(9);
         assert_eq!(parity_violations(&drifted, &reference).len(), 1);
 
         let mut extra = local.clone();

@@ -1,4 +1,5 @@
 {
   "challenge_period_seconds": 40,
-  "reason": "Only the ignored local-validator lifecycle test reads this file, to observe escape finalization in a bounded test run. No binary reads it. The production server rejects a vault whose period differs from shared.json and its settlement/challenger timing inequality also rejects 40 seconds."
+  "note_ttl_seconds": 1,
+  "reason": "Only the ignored local-validator lifecycle tests read this file; no binary reads it. challenge_period_seconds lets the main lifecycle test observe escape finalization in a bounded run. note_ttl_seconds is read only by the ignored expired-claim lifecycle test, on a stack started with a clock offset (scripts/localnet/stack.mjs --clock-before-utc-midnight), so a note's UTC-day expiry bucket passes within minutes. The production server rejects a vault whose challenge period or note TTL differs from shared.json, and its settlement/challenger timing inequality also rejects 40 seconds."
 }

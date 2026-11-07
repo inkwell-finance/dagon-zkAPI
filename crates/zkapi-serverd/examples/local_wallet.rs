@@ -1,25 +1,50 @@
-//! In-memory JSON-lines wallet for driving a Solana deployment end to end.
+//! In-memory JSON-lines wallet for driving a USDC Solana deployment end to
+//! end.
 //!
 //! Usage: `local_wallet SETUP_DIRECTORY`. Each stdin line is a JSON command
 //! `{"id": .., "command": .., ...}`; stdout carries only JSON replies
 //! `{"id", "ok", "result" | "error"}`. Wallet secrets, blindings and pending
 //! journals remain in this process. The helper does no networking and never
 //! reads an existing wallet or signing credential; it calls the same pure
-//! wallet operations as the browser SDK.
+//! wallet operations as the browser SDK. Amounts are USDC base units
+//! (micro-USDC); accounts are base58.
 //!
-//! Commands: `public_keys`, `init` (`config`: the browser wallet config,
-//! `solana_identity`: the network identity file it must match),
-//! `deposit_params`, `confirm_deposit`, `tree_path`, `prepare_request`,
-//! `complete_response`, `snapshot`, `prepare_withdrawal`, `status`.
+//! Commands:
+//! - `public_keys` → `{state_signing_key, clearance_signing_key, circuit_id}`.
+//! - `init` `{config, solana_identity}`: `config` is the browser wallet config,
+//!   `solana_identity` the network identity file it must match → wallet
+//!   status plus `asset {symbol, decimals, mint}`, `vault_token_account` and
+//!   `treasury_token_account`.
+//! - `usdc_account` `{owner}` → `{owner, token_account}`: the owner's
+//!   canonical USDC associated token account (pure derivation; create it with
+//!   `POST /v2/ledger/usdc-accounts/prepare`).
+//! - `deposit_params` `{owner?, leading_zero_fixture?}` → `{registration_commitment,
+//!   source_token_account?}`: a deposit's payer (`owner`) is its USDC token
+//!   authority, and the amount is drawn from its canonical USDC account.
+//!   `leading_zero_fixture` selects a deterministic PUBLIC secret for local tests
+//!   only; never fund that fixture on a real network.
+//! - `confirm_deposit` `{args: {note_id, amount, expiry_ts}}` → status.
+//! - `tree_path` `{args: {snapshot, note_id, require_existing}}` → Merkle path.
+//! - `prepare_request` `{args}` → `{request}`; `complete_response`
+//!   `{response}` → status.
+//! - `snapshot` `{name}` → `{name, withdrawal_nullifier}`.
+//! - `prepare_withdrawal` `{args: {mode, destination?, conceded, valid_until,
+//!   clearance?}, destination_owner?, snapshot?}` → `{mode, public_inputs,
+//!   proof, destination}`. `destination` is the proof-bound payout USDC token
+//!   account (any owner); given `destination_owner` instead, it defaults to
+//!   that owner's canonical USDC account. Send the result with a `payer` to
+//!   `POST /v2/ledger/withdrawals/prepare` or `/v2/ledger/escapes/prepare`.
+//! - `status` → wallet status.
 //!
 //! Named snapshots deliberately retain a genuine server-signed state for the
 //! stale escape scenarios; the helper never constructs a synthetic signed
-//! state. Exits are leaf-bound: `prepare_withdrawal` takes a base58 Solana
-//! `destination`, `conceded` and `valid_until`, needs no Merkle path, and
-//! returns `{mode, public_inputs, proof}` for `POST /v2/ledger/*/prepare`.
+//! state. Exits are leaf-bound and need no Merkle path.
 
 use anyhow::{bail, ensure, Context, Result};
-use dagon_zkapi_profile::{NetworkIdentity, SharedProfile};
+use dagon_zkapi_profile::{
+    usdc_associated_token_address, vault_token_address, NetworkIdentity, ResolvedIdentity,
+    SharedProfile,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -35,8 +60,8 @@ use zkapi_proof::compact::{CompactSigner, RequestProver, CIRCUIT_ID};
 use zkapi_types::Felt252;
 
 /// The wallet config must be the embedded profile's deployment under the
-/// network identity.
-fn check_deployment(config: &BrowserWalletConfig, identity_path: &str) -> Result<()> {
+/// network identity, which is returned.
+fn check_deployment(config: &BrowserWalletConfig, identity_path: &str) -> Result<ResolvedIdentity> {
     let profile = SharedProfile::embedded();
     let identity = NetworkIdentity::load(identity_path.as_ref())?.resolve(profile)?;
     ensure!(
@@ -60,7 +85,23 @@ fn check_deployment(config: &BrowserWalletConfig, identity_path: &str) -> Result
         config.request_charge_cap == u128::from(profile.vault.request_charge_cap),
         "wallet request charge cap is not the profile's"
     );
-    Ok(())
+    Ok(identity)
+}
+
+fn base58(bytes: &[u8; 32]) -> String {
+    bs58::encode(bytes).into_string()
+}
+
+/// The base58 32-byte Solana account at `command[field]`.
+fn account(command: &Value, field: &str) -> Result<[u8; 32]> {
+    let text = command[field]
+        .as_str()
+        .with_context(|| format!("{field} must be a base58 account"))?;
+    bs58::decode(text)
+        .into_vec()
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .with_context(|| format!("{field} must decode to 32 bytes"))
 }
 
 struct WalletDriver {
@@ -125,22 +166,67 @@ impl WalletDriver {
                 ensure!(self.config.is_none(), "wallet is already initialized");
                 let config: BrowserWalletConfig =
                     serde_json::from_value(command["config"].clone())?;
-                check_deployment(
+                let identity = check_deployment(
                     &config,
                     command["solana_identity"]
                         .as_str()
                         .context("solana_identity must be the identity file path")?,
                 )?;
                 self.config = Some(config);
-                Ok(self.status())
+                let profile = SharedProfile::embedded();
+                let mut status = self.status();
+                status["asset"] = json!({
+                    "symbol": profile.asset.symbol,
+                    "decimals": profile.asset.decimals,
+                    "mint": profile.asset.mint,
+                });
+                status["vault_token_account"] = base58(&vault_token_address(
+                    &profile.program_id(),
+                    &identity.vault_state,
+                ))
+                .into();
+                status["treasury_token_account"] = base58(&identity.treasury_token_account).into();
+                Ok(status)
+            }
+            "usdc_account" => {
+                let owner = account(command, "owner")?;
+                Ok(json!({
+                    "owner": base58(&owner),
+                    "token_account": base58(&usdc_associated_token_address(&owner)),
+                }))
             }
             "deposit_params" => {
                 ensure!(self.config.is_some(), "initialize the wallet first");
                 ensure!(self.state.is_none(), "wallet already has a note");
                 ensure!(self.deposit_secret.is_none(), "deposit is already prepared");
-                let params = zkapi_browser::generate_deposit_params();
+                let source = match command.get("owner") {
+                    Some(_) => Some(usdc_associated_token_address(&account(command, "owner")?)),
+                    None => None,
+                };
+                let params = if command["leading_zero_fixture"].as_bool() == Some(true) {
+                    // Exercise shortened Felt252 serialization on every acceptance run,
+                    // rather than relying on a random deposit to hit a zero top nibble.
+                    (1..=1024)
+                        .map(|n| {
+                            let secret = Felt252::from_u64(n);
+                            zkapi_browser::DepositParams {
+                                secret,
+                                registration_commitment: zkapi_core::v2::registration_commitment(
+                                    &secret,
+                                ),
+                            }
+                        })
+                        .find(|params| params.registration_commitment.as_bytes()[0] < 16)
+                        .context("no leading-zero deposit fixture")?
+                } else {
+                    zkapi_browser::generate_deposit_params()
+                };
                 self.deposit_secret = Some(params.secret);
-                Ok(json!({"registration_commitment": params.registration_commitment}))
+                let mut result = json!({"registration_commitment": params.registration_commitment});
+                if let Some(source) = source {
+                    result["source_token_account"] = base58(&source).into();
+                }
+                Ok(result)
             }
             "confirm_deposit" => {
                 ensure!(self.state.is_none(), "wallet already has a note");
@@ -222,7 +308,22 @@ impl WalletDriver {
                 )
             }
             "prepare_withdrawal" => {
-                let args: PrepareWithdrawalArgs = serde_json::from_value(command["args"].clone())?;
+                let mut args = command["args"].clone();
+                if command.get("destination_owner").is_some() {
+                    let owner = account(command, "destination_owner")?;
+                    let destination = base58(&usdc_associated_token_address(&owner));
+                    let args = args
+                        .as_object_mut()
+                        .context("withdrawal args must be an object")?;
+                    ensure!(
+                        args.get("destination")
+                            .is_none_or(|given| given.as_str() == Some(destination.as_str())),
+                        "destination is not destination_owner's canonical USDC account"
+                    );
+                    args.insert("destination".into(), destination.into());
+                }
+                let args: PrepareWithdrawalArgs = serde_json::from_value(args)?;
+                let destination = args.destination.clone();
                 let state = match command.get("snapshot") {
                     Some(value) => {
                         ensure!(
@@ -261,7 +362,9 @@ impl WalletDriver {
                         .as_deref()
                         .context("missing withdrawal key")?,
                 )?;
-                Ok(serde_json::to_value(plan)?)
+                let mut plan = serde_json::to_value(plan)?;
+                plan["destination"] = destination.into();
+                Ok(plan)
             }
             "tree_path" => {
                 let args: PathArgs = serde_json::from_value(command["args"].clone())?;

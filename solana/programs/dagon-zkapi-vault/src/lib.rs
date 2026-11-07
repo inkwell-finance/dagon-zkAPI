@@ -11,7 +11,10 @@ use zkapi_types::{
     PROTOCOL_VERSION,
 };
 
-declare_id!("7NdY5ZVP2He8gSiDHZbkfmNfSgKWV2tkZmZgty2C1d8H");
+pub mod token;
+use token::{TokenAccountView, TOKEN_PROGRAM_ID, USDC_MINT};
+
+declare_id!("8cYsHTNTvS5DwNqFaJ3LDZo8ed1k53cdgWQVZqEN45BX");
 
 pub const VAULT_VERSION: u8 = 1;
 pub const NOTE_STATUS_ACTIVE: u8 = 1;
@@ -24,6 +27,13 @@ pub const NULLIFIER_CONSUMED: u8 = 1;
 pub const NULLIFIER_CHALLENGED: u8 = 2;
 pub const MAX_PAUSE_DURATION: u64 = 7 * 86_400;
 pub const PAUSE_COOLDOWN: u64 = 86_400;
+/// `PendingWithdrawal.stage`: an open escape (challengeable, finalizable).
+pub const PENDING_STAGE_OPEN: u8 = 0;
+/// Finalized; the user payout is parked for `release_escape_payout`.
+pub const PENDING_STAGE_PAYOUT_PARKED: u8 = 1;
+/// Paid; only the escaper's rent refund is parked for `refund_pending_rent`.
+pub const PENDING_STAGE_RENT_PARKED: u8 = 2;
+pub const VAULT_TOKEN_SEED: &[u8] = b"vault-token";
 const EXPIRY_BUCKET_SECONDS: u64 = 86_400;
 const MAX_CREDIT_UNITS: u64 = 9_007_199_254_740_991;
 const MAX_OPERATION_BYTES: usize = 4_096;
@@ -34,9 +44,25 @@ const KIND_DEPOSIT: u8 = 1;
 pub mod dagon_zkapi_vault {
     use super::*;
 
+    /// Create the vault, its program-owned USDC token account, and pin the
+    /// classic-Token USDC mint and the treasury token account.
     pub fn initialize(ctx: Context<Initialize>, args: InitializeArgs) -> Result<()> {
         let vault_key = ctx.accounts.vault.key();
-        validate_initialize_configuration(&args, vault_key, ctx.accounts.treasury.key())?;
+        let treasury_token = ctx.accounts.treasury_token.key();
+        validate_initialize_configuration(&args, vault_key, treasury_token)?;
+        token::require_usdc_mint(&ctx.accounts.mint)?;
+        let treasury = token::read_token_account(&ctx.accounts.treasury_token)?;
+        require!(treasury.creditable(&USDC_MINT), VaultError::InvalidTreasuryAccount);
+        let vault_token_bump = ctx.bumps.vault_token;
+        token::create_vault_token_account(
+            &ctx.accounts.authority,
+            &ctx.accounts.vault_token,
+            &ctx.accounts.mint,
+            &ctx.accounts.token_program,
+            &ctx.accounts.system_program,
+            vault_key,
+            vault_token_bump,
+        )?;
         let chain_id = solana_chain_id(&args.genesis_hash);
         let binding = solana_deployment_binding(
             &ctx.program_id.to_bytes(),
@@ -48,7 +74,10 @@ pub mod dagon_zkapi_vault {
         vault.bump = ctx.bumps.vault;
         vault.paused = false;
         vault.authority = ctx.accounts.authority.key();
-        vault.treasury = ctx.accounts.treasury.key();
+        vault.treasury_token = treasury_token;
+        vault.mint = USDC_MINT;
+        vault.vault_token = ctx.accounts.vault_token.key();
+        vault.vault_token_bump = vault_token_bump;
         vault.genesis_hash = args.genesis_hash;
         vault.chain_id = chain_id;
         vault.protocol_binding = *binding.as_bytes();
@@ -141,6 +170,10 @@ pub mod dagon_zkapi_vault {
         Ok(())
     }
 
+    /// Consume a staged deposit. The operation owner pays the note rent; the
+    /// separate `depositor` is only the USDC token authority and may be any
+    /// signer, including a program PDA signing through `invoke_signed`. The
+    /// note's commitment, amount and expiry come from the staged payload.
     pub fn execute_deposit(ctx: Context<ExecuteDeposit>, expected_note_id: u32) -> Result<()> {
         let payload: DepositPayload = decode_operation(&ctx.accounts.operation, KIND_DEPOSIT)?;
         require!(
@@ -172,16 +205,28 @@ pub mod dagon_zkapi_vault {
             &payload.transition_proof,
         )?;
 
-        system_program::transfer(
-            CpiContext::new(
-                ctx.accounts.system_program.to_account_info(),
-                Transfer {
-                    from: ctx.accounts.owner.to_account_info(),
-                    to: vault.to_account_info(),
-                },
-            ),
+        let source = token::read_token_account(&ctx.accounts.source_token)?;
+        require_keys_eq!(source.mint, vault.mint, VaultError::InvalidTokenAccount);
+        require_keys_neq!(
+            ctx.accounts.source_token.key(),
+            vault.vault_token,
+            VaultError::InvalidTokenAccount
+        );
+        let before = token::read_token_account(&ctx.accounts.vault_token)?.amount;
+        token::transfer_checked(
+            &ctx.accounts.token_program,
+            &ctx.accounts.source_token,
+            &ctx.accounts.mint,
+            &ctx.accounts.vault_token,
+            &ctx.accounts.depositor,
             payload.amount,
+            &[],
         )?;
+        let after = token::read_token_account(&ctx.accounts.vault_token)?.amount;
+        require!(
+            after.checked_sub(before) == Some(payload.amount),
+            VaultError::DepositAmountMismatch
+        );
         vault.total_credits = vault
             .total_credits
             .checked_add(payload.amount)
@@ -202,7 +247,7 @@ pub mod dagon_zkapi_vault {
         note.bump = ctx.bumps.note;
         note.claimable_after = expiry;
         note.paused_offset = paused_duration_now(vault, unix_timestamp()?)?;
-        ensure_solvency(vault)?;
+        ensure_solvency(vault, &ctx.accounts.vault_token)?;
         emit!(NoteDeposited {
             note_id: expected_note_id,
             commitment: payload.commitment,
@@ -213,14 +258,17 @@ pub mod dagon_zkapi_vault {
         Ok(())
     }
 
+    /// Mutual close: pay `final_balance` to the proof-bound USDC token account
+    /// (any owner) and accrue the rest for the treasury.
     pub fn execute_close(
         ctx: Context<ExecuteClose>,
         note_id: u32,
         payload: WithdrawalPayload,
     ) -> Result<()> {
         let now = unix_timestamp()?;
+        let destination = ctx.accounts.destination_token.key();
         validate_withdrawal(&ctx.accounts.vault, &ctx.accounts.note, &payload,
-            &ctx.accounts.destination.key(), true, now)?;
+            &destination, true, now)?;
         let inputs = &payload.public_inputs;
         require!(inputs.note_id == note_id, VaultError::NoteMismatch);
         require_unused_nullifier(&ctx.accounts.used_nullifier, false)?;
@@ -233,13 +281,17 @@ pub mod dagon_zkapi_vault {
         let final_balance = u64::try_from(inputs.final_balance).map_err(|_| VaultError::InvalidAmount)?;
         ctx.accounts.note.status = NOTE_STATUS_CLOSED;
         let vault = &mut ctx.accounts.vault;
-        vault.total_credits = vault.total_credits.checked_sub(deposit)
-            .ok_or(VaultError::ArithmeticOverflow)?;
-        pay_from_vault(vault, &ctx.accounts.destination.to_account_info(), final_balance,
-            deposit - final_balance)?;
-        ensure_solvency(vault)?;
+        close_note_liability(vault, deposit, final_balance)?;
+        if final_balance > 0 {
+            let target = token::read_token_account(&ctx.accounts.destination_token)?;
+            require!(payout_target_ok(vault, &destination, &target),
+                VaultError::DestinationNotCreditable);
+            pay_from_vault(vault, &ctx.accounts.vault_token, &ctx.accounts.mint,
+                &ctx.accounts.token_program, &ctx.accounts.destination_token, final_balance)?;
+        }
+        ensure_solvency(vault, &ctx.accounts.vault_token)?;
         emit!(MutualClose { note_id, nullifier: inputs.withdrawal_nullifier,
-            final_balance, destination: ctx.accounts.destination.key(), new_root: vault.current_root });
+            final_balance, destination, new_root: vault.current_root });
         Ok(())
     }
 
@@ -249,8 +301,14 @@ pub mod dagon_zkapi_vault {
         payload: WithdrawalPayload,
     ) -> Result<()> {
         let now = unix_timestamp()?;
+        let destination = ctx.accounts.destination.key();
         validate_withdrawal(&ctx.accounts.vault, &ctx.accounts.note, &payload,
-            &ctx.accounts.destination.key(), false, now)?;
+            &destination, false, now)?;
+        // The escape is refused unless the bound account can be credited now;
+        // finalize stays live afterwards even if it is later closed or frozen.
+        let target = token::read_token_account(&ctx.accounts.destination)?;
+        require!(payout_target_ok(&ctx.accounts.vault, &destination, &target),
+            VaultError::DestinationNotCreditable);
         let inputs = &payload.public_inputs;
         require!(inputs.note_id == note_id, VaultError::NoteMismatch);
         require_unused_nullifier(&ctx.accounts.used_nullifier, false)?;
@@ -273,7 +331,9 @@ pub mod dagon_zkapi_vault {
         pending.conceded = u64::try_from(inputs.conceded).map_err(|_| VaultError::InvalidAmount)?;
         pending.state_balance = pending.final_balance.checked_add(pending.conceded)
             .ok_or(VaultError::ArithmeticOverflow)?;
-        pending.destination = ctx.accounts.destination.key();
+        pending.destination = destination;
+        pending.rent_payer = ctx.accounts.owner.key();
+        pending.stage = PENDING_STAGE_OPEN;
         pending.deadline = now.checked_add(ctx.accounts.vault.challenge_period)
             .ok_or(VaultError::ArithmeticOverflow)?;
         pending.bump = ctx.bumps.pending;
@@ -326,52 +386,74 @@ pub mod dagon_zkapi_vault {
         Ok(())
     }
 
+    /// Permissionless after the challenge deadline. The note always closes and
+    /// the operator share always accrues. The user's `final_balance` is paid to
+    /// the bound token account when it can be credited; otherwise (closed,
+    /// frozen, re-assigned) it stays a vault liability that only
+    /// `release_escape_payout` can pay, and only to that same account.
     pub fn finalize_escape(ctx: Context<FinalizeEscape>, note_id: u32) -> Result<()> {
-        require!(
-            ctx.accounts.note.note_id == note_id,
-            VaultError::OperationMismatch
-        );
-        require!(
-            ctx.accounts.note.status == NOTE_STATUS_PENDING,
-            VaultError::NoteNotPending
-        );
-        require!(
-            ctx.accounts.pending.note_id == note_id,
-            VaultError::OperationMismatch
-        );
-        require!(
-            unix_timestamp()? > ctx.accounts.pending.deadline,
-            VaultError::ChallengeNotExpired
-        );
-        require_keys_eq!(
-            ctx.accounts.pending.destination,
-            ctx.accounts.destination.key()
-        );
+        validate_finalize(&ctx.accounts.note, &ctx.accounts.pending, note_id, unix_timestamp()?)?;
         let deposit = ctx.accounts.note.deposit_amount;
         let final_balance = ctx.accounts.pending.final_balance;
-        let operator_share = deposit
-            .checked_sub(final_balance)
-            .ok_or(VaultError::InvalidAmount)?;
-        let vault = &mut ctx.accounts.vault;
-        vault.total_credits = vault
-            .total_credits
-            .checked_sub(deposit)
-            .ok_or(VaultError::ArithmeticOverflow)?;
+        let destination = ctx.accounts.pending.destination;
         ctx.accounts.note.status = NOTE_STATUS_CLOSED;
-        pay_from_vault(
-            vault,
-            &ctx.accounts.destination.to_account_info(),
-            final_balance,
-            operator_share,
-        )?;
-        ensure_solvency(vault)?;
+        let vault = &mut ctx.accounts.vault;
+        close_note_liability(vault, deposit, final_balance)?;
+        let creditable = final_balance == 0
+            || token::read_token_account(&ctx.accounts.destination_token)
+                .is_ok_and(|target| payout_target_ok(vault, &destination, &target));
+        if creditable {
+            if final_balance > 0 {
+                pay_from_vault(vault, &ctx.accounts.vault_token, &ctx.accounts.mint,
+                    &ctx.accounts.token_program, &ctx.accounts.destination_token, final_balance)?;
+            }
+            settle_pending_rent(&mut ctx.accounts.pending, &ctx.accounts.rent_payer)?;
+        } else {
+            vault.deferred_payouts = vault.deferred_payouts.checked_add(final_balance)
+                .ok_or(VaultError::ArithmeticOverflow)?;
+            ctx.accounts.pending.stage = PENDING_STAGE_PAYOUT_PARKED;
+        }
+        ensure_solvency(vault, &ctx.accounts.vault_token)?;
         emit!(EscapeWithdrawalFinalized {
             note_id,
             nullifier: ctx.accounts.pending.nullifier,
             final_balance,
-            destination: ctx.accounts.destination.key(),
+            destination,
+            payout_deferred: !creditable,
         });
         Ok(())
+    }
+
+    /// Permissionless and retryable forever: pay a parked escape payout to
+    /// the proof-bound token account once it can be credited, then close the
+    /// pending record (rent to the escaper). There is no expiry or sweep.
+    pub fn release_escape_payout(ctx: Context<ReleaseEscapePayout>, note_id: u32) -> Result<()> {
+        validate_release(&ctx.accounts.note, &ctx.accounts.pending, note_id)?;
+        let pending = &ctx.accounts.pending;
+        let amount = pending.final_balance;
+        let destination = pending.destination;
+        let vault = &mut ctx.accounts.vault;
+        let target = token::read_token_account(&ctx.accounts.destination_token)?;
+        require!(payout_target_ok(vault, &destination, &target),
+            VaultError::DestinationNotCreditable);
+        vault.deferred_payouts = vault.deferred_payouts.checked_sub(amount)
+            .ok_or(VaultError::ArithmeticOverflow)?;
+        pay_from_vault(vault, &ctx.accounts.vault_token, &ctx.accounts.mint,
+            &ctx.accounts.token_program, &ctx.accounts.destination_token, amount)?;
+        settle_pending_rent(&mut ctx.accounts.pending, &ctx.accounts.rent_payer)?;
+        ensure_solvency(vault, &ctx.accounts.vault_token)?;
+        emit!(EscapePayoutReleased { note_id, amount, destination });
+        Ok(())
+    }
+
+    /// Permissionless: return rent that finalize or release parked because the
+    /// escaper's address could not receive lamports, once it can again. Only
+    /// the stored escaper is ever paid.
+    pub fn refund_pending_rent(ctx: Context<RefundPendingRent>, note_id: u32) -> Result<()> {
+        validate_rent_refund(&ctx.accounts.note, &ctx.accounts.pending, note_id)?;
+        require!(rent_refund(&ctx.accounts.rent_payer)? == RentRefund::Refund,
+            VaultError::RentPayerNotWritable);
+        ctx.accounts.pending.close(ctx.accounts.rent_payer.to_account_info())
     }
 
     pub fn execute_claim_expired(ctx: Context<ExecuteClaimExpired>, note_id: u32) -> Result<()> {
@@ -379,12 +461,8 @@ pub mod dagon_zkapi_vault {
         let amount = ctx.accounts.note.deposit_amount;
         let vault = &mut ctx.accounts.vault;
         ctx.accounts.note.status = NOTE_STATUS_CLOSED;
-        vault.total_credits = vault
-            .total_credits
-            .checked_sub(amount)
-            .ok_or(VaultError::ArithmeticOverflow)?;
-        accrue_treasury(vault, amount)?;
-        ensure_solvency(vault)?;
+        close_note_liability(vault, amount, 0)?;
+        ensure_solvency(vault, &ctx.accounts.vault_token)?;
         emit!(ExpiredClaimed {
             note_id,
             amount,
@@ -393,14 +471,21 @@ pub mod dagon_zkapi_vault {
         Ok(())
     }
 
-    /// Anyone can flush accrued operator revenue to the pinned treasury. A
-    /// treasury that cannot receive SOL can fail only this separate transaction.
+    /// Anyone can flush accrued operator revenue to the pinned treasury token
+    /// account. A treasury account that cannot receive USDC fails only this
+    /// separate transaction; exits never touch it.
     pub fn withdraw_treasury(ctx: Context<WithdrawTreasury>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
         let amount = vault.treasury_accrued;
+        let treasury = vault.treasury_token;
+        let target = token::read_token_account(&ctx.accounts.treasury_token)?;
+        require!(payout_target_ok(vault, &treasury, &target), VaultError::InvalidTreasuryAccount);
         vault.treasury_accrued = 0;
-        transfer_owned_lamports(&vault.to_account_info(), &ctx.accounts.treasury.to_account_info(), amount)?;
-        ensure_solvency(vault)?;
+        if amount > 0 {
+            pay_from_vault(vault, &ctx.accounts.vault_token, &ctx.accounts.mint,
+                &ctx.accounts.token_program, &ctx.accounts.treasury_token, amount)?;
+        }
+        ensure_solvency(vault, &ctx.accounts.vault_token)?;
         emit!(TreasuryWithdrawn { amount });
         Ok(())
     }
@@ -439,7 +524,6 @@ pub struct DepositPayload {
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct WithdrawalPayload {
-    pub destination: Pubkey,
     pub public_inputs: WithdrawalInputs,
     pub proof: Vec<u8>,
 }
@@ -546,8 +630,20 @@ pub struct Initialize<'info> {
     pub vault: Account<'info, VaultState>,
     #[account(mut)]
     pub authority: Signer<'info>,
-    /// CHECK: public payout account pinned in vault state.
-    pub treasury: UncheckedAccount<'info>,
+    /// CHECK: pinned treasury payout account; validated as an initialized,
+    /// unfrozen classic-Token USDC account (any owner) in the handler.
+    pub treasury_token: UncheckedAccount<'info>,
+    /// CHECK: the pinned classic-Token USDC mint; owner/layout/decimals
+    /// validated in the handler.
+    #[account(address = USDC_MINT @ VaultError::InvalidMint)]
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: the vault's own token account, created and initialized here at
+    /// its PDA with the vault as token authority.
+    #[account(mut, seeds = [VAULT_TOKEN_SEED, vault.key().as_ref()], bump)]
+    pub vault_token: UncheckedAccount<'info>,
+    /// CHECK: classic SPL Token only; Token-2022 is rejected.
+    #[account(address = TOKEN_PROGRAM_ID @ VaultError::InvalidTokenProgram)]
+    pub token_program: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -623,6 +719,22 @@ pub struct ExecuteDeposit<'info> {
     pub note: Account<'info, NoteState>,
     #[account(mut)]
     pub owner: Signer<'info>,
+    /// USDC token authority for `source_token`: any signer, including a PDA
+    /// signing through a calling program; it need not be `owner`.
+    pub depositor: Signer<'info>,
+    /// CHECK: classic-Token USDC account; the Token program authenticates
+    /// `depositor` as its owner or delegate.
+    #[account(mut)]
+    pub source_token: UncheckedAccount<'info>,
+    /// CHECK: pinned vault token account.
+    #[account(mut, address = vault.vault_token @ VaultError::InvalidVaultTokenAccount)]
+    pub vault_token: UncheckedAccount<'info>,
+    /// CHECK: pinned mint.
+    #[account(address = vault.mint @ VaultError::InvalidMint)]
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: classic SPL Token only.
+    #[account(address = TOKEN_PROGRAM_ID @ VaultError::InvalidTokenProgram)]
+    pub token_program: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -642,9 +754,19 @@ pub struct ExecuteClose<'info> {
     pub used_nullifier: UncheckedAccount<'info>,
     #[account(mut)]
     pub owner: Signer<'info>,
-    /// CHECK: proof-bound payout destination.
+    /// CHECK: the proof-bound payout token account (any owner); validated as
+    /// a creditable USDC account before the transfer.
     #[account(mut)]
-    pub destination: UncheckedAccount<'info>,
+    pub destination_token: UncheckedAccount<'info>,
+    /// CHECK: pinned vault token account.
+    #[account(mut, address = vault.vault_token @ VaultError::InvalidVaultTokenAccount)]
+    pub vault_token: UncheckedAccount<'info>,
+    /// CHECK: pinned mint.
+    #[account(address = vault.mint @ VaultError::InvalidMint)]
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: classic SPL Token only.
+    #[account(address = TOKEN_PROGRAM_ID @ VaultError::InvalidTokenProgram)]
+    pub token_program: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -675,14 +797,9 @@ pub struct ExecuteEscape<'info> {
     pub next_nullifier: UncheckedAccount<'info>,
     #[account(mut)]
     pub owner: Signer<'info>,
-    /// CHECK: proof-bound and saved for finalization. Finalize must be able to
-    /// credit it, or the note would stay Pending forever with the operator share
-    /// locked: it must be writable (a runtime-demoted reserved key such as the
-    /// System program or a sysvar is not) and neither the vault nor the pending
-    /// account.
-    #[account(mut @ VaultError::DestinationNotCreditable,
-        constraint = creditable_destination(&destination, &vault.key(), &pending.key())
-            @ VaultError::DestinationNotCreditable)]
+    /// CHECK: the proof-bound payout token account, saved for finalization.
+    /// It must be a creditable USDC account now; finalize stays live if it
+    /// later stops being one (the payout is then parked, not lost).
     pub destination: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
@@ -738,21 +855,87 @@ pub struct FinalizeEscape<'info> {
         constraint = note.note_id == note_id @ VaultError::OperationMismatch
     )]
     pub note: Account<'info, NoteState>,
-    /// The escaper paid this rent. Refund it to the proof-bound destination, not
-    /// to whoever calls the permissionless finalize; it also keeps a dust payout
-    /// to a fresh destination rent-exempt.
+    /// Closed to `rent_payer` (the escaper) when the payout completes; kept,
+    /// marked deferred, while the payout is parked.
     #[account(
         mut,
-        close = destination,
         seeds = [b"pending", vault.key().as_ref(), &note_id.to_le_bytes()],
         bump = pending.bump
     )]
     pub pending: Account<'info, PendingWithdrawal>,
-    #[account(mut)]
     pub payer: Signer<'info>,
-    /// CHECK: must match the saved pending destination.
+    /// CHECK: the escaper, who paid the pending rent and alone gets it back.
+    /// It must be passed writable; if it can no longer receive lamports
+    /// (executable) the rent stays parked in the pending record for
+    /// `refund_pending_rent`, never paid to the caller.
+    #[account(address = pending.rent_payer @ VaultError::RentPayerMismatch)]
+    pub rent_payer: UncheckedAccount<'info>,
+    /// CHECK: must be the saved proof-bound payout account.
+    #[account(mut, address = pending.destination @ VaultError::DestinationMismatch)]
+    pub destination_token: UncheckedAccount<'info>,
+    /// CHECK: pinned vault token account.
+    #[account(mut, address = vault.vault_token @ VaultError::InvalidVaultTokenAccount)]
+    pub vault_token: UncheckedAccount<'info>,
+    /// CHECK: pinned mint.
+    #[account(address = vault.mint @ VaultError::InvalidMint)]
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: classic SPL Token only.
+    #[account(address = TOKEN_PROGRAM_ID @ VaultError::InvalidTokenProgram)]
+    pub token_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(note_id: u32)]
+pub struct ReleaseEscapePayout<'info> {
     #[account(mut)]
-    pub destination: UncheckedAccount<'info>,
+    pub vault: Account<'info, VaultState>,
+    #[account(
+        constraint = note.vault == vault.key() @ VaultError::OperationMismatch,
+        constraint = note.note_id == note_id @ VaultError::OperationMismatch
+    )]
+    pub note: Account<'info, NoteState>,
+    #[account(
+        mut,
+        seeds = [b"pending", vault.key().as_ref(), &note_id.to_le_bytes()],
+        bump = pending.bump
+    )]
+    pub pending: Account<'info, PendingWithdrawal>,
+    pub payer: Signer<'info>,
+    /// CHECK: refund target for the pending rent (see `FinalizeEscape`).
+    #[account(address = pending.rent_payer @ VaultError::RentPayerMismatch)]
+    pub rent_payer: UncheckedAccount<'info>,
+    /// CHECK: the only account a parked payout can ever be paid to.
+    #[account(mut, address = pending.destination @ VaultError::DestinationMismatch)]
+    pub destination_token: UncheckedAccount<'info>,
+    /// CHECK: pinned vault token account.
+    #[account(mut, address = vault.vault_token @ VaultError::InvalidVaultTokenAccount)]
+    pub vault_token: UncheckedAccount<'info>,
+    /// CHECK: pinned mint.
+    #[account(address = vault.mint @ VaultError::InvalidMint)]
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: classic SPL Token only.
+    #[account(address = TOKEN_PROGRAM_ID @ VaultError::InvalidTokenProgram)]
+    pub token_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(note_id: u32)]
+pub struct RefundPendingRent<'info> {
+    pub vault: Account<'info, VaultState>,
+    #[account(
+        constraint = note.vault == vault.key() @ VaultError::OperationMismatch,
+        constraint = note.note_id == note_id @ VaultError::OperationMismatch
+    )]
+    pub note: Account<'info, NoteState>,
+    #[account(
+        mut,
+        seeds = [b"pending", vault.key().as_ref(), &note_id.to_le_bytes()],
+        bump = pending.bump
+    )]
+    pub pending: Account<'info, PendingWithdrawal>,
+    /// CHECK: the stored escaper; the only possible recipient.
+    #[account(mut, address = pending.rent_payer @ VaultError::RentPayerMismatch)]
+    pub rent_payer: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -768,15 +951,27 @@ pub struct ExecuteClaimExpired<'info> {
     pub note: Account<'info, NoteState>,
     #[account(mut)]
     pub owner: Signer<'info>,
+    /// CHECK: pinned vault token account, read for the solvency check.
+    #[account(address = vault.vault_token @ VaultError::InvalidVaultTokenAccount)]
+    pub vault_token: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
 pub struct WithdrawTreasury<'info> {
-    #[account(mut, has_one = treasury)]
+    #[account(mut, has_one = treasury_token @ VaultError::InvalidTreasuryAccount)]
     pub vault: Account<'info, VaultState>,
-    /// CHECK: the pinned treasury receives only separately withdrawn accrual.
+    /// CHECK: the pinned treasury token account; mint and state checked.
     #[account(mut)]
-    pub treasury: UncheckedAccount<'info>,
+    pub treasury_token: UncheckedAccount<'info>,
+    /// CHECK: pinned vault token account.
+    #[account(mut, address = vault.vault_token @ VaultError::InvalidVaultTokenAccount)]
+    pub vault_token: UncheckedAccount<'info>,
+    /// CHECK: pinned mint.
+    #[account(address = vault.mint @ VaultError::InvalidMint)]
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: classic SPL Token only.
+    #[account(address = TOKEN_PROGRAM_ID @ VaultError::InvalidTokenProgram)]
+    pub token_program: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -801,7 +996,14 @@ pub struct VaultState {
     pub bump: u8,
     pub paused: bool,
     pub authority: Pubkey,
-    pub treasury: Pubkey,
+    /// Pinned classic-Token USDC account that receives treasury withdrawals.
+    pub treasury_token: Pubkey,
+    /// Always `token::USDC_MINT`.
+    pub mint: Pubkey,
+    /// Program-owned USDC account (PDA `["vault-token", vault]`, authority =
+    /// vault) holding every note's collateral and the treasury accrual.
+    pub vault_token: Pubkey,
+    pub vault_token_bump: u8,
     pub genesis_hash: [u8; 32],
     pub chain_id: u64,
     pub protocol_binding: [u8; 32],
@@ -819,6 +1021,8 @@ pub struct VaultState {
     pub last_pause_end: u64,
     pub total_paused_duration: u64,
     pub treasury_accrued: u64,
+    /// Finalized escape payouts parked until their bound account is creditable.
+    pub deferred_payouts: u64,
 }
 
 #[account]
@@ -848,6 +1052,11 @@ pub struct PendingWithdrawal {
     pub destination: Pubkey,
     pub deadline: u64,
     pub bump: u8,
+    /// Escaper that paid this account's rent; the only refund target.
+    pub rent_payer: Pubkey,
+    /// `PENDING_STAGE_*`: open escape, payout parked after finalize, or paid
+    /// with only the rent refund parked.
+    pub stage: u8,
 }
 
 #[account]
@@ -936,6 +1145,16 @@ pub struct EscapeWithdrawalFinalized {
     pub note_id: u32,
     pub nullifier: [u8; 32],
     pub final_balance: u64,
+    pub destination: Pubkey,
+    /// The bound account could not be credited; the payout is parked for
+    /// `release_escape_payout`.
+    pub payout_deferred: bool,
+}
+
+#[event]
+pub struct EscapePayoutReleased {
+    pub note_id: u32,
+    pub amount: u64,
     pub destination: Pubkey,
 }
 
@@ -1061,10 +1280,6 @@ fn validate_withdrawal(
     require!(!effectively_paused(vault, now), VaultError::Paused);
     let inputs = &payload.public_inputs;
     require!(
-        payload.destination == *destination,
-        VaultError::DestinationMismatch
-    );
-    require!(
         solana_destination_matches(&inputs.destination, &destination.to_bytes()),
         VaultError::DestinationMismatch
     );
@@ -1123,11 +1338,47 @@ fn validate_withdrawal(
     Ok(())
 }
 
-/// A payout account finalize can always credit: writable as seen by the
-/// program (the runtime demotes reserved keys to read-only) and not one of the
-/// program accounts the payout or the pending close debits.
-pub fn creditable_destination(destination: &AccountInfo, vault: &Pubkey, pending: &Pubkey) -> bool {
-    destination.is_writable && destination.key != vault && destination.key != pending
+/// Whether `target` may receive a vault payout bound to `bound` right now: it
+/// is that exact account, an initialized and unfrozen classic-Token account of
+/// the pinned mint, and not the vault's own token account. Its owner is
+/// irrelevant (wallet, ATA or off-curve PDA).
+pub fn payout_target_ok(vault: &VaultState, bound: &Pubkey, target: &TokenAccountView) -> bool {
+    target.key == *bound && target.key != vault.vault_token && target.creditable(&vault.mint)
+}
+
+/// What happens to the pending record's rent once the payout is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RentRefund {
+    /// Close the record to the escaper now.
+    Refund,
+    /// The escaper's address can no longer receive lamports (it was made
+    /// executable): keep the rent in the record for `refund_pending_rent`.
+    Park,
+}
+
+/// The rent goes only to the stored escaper. A caller passing that address
+/// read-only is refused (it can neither redirect nor block the refund: the
+/// caller simply retries with it writable). Only an address that truly
+/// cannot be credited parks the rent; nobody else ever receives it.
+pub fn rent_refund(rent_payer: &AccountInfo) -> Result<RentRefund> {
+    if rent_payer.executable {
+        return Ok(RentRefund::Park);
+    }
+    require!(rent_payer.is_writable, VaultError::RentPayerNotWritable);
+    Ok(RentRefund::Refund)
+}
+
+fn settle_pending_rent<'info>(
+    pending: &mut Account<'info, PendingWithdrawal>,
+    rent_payer: &AccountInfo<'info>,
+) -> Result<()> {
+    match rent_refund(rent_payer)? {
+        RentRefund::Refund => pending.close(rent_payer.clone()),
+        RentRefund::Park => {
+            pending.stage = PENDING_STAGE_RENT_PARKED;
+            Ok(())
+        }
+    }
 }
 
 /// Only evidence of spending the successor defeats an escape. Historical roots
@@ -1303,15 +1554,20 @@ fn write_nullifier<'info>(
     Ok(())
 }
 
+/// Transfer `amount` USDC out of the vault token account, signed by the
+/// vault PDA. Callers validate the target and update liabilities first.
 fn pay_from_vault<'info>(
-    vault: &mut Account<'info, VaultState>,
+    vault: &Account<'info, VaultState>,
+    vault_token: &AccountInfo<'info>,
+    mint: &AccountInfo<'info>,
+    token_program: &AccountInfo<'info>,
     destination: &AccountInfo<'info>,
-    user_amount: u64,
-    operator_amount: u64,
+    amount: u64,
 ) -> Result<()> {
-    transfer_owned_lamports(&vault.to_account_info(), destination, user_amount)?;
-    accrue_treasury(vault, operator_amount)?;
-    Ok(())
+    let bump = [vault.bump];
+    let seeds: &[&[u8]] = &[b"vault", vault.authority.as_ref(), &bump];
+    token::transfer_checked(token_program, vault_token, mint, destination,
+        &vault.to_account_info(), amount, &[seeds])
 }
 
 fn accrue_treasury(vault: &mut VaultState, amount: u64) -> Result<()> {
@@ -1320,9 +1576,21 @@ fn accrue_treasury(vault: &mut VaultState, amount: u64) -> Result<()> {
     Ok(())
 }
 
-fn required_vault_lamports(vault: &VaultState, rent_reserve: u64) -> Result<u64> {
-    rent_reserve.checked_add(vault.total_credits)
-        .and_then(|amount| amount.checked_add(vault.treasury_accrued))
+/// Retire a note's collateral from active credits and accrue the operator
+/// share (`deposit - final_balance`) to the treasury. The caller pays or
+/// parks `final_balance`; expiry claims pass zero and accrue everything.
+pub fn close_note_liability(vault: &mut VaultState, deposit: u64, final_balance: u64) -> Result<()> {
+    let operator_share = deposit.checked_sub(final_balance).ok_or(VaultError::InvalidAmount)?;
+    vault.total_credits = vault.total_credits.checked_sub(deposit)
+        .ok_or(VaultError::ArithmeticOverflow)?;
+    accrue_treasury(vault, operator_share)
+}
+
+/// Every USDC liability of the vault: active note collateral, accrued
+/// treasury revenue and parked escape payouts.
+pub fn required_vault_tokens(vault: &VaultState) -> Result<u64> {
+    vault.total_credits.checked_add(vault.treasury_accrued)
+        .and_then(|amount| amount.checked_add(vault.deferred_payouts))
         .ok_or_else(|| error!(VaultError::ArithmeticOverflow))
 }
 
@@ -1331,33 +1599,13 @@ pub struct TreasuryWithdrawn {
     pub amount: u64,
 }
 
-fn transfer_owned_lamports<'info>(
-    source: &AccountInfo<'info>,
-    destination: &AccountInfo<'info>,
-    amount: u64,
-) -> Result<()> {
-    if amount == 0 {
-        return Ok(());
-    }
-    let source_after = source
-        .lamports()
-        .checked_sub(amount)
-        .ok_or(VaultError::InsufficientVaultFunds)?;
-    let destination_after = destination
-        .lamports()
-        .checked_add(amount)
-        .ok_or(VaultError::ArithmeticOverflow)?;
-    **source.try_borrow_mut_lamports()? = source_after;
-    **destination.try_borrow_mut_lamports()? = destination_after;
-    Ok(())
-}
-
-fn ensure_solvency(vault: &Account<VaultState>) -> Result<()> {
-    let account = vault.to_account_info();
-    let rent_reserve = Rent::get()?.minimum_balance(account.data_len());
-    let required = required_vault_lamports(vault, rent_reserve)?;
+/// The vault token balance must cover every liability after each mutation.
+/// Donations only add surplus; nothing can move it out except a payout.
+fn ensure_solvency(vault: &VaultState, vault_token: &AccountInfo) -> Result<()> {
+    require_keys_eq!(vault_token.key(), vault.vault_token, VaultError::InvalidVaultTokenAccount);
+    let balance = token::read_token_account(vault_token)?.amount;
     require!(
-        account.lamports() >= required,
+        balance >= required_vault_tokens(vault)?,
         VaultError::InsufficientVaultFunds
     );
     Ok(())
@@ -1419,7 +1667,7 @@ pub enum VaultError {
     InvalidOperationPayload,
     #[msg("operation does not match its execute instruction")]
     OperationMismatch,
-    #[msg("vault does not have enough lamports for its credit liabilities")]
+    #[msg("vault token balance does not cover its USDC liabilities")]
     InsufficientVaultFunds,
     #[msg("note is not closed")]
     NoteNotClosed,
@@ -1441,8 +1689,59 @@ pub enum VaultError {
     NoteExpired,
     #[msg("invalid nullifier account")]
     InvalidNullifierAccount,
-    #[msg("withdrawal destination cannot be credited at finalization")]
+    #[msg("payout account is not a creditable USDC token account")]
     DestinationNotCreditable,
+    #[msg("mint is not the pinned classic-Token USDC mint")]
+    InvalidMint,
+    #[msg("token program is not the classic SPL Token program")]
+    InvalidTokenProgram,
+    #[msg("invalid classic-Token USDC account")]
+    InvalidTokenAccount,
+    #[msg("not the vault's pinned token account")]
+    InvalidVaultTokenAccount,
+    #[msg("not the pinned, creditable treasury token account")]
+    InvalidTreasuryAccount,
+    #[msg("vault received a different amount than the deposit")]
+    DepositAmountMismatch,
+    #[msg("escape payout is not parked")]
+    PayoutNotDeferred,
+    #[msg("rent refund account is not the escaper")]
+    RentPayerMismatch,
+    #[msg("the escaper's rent refund account must be passed writable")]
+    RentPayerNotWritable,
+    #[msg("no parked rent refund")]
+    RentNotParked,
+}
+
+/// Finalize only an undefeated, unfinalized escape after its deadline.
+pub fn validate_finalize(note: &NoteState, pending: &PendingWithdrawal, note_id: u32, now: u64)
+    -> Result<()> {
+    require!(note.note_id == note_id && pending.note_id == note_id, VaultError::OperationMismatch);
+    require!(note.status == NOTE_STATUS_PENDING, VaultError::NoteNotPending);
+    require!(pending.stage == PENDING_STAGE_OPEN, VaultError::OperationMismatch);
+    require!(now > pending.deadline, VaultError::ChallengeNotExpired);
+    Ok(())
+}
+
+/// Release only a payout that finalize parked. The note is closed, or retired
+/// by the permissionless leaf retirement after finalize; retirement never
+/// blocks a release. A successful release closes the pending record, so a
+/// second release finds no account.
+pub fn validate_release(note: &NoteState, pending: &PendingWithdrawal, note_id: u32) -> Result<()> {
+    require!(note.note_id == note_id && pending.note_id == note_id, VaultError::OperationMismatch);
+    require!(pending.stage == PENDING_STAGE_PAYOUT_PARKED
+        && matches!(note.status, NOTE_STATUS_CLOSED | NOTE_STATUS_RETIRED),
+        VaultError::PayoutNotDeferred);
+    Ok(())
+}
+
+/// Refund only rent that finalize or release parked after a completed payout.
+pub fn validate_rent_refund(note: &NoteState, pending: &PendingWithdrawal, note_id: u32) -> Result<()> {
+    require!(note.note_id == note_id && pending.note_id == note_id, VaultError::OperationMismatch);
+    require!(pending.stage == PENDING_STAGE_RENT_PARKED
+        && matches!(note.status, NOTE_STATUS_CLOSED | NOTE_STATUS_RETIRED),
+        VaultError::RentNotParked);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1513,7 +1812,10 @@ mod tests {
             bump: 255,
             paused: false,
             authority: Pubkey::new_unique(),
-            treasury: Pubkey::new_unique(),
+            treasury_token: Pubkey::new_unique(),
+            mint: USDC_MINT,
+            vault_token: Pubkey::new_unique(),
+            vault_token_bump: 254,
             genesis_hash: [3; 32],
             chain_id: 1,
             protocol_binding: [1; 32],
@@ -1531,64 +1833,209 @@ mod tests {
             last_pause_end: 0,
             total_paused_duration: 0,
             treasury_accrued: 0,
+            deferred_payouts: 0,
         }
     }
 
-    #[test]
-    fn payout_ignores_empty_or_executable_treasury_and_preserves_accrued_liabilities() {
-        for executable in [false, true] {
-            let mut state = test_vault();
-            let treasury_key = state.treasury;
-            let mut treasury_lamports = 0;
-            let mut treasury_data = [];
-            let treasury_owner = system_program::ID;
-            let treasury = AccountInfo::new(&treasury_key, false, true,
-                &mut treasury_lamports, &mut treasury_data, &treasury_owner, executable, 0);
-            let rent_reserve = Rent::default().minimum_balance(8 + VaultState::INIT_SPACE);
-            let vault_key = Pubkey::new_unique();
-            let mut vault_lamports = rent_reserve + state.total_credits;
-            // Close a 700-lamport note; the remaining active liability is 200.
-            state.total_credits -= 700;
-            let mut vault_data = vec![0; 8 + VaultState::INIT_SPACE];
-            state.try_serialize(&mut vault_data.as_mut_slice()).unwrap();
-            let vault_info = AccountInfo::new(&vault_key, false, true, &mut vault_lamports,
-                &mut vault_data, &crate::ID, false, 0);
-            let mut vault = Account::<VaultState>::try_from(&vault_info).unwrap();
-            let user_key = Pubkey::new_unique();
-            let mut user_lamports = 1_000_000;
-            let mut user_data = [];
-            let user = AccountInfo::new(&user_key, false, true, &mut user_lamports,
-                &mut user_data, &system_program::ID, false, 0);
-            // The one-lamport treasury share is below rent exemption and its
-            // recipient is deliberately absent from the payout path.
-            pay_from_vault(&mut vault, &user, 699, 1).unwrap();
-            assert_eq!(user.lamports(), 1_000_699);
-            assert_eq!(treasury.lamports(), 0);
-            assert_eq!(vault.treasury_accrued, 1);
-            assert_eq!(vault_info.lamports(), required_vault_lamports(&vault, rent_reserve).unwrap());
-            // Claim expiry accrues the entire remaining note without a transfer.
-            vault.total_credits -= 200;
-            accrue_treasury(&mut vault, 200).unwrap();
-            assert_eq!(vault.treasury_accrued, 201);
-            assert_eq!(vault_info.lamports(), required_vault_lamports(&vault, rent_reserve).unwrap());
-            // A successful separate treasury withdrawal releases only accrual.
-            let accrued = vault.treasury_accrued;
-            vault.treasury_accrued = 0;
-            transfer_owned_lamports(&vault_info, &user, accrued).unwrap();
-            assert_eq!(vault_info.lamports(), rent_reserve);
-            assert_eq!(required_vault_lamports(&vault, rent_reserve).unwrap(), rent_reserve);
-        }
+    use token::test_layout::{mint_data, token_account_data};
+    use token::{ACCOUNT_STATE_FROZEN, ACCOUNT_STATE_INITIALIZED, TOKEN_2022_PROGRAM_ID};
+
+    fn token_host(key: Pubkey, owner_program: Pubkey, mint: Pubkey, owner: Pubkey, amount: u64,
+        state: u8) -> HostAccount {
+        HostAccount::new(key, owner_program, 2_039_280,
+            token_account_data(mint, owner, amount, state), false, true)
+    }
+
+    fn vault_token_host(vault: &VaultState, amount: u64) -> HostAccount {
+        token_host(vault.vault_token, TOKEN_PROGRAM_ID, USDC_MINT, Pubkey::new_unique(), amount,
+            ACCOUNT_STATE_INITIALIZED)
     }
 
     #[test]
-    fn treasury_accrual_is_checked_and_included_in_solvency() {
+    fn treasury_accrual_and_parked_payouts_are_checked_liabilities() {
         let mut vault = test_vault();
         accrue_treasury(&mut vault, 123).unwrap();
-        assert_eq!(required_vault_lamports(&vault, 77).unwrap(), 1_100);
+        vault.deferred_payouts = 77;
+        assert_eq!(required_vault_tokens(&vault).unwrap(), 1_100);
         vault.treasury_accrued = u64::MAX;
         assert!(accrue_treasury(&mut vault, 1).is_err());
         assert_eq!(vault.treasury_accrued, u64::MAX);
-        assert!(required_vault_lamports(&vault, 0).is_err());
+        assert!(required_vault_tokens(&vault).is_err());
+        let mut vault = test_vault();
+        assert!(close_note_liability(&mut vault, 700, 701).is_err(), "payout above deposit");
+        assert!(close_note_liability(&mut vault, 901, 0).is_err(), "more than active credits");
+        close_note_liability(&mut vault, 700, 650).unwrap();
+        assert_eq!((vault.total_credits, vault.treasury_accrued), (200, 50));
+    }
+
+    /// Threat: a token account of another program (Token-2022), a closed
+    /// (System-owned) or malformed account posing as USDC custody.
+    #[test]
+    fn token_accounts_must_be_classic_token_and_initialized() {
+        let key = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mut classic = token_host(key, TOKEN_PROGRAM_ID, USDC_MINT, owner, 5, ACCOUNT_STATE_INITIALIZED);
+        let view = token::read_token_account(&classic.info()).unwrap();
+        assert_eq!((view.key, view.mint, view.owner, view.amount), (key, USDC_MINT, owner, 5));
+        assert!(view.creditable(&USDC_MINT));
+        let mut t22 = token_host(key, TOKEN_2022_PROGRAM_ID, USDC_MINT, owner, 5, ACCOUNT_STATE_INITIALIZED);
+        assert!(token::read_token_account(&t22.info()).is_err(), "Token-2022 is rejected");
+        let mut closed = HostAccount::new(key, system_program::ID, 0, vec![], false, true);
+        assert!(token::read_token_account(&closed.info()).is_err(), "closed account");
+        let mut uninit = token_host(key, TOKEN_PROGRAM_ID, USDC_MINT, owner, 5, 0);
+        assert!(token::read_token_account(&uninit.info()).is_err(), "uninitialized");
+        let mut data = token_account_data(USDC_MINT, owner, 5, ACCOUNT_STATE_INITIALIZED);
+        data.push(0);
+        let mut long = HostAccount::new(key, TOKEN_PROGRAM_ID, 1, data, false, true);
+        assert!(token::read_token_account(&long.info()).is_err(), "not a token account layout");
+        let mut forged = token_host(key, crate::ID, USDC_MINT, owner, 5, ACCOUNT_STATE_INITIALIZED);
+        assert!(token::read_token_account(&forged.info()).is_err(), "program-forged account");
+        let mut frozen = token_host(key, TOKEN_PROGRAM_ID, USDC_MINT, owner, 5, ACCOUNT_STATE_FROZEN);
+        let view = token::read_token_account(&frozen.info()).unwrap();
+        assert!(!view.creditable(&USDC_MINT), "frozen accounts cannot be credited");
+    }
+
+    /// Threat: a lookalike mint, a Token-2022 mint at the USDC address, or a
+    /// different decimal scale.
+    #[test]
+    fn only_the_classic_usdc_mint_is_accepted() {
+        let mut usdc = HostAccount::new(USDC_MINT, TOKEN_PROGRAM_ID, 1, mint_data(6, true), false, false);
+        assert!(token::require_usdc_mint(&usdc.info()).is_ok());
+        let mut other = HostAccount::new(Pubkey::new_unique(), TOKEN_PROGRAM_ID, 1, mint_data(6, true), false, false);
+        assert!(token::require_usdc_mint(&other.info()).is_err());
+        let mut t22 = HostAccount::new(USDC_MINT, TOKEN_2022_PROGRAM_ID, 1, mint_data(6, true), false, false);
+        assert!(token::require_usdc_mint(&t22.info()).is_err());
+        let mut decimals = HostAccount::new(USDC_MINT, TOKEN_PROGRAM_ID, 1, mint_data(9, true), false, false);
+        assert!(token::require_usdc_mint(&decimals.info()).is_err());
+        let mut uninit = HostAccount::new(USDC_MINT, TOKEN_PROGRAM_ID, 1, mint_data(6, false), false, false);
+        assert!(token::require_usdc_mint(&uninit.info()).is_err());
+    }
+
+    /// Threats: a substituted destination, the vault's own account as a
+    /// destination, a wrong-mint or frozen account. Ownership is irrelevant:
+    /// a wallet, an ATA or an account owned by an off-curve PDA all qualify.
+    #[test]
+    fn payout_targets_are_the_bound_creditable_usdc_account_of_any_owner() {
+        let vault = test_vault();
+        let bound = Pubkey::new_unique();
+        let (pda_owner, _) = Pubkey::find_program_address(&[b"cctp-forwarder"], &Pubkey::new_unique());
+        assert!(!pda_owner.is_on_curve());
+        for owner in [Pubkey::new_unique(), pda_owner] {
+            let mut target = token_host(bound, TOKEN_PROGRAM_ID, USDC_MINT, owner, 0, ACCOUNT_STATE_INITIALIZED);
+            let view = token::read_token_account(&target.info()).unwrap();
+            assert!(payout_target_ok(&vault, &bound, &view));
+            assert!(!payout_target_ok(&vault, &Pubkey::new_unique(), &view), "substituted destination");
+        }
+        let mut wrong_mint = token_host(bound, TOKEN_PROGRAM_ID, Pubkey::new_unique(), pda_owner, 0,
+            ACCOUNT_STATE_INITIALIZED);
+        let view = token::read_token_account(&wrong_mint.info()).unwrap();
+        assert!(!payout_target_ok(&vault, &bound, &view));
+        let mut frozen = token_host(bound, TOKEN_PROGRAM_ID, USDC_MINT, pda_owner, 0, ACCOUNT_STATE_FROZEN);
+        let view = token::read_token_account(&frozen.info()).unwrap();
+        assert!(!payout_target_ok(&vault, &bound, &view));
+        let mut own = vault_token_host(&vault, 0);
+        let view = token::read_token_account(&own.info()).unwrap();
+        assert!(!payout_target_ok(&vault, &vault.vault_token, &view), "self-payout");
+    }
+
+    #[test]
+    fn solvency_reads_only_the_pinned_vault_token_account() {
+        let vault = test_vault();
+        let mut exact = vault_token_host(&vault, 900);
+        assert!(ensure_solvency(&vault, &exact.info()).is_ok());
+        let mut short = vault_token_host(&vault, 899);
+        assert!(ensure_solvency(&vault, &short.info()).is_err());
+        let mut other = token_host(Pubkey::new_unique(), TOKEN_PROGRAM_ID, USDC_MINT,
+            Pubkey::new_unique(), u64::MAX, ACCOUNT_STATE_INITIALIZED);
+        assert!(ensure_solvency(&vault, &other.info()).is_err(), "a rich foreign account");
+        let mut t22 = token_host(vault.vault_token, TOKEN_2022_PROGRAM_ID, USDC_MINT,
+            Pubkey::new_unique(), u64::MAX, ACCOUNT_STATE_INITIALIZED);
+        assert!(ensure_solvency(&vault, &t22.info()).is_err());
+        // A frozen vault account still reports its balance; transfers fail.
+        let mut frozen = token_host(vault.vault_token, TOKEN_PROGRAM_ID, USDC_MINT,
+            Pubkey::new_unique(), 900, ACCOUNT_STATE_FROZEN);
+        assert!(ensure_solvency(&vault, &frozen.info()).is_ok());
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 { 0 } else { self.next() % bound }
+        }
+    }
+
+    /// Property: over random interleavings of every custody path (deposit,
+    /// close, escape finalize paid or parked, release, expiry claim, treasury
+    /// withdrawal, donation), the vault token balance always covers
+    /// `total_credits + treasury_accrued + deferred_payouts`, the surplus is
+    /// exactly the donations, and one base unit less fails the check.
+    #[test]
+    fn solvency_holds_on_every_path_and_surplus_is_exactly_donations() {
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let mut vault = test_vault();
+            vault.total_credits = 0;
+            let (mut balance, mut donated) = (0u64, 0u64);
+            let (mut notes, mut parked) = (Vec::<u64>::new(), Vec::<u64>::new());
+            for _ in 0..200 {
+                match rng.below(8) {
+                    0 | 1 => {
+                        let amount = 1 + rng.below(MAX_CREDIT_UNITS / 1_000_000);
+                        balance += amount;
+                        vault.total_credits += amount;
+                        notes.push(amount);
+                    }
+                    2 if !notes.is_empty() => {
+                        let deposit = notes.swap_remove(rng.below(notes.len() as u64) as usize);
+                        let paid = rng.below(deposit + 1);
+                        close_note_liability(&mut vault, deposit, paid).unwrap();
+                        balance -= paid;
+                    }
+                    3 if !notes.is_empty() => {
+                        let deposit = notes.swap_remove(rng.below(notes.len() as u64) as usize);
+                        let owed = rng.below(deposit + 1);
+                        close_note_liability(&mut vault, deposit, owed).unwrap();
+                        vault.deferred_payouts += owed;
+                        parked.push(owed);
+                    }
+                    4 if !parked.is_empty() => {
+                        let owed = parked.swap_remove(rng.below(parked.len() as u64) as usize);
+                        vault.deferred_payouts -= owed;
+                        balance -= owed;
+                    }
+                    5 if !notes.is_empty() => {
+                        let deposit = notes.swap_remove(rng.below(notes.len() as u64) as usize);
+                        close_note_liability(&mut vault, deposit, 0).unwrap();
+                    }
+                    6 => {
+                        balance -= vault.treasury_accrued;
+                        vault.treasury_accrued = 0;
+                    }
+                    7 => {
+                        let gift = rng.below(1_000_000);
+                        balance += gift;
+                        donated += gift;
+                    }
+                    _ => {}
+                }
+                let required = required_vault_tokens(&vault).unwrap();
+                assert_eq!(balance - required, donated, "seed {seed}");
+                assert_eq!(vault.total_credits, notes.iter().sum::<u64>());
+                assert_eq!(vault.deferred_payouts, parked.iter().sum::<u64>());
+                let mut host = vault_token_host(&vault, balance);
+                assert!(ensure_solvency(&vault, &host.info()).is_ok());
+                if required > 0 {
+                    let mut host = vault_token_host(&vault, required - 1);
+                    assert!(ensure_solvency(&vault, &host.info()).is_err());
+                }
+            }
+        }
     }
 
     fn test_note() -> NoteState {
@@ -1715,63 +2162,179 @@ mod tests {
         data
     }
 
-    /// Threat: a third party front-runs the permissionless finalize to take the
-    /// pending-account rent the escaper paid. The rent goes to the destination.
-    #[test]
-    fn finalize_refunds_pending_rent_to_destination_not_the_caller() {
-        let vault_key = Pubkey::new_unique();
-        let note_id = 3u32;
+    fn pending_fixture(vault_key: Pubkey, note_id: u32) -> (Pubkey, PendingWithdrawal) {
         let (pending_key, pending_bump) = Pubkey::find_program_address(
             &[b"pending", vault_key.as_ref(), &note_id.to_le_bytes()], &crate::ID);
-        let destination_key = Pubkey::new_unique();
+        (pending_key, PendingWithdrawal { vault: vault_key, note_id, nullifier: [1; 32],
+            next_nullifier: [2; 32], state_balance: 700, conceded: 100, final_balance: 600,
+            destination: Pubkey::new_unique(), deadline: 10, bump: pending_bump,
+            rent_payer: Pubkey::new_unique(), stage: PENDING_STAGE_OPEN })
+    }
+
+    /// Threats: a third party finalizing to take the escaper's pending rent,
+    /// or substituting the payout account, mint, vault token account or token
+    /// program (Token-2022).
+    #[test]
+    fn finalize_and_release_accounts_are_pinned_to_the_escape() {
+        let state = test_vault();
+        let vault_key = Pubkey::new_unique();
+        let note_id = 3u32;
+        let (pending_key, pending) = pending_fixture(vault_key, note_id);
         let mut note = test_note();
         note.vault = vault_key;
         note.note_id = note_id;
         note.status = NOTE_STATUS_PENDING;
-        let pending = PendingWithdrawal { vault: vault_key, note_id, nullifier: [1; 32],
-            next_nullifier: [2; 32], state_balance: 700, conceded: 100, final_balance: 600,
-            destination: destination_key, deadline: 10, bump: pending_bump };
-        let rent = Rent::default().minimum_balance(8 + PendingWithdrawal::INIT_SPACE);
-        let payer_before = 5_000_000;
-        let mut hosts = [
-            HostAccount::new(vault_key, crate::ID, 10_000_000, serialized(&test_vault()), false, true),
-            HostAccount::new(Pubkey::new_unique(), crate::ID, 1_000_000, serialized(&note), false, true),
-            HostAccount::new(pending_key, crate::ID, rent, serialized(&pending), false, true),
-            HostAccount::new(Pubkey::new_unique(), system_program::ID, payer_before, vec![], true, true),
-            HostAccount::new(destination_key, system_program::ID, 0, vec![], false, true),
-        ];
-        let infos: Vec<AccountInfo> = hosts.iter_mut().map(HostAccount::info).collect();
-        let mut remaining = infos.as_slice();
-        let accounts = FinalizeEscape::try_accounts(&crate::ID, &mut remaining,
-            &note_id.to_le_bytes(), &mut Default::default(), &mut Default::default()).unwrap();
-        accounts.exit(&crate::ID).unwrap();
-        assert_eq!(infos[2].lamports(), 0);
-        assert_eq!(*infos[2].owner, system_program::ID);
-        assert!(infos[2].data_is_empty());
-        assert_eq!(infos[3].lamports(), payer_before, "the caller must not collect the rent");
-        assert_eq!(infos[4].lamports(), rent, "the escaper's rent is refunded to the destination");
+        let honest = [pending.rent_payer, pending.destination, state.vault_token, USDC_MINT, TOKEN_PROGRAM_ID];
+        let mut substitutes = vec![honest];
+        for (index, bad) in [Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            Pubkey::new_unique(), TOKEN_2022_PROGRAM_ID].into_iter().enumerate() {
+            let mut keys = honest;
+            keys[index] = bad;
+            substitutes.push(keys);
+        }
+        for release in [false, true] {
+            for (case, keys) in substitutes.iter().enumerate() {
+                let mut hosts = vec![
+                    HostAccount::new(vault_key, crate::ID, 10_000_000, serialized(&state), false, true),
+                    HostAccount::new(Pubkey::new_unique(), crate::ID, 1_000_000, serialized(&note), false, true),
+                    HostAccount::new(pending_key, crate::ID, 1_000_000, serialized(&pending), false, true),
+                    HostAccount::new(Pubkey::new_unique(), system_program::ID, 5_000_000, vec![], true, true),
+                ];
+                for key in keys {
+                    hosts.push(HostAccount::new(*key, system_program::ID, 0, vec![], false, true));
+                }
+                let infos: Vec<AccountInfo> = hosts.iter_mut().map(HostAccount::info).collect();
+                let mut remaining = infos.as_slice();
+                let ok = if release {
+                    ReleaseEscapePayout::try_accounts(&crate::ID, &mut remaining, &note_id.to_le_bytes(),
+                        &mut Default::default(), &mut Default::default()).is_ok()
+                } else {
+                    FinalizeEscape::try_accounts(&crate::ID, &mut remaining, &note_id.to_le_bytes(),
+                        &mut Default::default(), &mut Default::default()).is_ok()
+                };
+                assert_eq!(ok, case == 0, "release={release} substituted account {case}");
+            }
+        }
     }
 
-    /// Threat: a spent-down user escapes to a destination finalize can never
-    /// credit, so the note stays Pending and the operator share is locked
-    /// forever. Such destinations are refused when the escape is opened.
+    /// Threat: treasury substitution, and Token-2022 in the treasury path.
     #[test]
-    fn escape_refuses_destinations_finalize_could_never_credit() {
-        let (vault, pending, wallet) =
-            (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
-        let check = |key: Pubkey, writable: bool| {
-            let mut host = HostAccount::new(key, system_program::ID, 0, vec![], false, writable);
-            creditable_destination(&host.info(), &vault, &pending)
-        };
-        assert!(check(wallet, true));
-        // The runtime demotes reserved keys (System program, sysvars, builtins)
-        // to read-only even when the message marks them writable.
-        assert!(!check(system_program::ID, false));
-        assert!(!check(anchor_lang::solana_program::sysvar::clock::ID, false));
-        // Vault == destination mints lamports; pending == destination is zeroed
-        // by its own close. Both make every finalize fail.
-        assert!(!check(vault, true));
-        assert!(!check(pending, true));
+    fn treasury_withdrawal_is_pinned_to_the_treasury_token_account() {
+        let state = test_vault();
+        let vault_key = Pubkey::new_unique();
+        let honest = [state.treasury_token, state.vault_token, USDC_MINT, TOKEN_PROGRAM_ID];
+        let mut cases = vec![(honest, true)];
+        for (index, bad) in [Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            TOKEN_2022_PROGRAM_ID].into_iter().enumerate() {
+            let mut keys = honest;
+            keys[index] = bad;
+            cases.push((keys, false));
+        }
+        for (keys, expected) in cases {
+            let mut hosts = vec![HostAccount::new(vault_key, crate::ID, 10_000_000, serialized(&state), false, true)];
+            for key in keys {
+                hosts.push(HostAccount::new(key, system_program::ID, 0, vec![], false, true));
+            }
+            let infos: Vec<AccountInfo> = hosts.iter_mut().map(HostAccount::info).collect();
+            let mut remaining = infos.as_slice();
+            let result = WithdrawTreasury::try_accounts(&crate::ID, &mut remaining, &[],
+                &mut Default::default(), &mut Default::default());
+            assert_eq!(result.is_ok(), expected, "{keys:?}");
+        }
+    }
+
+    /// Threats: double payout and a release racing finalize. Finalize refuses
+    /// a parked or already-closed escape; release refuses anything finalize did
+    /// not park, so neither can run twice or out of order. (A completed release
+    /// closes the pending record; the localnet test shows the second release
+    /// failing on the missing account.)
+    #[test]
+    fn finalize_and_release_are_single_shot_and_ordered() {
+        let (_, mut pending) = pending_fixture(Pubkey::new_unique(), 3);
+        let mut note = test_note();
+        note.note_id = 3;
+        note.status = NOTE_STATUS_PENDING;
+        assert!(validate_finalize(&note, &pending, 3, pending.deadline).is_err(), "inside the window");
+        assert!(validate_release(&note, &pending, 3).is_err(), "release before finalize");
+        assert!(validate_finalize(&note, &pending, 3, pending.deadline + 1).is_ok());
+        // finalize parks the payout:
+        note.status = NOTE_STATUS_CLOSED;
+        pending.stage = PENDING_STAGE_PAYOUT_PARKED;
+        assert!(validate_finalize(&note, &pending, 3, pending.deadline + 1).is_err(), "second finalize");
+        assert!(validate_release(&note, &pending, 3).is_ok());
+        assert!(validate_release(&note, &pending, 4).is_err(), "another note's release");
+        // The permissionless leaf retirement after finalize never strands it.
+        note.status = NOTE_STATUS_RETIRED;
+        assert!(validate_release(&note, &pending, 3).is_ok());
+        assert!(validate_finalize(&note, &pending, 3, pending.deadline + 1).is_err());
+        // A defeated escape (note active again) is never releasable.
+        note.status = NOTE_STATUS_ACTIVE;
+        assert!(validate_release(&note, &pending, 3).is_err());
+        // An escape that never parked cannot be released after a paid finalize,
+        // nor can a record that only parks rent.
+        note.status = NOTE_STATUS_CLOSED;
+        for stage in [PENDING_STAGE_OPEN, PENDING_STAGE_RENT_PARKED] {
+            pending.stage = stage;
+            assert!(validate_release(&note, &pending, 3).is_err());
+            assert!(validate_finalize(&note, &pending, 3, pending.deadline + 1).is_err());
+        }
+        assert!(validate_rent_refund(&note, &pending, 3).is_ok());
+        pending.stage = PENDING_STAGE_PAYOUT_PARKED;
+        assert!(validate_rent_refund(&note, &pending, 3).is_err(), "rent refund before payout");
+    }
+
+    /// Threats: a third-party caller passes the escaper's address read-only to
+    /// divert or block the rent refund; an escaper makes its address
+    /// executable to block finalize. The rent only ever goes to the escaper:
+    /// read-only is refused with nothing moved, executable parks the rent in
+    /// the record (finalize/release still complete).
+    #[test]
+    fn pending_rent_only_ever_returns_to_the_escaper() {
+        let vault_key = Pubkey::new_unique();
+        let (pending_key, pending) = pending_fixture(vault_key, 3);
+        let rent = Rent::default().minimum_balance(8 + PendingWithdrawal::INIT_SPACE);
+        for (writable, executable) in [(false, false), (true, false), (true, true), (false, true)] {
+            let mut record = HostAccount::new(pending_key, crate::ID, rent, serialized(&pending), false, true);
+            let mut escaper = HostAccount::new(pending.rent_payer, system_program::ID, 7, vec![], false, writable);
+            let record_info = record.info();
+            let mut escaper_info = escaper.info();
+            escaper_info.executable = executable;
+            let mut account = Account::<PendingWithdrawal>::try_from(&record_info).unwrap();
+            let result = settle_pending_rent(&mut account, &escaper_info);
+            if executable {
+                result.unwrap();
+                assert_eq!(account.stage, PENDING_STAGE_RENT_PARKED);
+                assert_eq!((record_info.lamports(), escaper_info.lamports()), (rent, 7), "rent parked");
+                assert!(rent_refund(&escaper_info).unwrap() == RentRefund::Park);
+            } else if writable {
+                result.unwrap();
+                assert_eq!((record_info.lamports(), escaper_info.lamports()), (0, 7 + rent));
+            } else {
+                assert!(result.is_err(), "read-only escaper is refused");
+                assert_eq!((record_info.lamports(), escaper_info.lamports()), (rent, 7), "nothing moved");
+            }
+        }
+        // The parked-rent refund is pinned to the stored escaper.
+        let state = test_vault();
+        let mut note = test_note();
+        note.vault = vault_key;
+        note.note_id = 3;
+        note.status = NOTE_STATUS_CLOSED;
+        let mut parked = pending.clone();
+        parked.stage = PENDING_STAGE_RENT_PARKED;
+        for (key, expected) in [(pending.rent_payer, true), (Pubkey::new_unique(), false)] {
+            let mut hosts = [
+                HostAccount::new(vault_key, crate::ID, 1, serialized(&state), false, false),
+                HostAccount::new(Pubkey::new_unique(), crate::ID, 1, serialized(&note), false, false),
+                HostAccount::new(pending_key, crate::ID, rent, serialized(&parked), false, true),
+                HostAccount::new(key, system_program::ID, 0, vec![], false, true),
+            ];
+            let infos: Vec<AccountInfo> = hosts.iter_mut().map(HostAccount::info).collect();
+            let mut remaining = infos.as_slice();
+            let result = RefundPendingRent::try_accounts(&crate::ID, &mut remaining, &3u32.to_le_bytes(),
+                &mut Default::default(), &mut Default::default());
+            assert_eq!(result.is_ok(), expected);
+        }
     }
 }
 

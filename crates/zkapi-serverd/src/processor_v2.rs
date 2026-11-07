@@ -13,8 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use dagon_zkapi_ledger::{
-    CreditLedger, DepositRequest, FinalizeEscapeRequest, LedgerCommitment, LedgerDeployment,
-    LedgerError, LedgerNullifierStatus, LedgerState, PreparedLedgerOperation, WithdrawalRequest,
+    CreateUsdcAccountRequest, CreditLedger, DepositRequest, FinalizeEscapeRequest,
+    LedgerCommitment, LedgerDeployment, LedgerError, LedgerNullifierStatus, LedgerState,
+    PreparedLedgerOperation, RefundPendingRentRequest, ReleaseEscapePayoutRequest,
+    WithdrawalRequest,
 };
 use sha3::{Digest, Keccak256};
 use zkapi_core::v2 as core;
@@ -29,7 +31,7 @@ use zkapi_types::{
     NullifierStatus,
 };
 
-use crate::billing::{BillingPriceSource, BillingQuote};
+use crate::billing;
 use crate::config::{OpenRouterLeaseSourceConfig, ServerConfig};
 use crate::dashboard::{redact_secrets, DashboardEvent, DashboardHub};
 use crate::error::ServerError;
@@ -72,7 +74,6 @@ pub struct RequestProcessor {
     dashboard: Option<Arc<DashboardHub>>,
     openrouter: Option<Arc<OpenRouterProvisioner>>,
     oa_org: Option<Arc<OaOrgProvisioner>>,
-    billing: Arc<dyn BillingPriceSource>,
     ledger: Arc<dyn CreditLedger>,
     lease_issue_lock: tokio::sync::Mutex<()>,
     lease_settlement_lock: tokio::sync::Mutex<()>,
@@ -103,7 +104,6 @@ impl RequestProcessor {
         signer: Arc<ServerSigner>,
         current_root: Felt252,
         ledger: Arc<dyn CreditLedger>,
-        billing: Arc<dyn BillingPriceSource>,
     ) -> anyhow::Result<Self> {
         config.validate()?;
         anyhow::ensure!(
@@ -136,7 +136,6 @@ impl RequestProcessor {
             ),
         };
         Ok(Self {
-            billing,
             ledger,
             config,
             store,
@@ -157,15 +156,15 @@ impl RequestProcessor {
     pub(crate) fn finalize_test_lease(
         &self,
         request: &ApiRequestV2,
-        charge_lamports: u128,
+        charge: u128,
     ) -> Result<RequestResponseV2, ServerError> {
         if let Some(response) = self.validate_and_reserve(request)? {
             return Ok(response);
         }
         let settlement = SettlementResult {
             status_code: 200,
-            payload: self.settlement_payload(request, serde_json::json!({"status":"finalized"}))?,
-            charge_applied: charge_lamports,
+            payload: serde_json::json!({"status":"finalized"}).to_string(),
+            charge_applied: charge,
             usage: None,
             billing_label: "native-test".into(),
         };
@@ -239,6 +238,39 @@ impl RequestProcessor {
             .map_err(ledger_wallet_error)
     }
 
+    /// Permissionless release of an escape payout parked at finalization.
+    pub async fn prepare_ledger_release_escape_payout(
+        &self,
+        request: ReleaseEscapePayoutRequest,
+    ) -> Result<PreparedLedgerOperation, ServerError> {
+        self.ledger
+            .prepare_release_escape_payout(request)
+            .await
+            .map_err(ledger_wallet_error)
+    }
+
+    /// Permissionless refund of escape rent parked after its payout.
+    pub async fn prepare_ledger_refund_pending_rent(
+        &self,
+        request: RefundPendingRentRequest,
+    ) -> Result<PreparedLedgerOperation, ServerError> {
+        self.ledger
+            .prepare_refund_pending_rent(request)
+            .await
+            .map_err(ledger_wallet_error)
+    }
+
+    /// Idempotent creation of an owner's canonical USDC token account.
+    pub async fn prepare_ledger_usdc_account(
+        &self,
+        request: CreateUsdcAccountRequest,
+    ) -> Result<PreparedLedgerOperation, ServerError> {
+        self.ledger
+            .prepare_create_usdc_account(request)
+            .await
+            .map_err(ledger_wallet_error)
+    }
+
     async fn assert_request_unspent(&self, nullifier: &Felt252) -> Result<(), ServerError> {
         match self
             .ledger
@@ -254,13 +286,8 @@ impl RequestProcessor {
     }
 
     #[cfg(test)]
-    pub(crate) fn replace_backends(
-        &mut self,
-        ledger: Arc<dyn CreditLedger>,
-        billing: Arc<dyn BillingPriceSource>,
-    ) {
+    pub(crate) fn set_ledger(&mut self, ledger: Arc<dyn CreditLedger>) {
         self.ledger = ledger;
-        self.billing = billing;
     }
 
     pub fn dashboard(&self) -> Option<&Arc<DashboardHub>> {
@@ -288,67 +315,19 @@ impl RequestProcessor {
         self.signer.clearance_public_key()
     }
 
-    pub async fn billing_quote(&self) -> Result<BillingQuote, ServerError> {
-        let quote = self.billing.quote(current_timestamp()).await?;
-        // A finalized RPC read can cross expiry or a concurrent observation.
-        // Recheck both policies before returning a quote, as at admission.
-        self.billing
-            .assert_admissible(&quote, current_timestamp())?;
-        Ok(quote)
-    }
-
-    fn lease_authorization(
-        &self,
-        request: &ApiRequestV2,
-    ) -> Result<(OpenRouterLeaseAuthorization, BillingQuote), ServerError> {
-        let mut payload: serde_json::Value = serde_json::from_str(&request.payload)
-            .map_err(|_| ServerError::InvalidRequest("invalid lease authorization".into()))?;
-        let object = payload.as_object_mut().ok_or_else(|| {
-            ServerError::InvalidRequest("invalid lease authorization object".into())
-        })?;
-        let quote = object.remove("billing_quote").ok_or_else(|| {
-            ServerError::InvalidRequest("native SOL lease requires a bound billing quote".into())
-        })?;
-        let quote: BillingQuote = serde_json::from_value(quote)
-            .map_err(|_| ServerError::InvalidRequest("invalid native billing quote".into()))?;
-        // Authenticate the source identity even for frozen settlement.
-        self.billing.validate_identity(&quote)?;
-        let authorization = serde_json::from_value(payload).map_err(|_| {
-            ServerError::InvalidRequest("invalid prompt-free lease authorization".into())
-        })?;
-        Ok((authorization, quote))
-    }
-
-    fn lease_limit_micro_usd(&self, request: &ApiRequestV2) -> Result<u128, ServerError> {
-        self.lease_authorization(request)?
-            .1
-            .limit_micro_usd(request.public_inputs.solvency_bound)
-    }
-
-    fn settlement_payload(
-        &self,
-        request: &ApiRequestV2,
-        mut payload: serde_json::Value,
-    ) -> Result<String, ServerError> {
-        let quote = self.lease_authorization(request)?.1;
-        payload
-            .as_object_mut()
-            .ok_or_else(|| ServerError::Internal("settlement payload is not an object".into()))?
-            .insert(
-                "billing_quote".into(),
-                serde_json::to_value(quote).map_err(|_| {
-                    ServerError::Internal("could not encode native billing quote".into())
-                })?,
-            );
-        Ok(payload.to_string())
-    }
-
-    fn lease_charge_units(
-        &self,
-        request: &ApiRequestV2,
-        micro_usd: u128,
-    ) -> Result<u128, ServerError> {
-        self.lease_authorization(request)?.1.charge_units(micro_usd)
+    /// The prompt-free lease payload is exactly
+    /// `{"mode":"openrouter_ephemeral_lease","version":1}`; unknown fields fail.
+    fn check_lease_authorization(request: &ApiRequestV2) -> Result<(), ServerError> {
+        let authorization: OpenRouterLeaseAuthorization = serde_json::from_str(&request.payload)
+            .map_err(|_| {
+                ServerError::InvalidRequest("invalid prompt-free lease authorization".into())
+            })?;
+        if authorization != OpenRouterLeaseAuthorization::default() {
+            return Err(ServerError::InvalidRequest(
+                "unsupported OpenRouter lease authorization".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn native_oa_request_id(request: &ApiRequestV2) -> Result<String, ServerError> {
@@ -373,22 +352,17 @@ impl RequestProcessor {
     }
 
     /// Reserve one prompt-free zkAPI request and mint its bounded OpenRouter
-    /// runtime key using its frozen Pyth SOL/USD quote.
+    /// runtime key, whose USD budget is the request's USDC solvency bound.
     pub async fn issue_openrouter_lease(
         &self,
         request: &ApiRequestV2,
     ) -> Result<IssuedOpenRouterLease, ServerError> {
-        let (authorization, billing_quote) = self.lease_authorization(request)?;
-        if authorization != OpenRouterLeaseAuthorization::default() {
-            return Err(ServerError::InvalidRequest(
-                "unsupported OpenRouter lease authorization".to_string(),
-            ));
-        }
+        Self::check_lease_authorization(request)?;
         let lease_source = &self.config.lease_source;
         let lease_timing = &self.config.profile.server;
         // Validate native integer bounds before reserving a nullifier. An
         // unrepresentable budget must never strand otherwise unused state.
-        let limit_micro_usd = self.lease_limit_micro_usd(request)?;
+        let limit_micro_usd = billing::lease_limit_micro_usd(request.public_inputs.solvency_bound)?;
         let _issue_guard = self.lease_issue_lock.lock().await;
         let oa_request_id = if matches!(lease_source, OpenRouterLeaseSourceConfig::OaOrg { .. }) {
             Some(Self::native_oa_request_id(request)?)
@@ -396,27 +370,14 @@ impl RequestProcessor {
             None
         };
 
-        // A persisted request already froze its quote before external issuance.
-        // Matching retries remain valid after the quote ages out.
+        // A persisted request is resumed only by its exact retry.
         let existing_lease = self
             .store
             .lookup_openrouter_lease(&request.client_request_id);
-        let existing_reservation = self
-            .store
-            .lookup_by_nullifier(&request.public_inputs.request_nullifier);
         if let Some(existing) = existing_lease.as_ref() {
             if api_request_binding(&existing.api_request)? != api_request_binding(request)? {
                 return Err(ServerError::Replay);
             }
-        }
-        if existing_reservation.is_none() {
-            self.billing
-                .validate(&billing_quote, current_timestamp())
-                .await?;
-            // Oracle reads may span expiry; no await may separate this check
-            // from the synchronous proof validation and reservation below.
-            self.billing
-                .assert_admissible(&billing_quote, current_timestamp())?;
         }
         if self.validate_and_reserve(request)?.is_some() {
             return Err(ServerError::Replay);
@@ -486,9 +447,10 @@ impl RequestProcessor {
                     // OA station issuance is replay-safe. Retain the durable
                     // reservation and ask for the same one-show key again. The
                     // persisted limit, not any retry input, is authoritative.
-                    let persisted_limit = pricing::micro_usd_to_usd(
-                        self.lease_limit_micro_usd(&existing.api_request)?,
-                    );
+                    let persisted_limit =
+                        pricing::micro_usd_to_usd(billing::lease_limit_micro_usd(
+                            existing.api_request.public_inputs.solvency_bound,
+                        )?);
                     if existing.spending_limit_usd.to_bits() != persisted_limit.to_bits()
                         || !persisted_limit.is_finite()
                         || persisted_limit <= 0.0
@@ -629,66 +591,7 @@ impl RequestProcessor {
             },
             key_source: lease_source.label().to_string(),
             verification,
-            billing_quote,
         })
-    }
-
-    /// Read-only expiration handshake. It serializes behind in-flight issuance
-    /// without provisioning a key or mutating the wallet/nullifier database.
-    pub async fn expire_unaccepted_native_lease(
-        &self,
-        client_request_id: &str,
-        request: &ApiRequestV2,
-    ) -> Result<serde_json::Value, ServerError> {
-        let (authorization, quote) = self.lease_authorization(request)?;
-        if authorization != OpenRouterLeaseAuthorization::default()
-            || request.client_request_id != client_request_id
-            || canonical_payload_hash(request.payload.as_bytes()) != request.payload_hash
-        {
-            return Err(ServerError::InvalidRequest(
-                "native expiry check does not match the exact request".into(),
-            ));
-        }
-        if request.public_inputs.protocol_version != self.config.protocol_version()
-            || request.public_inputs.chain_id != self.config.chain_id()
-            || request.public_inputs.contract_address != self.config.contract_address()
-        {
-            return Err(ServerError::ProtocolMismatch(
-                "native expiry check deployment mismatch".into(),
-            ));
-        }
-        let _guard = self.lease_issue_lock.lock().await;
-        if self
-            .store
-            .lookup_by_nullifier(&request.public_inputs.request_nullifier)
-            .is_some()
-            || self
-                .store
-                .lookup_openrouter_lease(client_request_id)
-                .is_some()
-            || self.store.lookup_by_client_id(client_request_id).is_some()
-        {
-            return Err(ServerError::LeasePending);
-        }
-        let status = if quote.expires_at <= current_timestamp() {
-            "expired_unaccepted"
-        } else {
-            let oracle = &self.billing;
-            match oracle.validate(&quote, current_timestamp()).await {
-                Err(ServerError::NativeQuoteSuperseded) => "superseded_unaccepted",
-                Err(ServerError::NativeQuoteExpired) if quote.expires_at <= current_timestamp() => {
-                    "expired_unaccepted"
-                }
-                Err(error) => return Err(error),
-                Ok(()) if quote.expires_at <= current_timestamp() => "expired_unaccepted",
-                Ok(()) => return Err(ServerError::LeasePending),
-            }
-        };
-        Ok(serde_json::json!({
-            "status":status, "client_request_id":client_request_id,
-            "request_nullifier":request.public_inputs.request_nullifier,
-            "payload_hash":request.payload_hash, "server_time_ms":current_timestamp().saturating_mul(1000),
-        }))
     }
 
     /// Settle every expired lease from OpenRouter's authoritative aggregate
@@ -847,7 +750,9 @@ impl RequestProcessor {
                 OaOrgUsageExpectation {
                     credit_limit_usd: lease.spending_limit_usd,
                     duration_minutes: config.lease_ttl_seconds / 60,
-                    limit_credits: self.lease_limit_micro_usd(&lease.api_request)?,
+                    limit_credits: billing::lease_limit_micro_usd(
+                        lease.api_request.public_inputs.solvency_bound,
+                    )?,
                     minimum_expires_at: lease
                         .issued_at
                         .saturating_add(config.lease_ttl_seconds)
@@ -921,9 +826,10 @@ impl RequestProcessor {
             || public.contract_address != self.config.contract_address()
             || public.state_signing_key_x != signing_key.x
             || public.state_signing_key_y != signing_key.y
-            || self.lease_authorization(request)?.0 != OpenRouterLeaseAuthorization::default()
+            || Self::check_lease_authorization(request).is_err()
             || lease.spending_limit_usd.to_bits()
-                != pricing::micro_usd_to_usd(self.lease_limit_micro_usd(request)?).to_bits()
+                != pricing::micro_usd_to_usd(billing::lease_limit_micro_usd(public.solvency_bound)?)
+                    .to_bits()
         {
             return Err(ServerError::Internal("OA lease binding mismatch".into()));
         }
@@ -973,19 +879,17 @@ impl RequestProcessor {
                 ));
             }
         } else if record.status == NullifierStatus::Reserved {
-            let payload = self.settlement_payload(
-                request,
-                serde_json::json!({
-                    "type": "oa_org_unissued_lease_cancellation",
-                    "issued": false,
-                    "usage_credits": 0,
-                    "usage_usd": 0,
-                    "reason": match lease.oa_provisioning_outcome {
-                        OaProvisioningOutcome::NotStarted => "issuance_not_started",
-                        _ => "issuer_policy_rejected",
-                    },
-                }),
-            )?;
+            let payload = serde_json::json!({
+                "type": "oa_org_unissued_lease_cancellation",
+                "issued": false,
+                "usage_credits": 0,
+                "usage_usd": 0,
+                "reason": match lease.oa_provisioning_outcome {
+                    OaProvisioningOutcome::NotStarted => "issuance_not_started",
+                    _ => "issuer_policy_rejected",
+                },
+            })
+            .to_string();
             self.settle_and_sign(
                 request,
                 SettlementResult {
@@ -1043,7 +947,8 @@ impl RequestProcessor {
             ));
         }
         let duration_minutes = lease_timing.lease_ttl_seconds / 60;
-        let expected_limit_credits = self.lease_limit_micro_usd(&lease.api_request)?;
+        let expected_limit_credits =
+            billing::lease_limit_micro_usd(lease.api_request.public_inputs.solvency_bound)?;
         let oa_request_id = self.persisted_oa_request_id(lease)?;
         let receipt = provisioner
             .get_key_usage(
@@ -1075,24 +980,23 @@ impl RequestProcessor {
                 "OA org usage receipt predates the issued lease".to_string(),
             ));
         }
-        let charge = self.lease_charge_units(&lease.api_request, receipt.usage_credits)?;
+        // OA verified `usage_credits` within the limit, the solvency bound.
+        let charge = billing::charge_units(receipt.usage_credits)?;
         let usage_usd = pricing::micro_usd_to_usd(receipt.usage_credits);
-        let payload = self.settlement_payload(
-            &lease.api_request,
-            serde_json::json!({
-                "type": "oa_org_ephemeral_lease_settlement",
-                "issued_at": lease.issued_at,
-                "expires_at": lease.expires_at,
-                "usage_credits": receipt.usage_credits,
-                "usage_usd": usage_usd,
-                "usage_receipt_expires_at": receipt.expires_at,
-                "usage_receipt_closed_at": receipt.closed_at,
-                "usage_finalized_at": receipt.finalized_at,
-                "station_id": receipt.station_id,
-                "station_signature": receipt.station_signature,
-                "org_signature": receipt.org_signature,
-            }),
-        )?;
+        let payload = serde_json::json!({
+            "type": "oa_org_ephemeral_lease_settlement",
+            "issued_at": lease.issued_at,
+            "expires_at": lease.expires_at,
+            "usage_credits": receipt.usage_credits,
+            "usage_usd": usage_usd,
+            "usage_receipt_expires_at": receipt.expires_at,
+            "usage_receipt_closed_at": receipt.closed_at,
+            "usage_finalized_at": receipt.finalized_at,
+            "station_id": receipt.station_id,
+            "station_signature": receipt.station_signature,
+            "org_signature": receipt.org_signature,
+        })
+        .to_string();
         let provider_response = SettlementResult {
             status_code: 200,
             payload,
@@ -1209,8 +1113,7 @@ impl RequestProcessor {
         // Fail closed. A 503 or ambiguous DELETE leaves the nullifier reserved
         // and the revoking lease visible to the background retry scanner.
         provisioner.delete_key(key_hash).await?;
-        let raw_charge =
-            self.lease_charge_units(&lease.api_request, pricing::usd_to_micro_usd(usage_usd))?;
+        let raw_charge = billing::charge_units(pricing::usd_to_micro_usd(usage_usd))?;
         let lease_charge_cap = lease.api_request.public_inputs.solvency_bound;
         let charge = raw_charge.min(lease_charge_cap);
         if charge != raw_charge {
@@ -1221,15 +1124,13 @@ impl RequestProcessor {
                 "OpenRouter usage exceeded the proof-bound lease limit; clamped charge"
             );
         }
-        let payload = self.settlement_payload(
-            &lease.api_request,
-            serde_json::json!({
-                "type": "openrouter_ephemeral_lease_settlement",
-                "issued_at": lease.issued_at,
-                "expires_at": lease.expires_at,
-                "usage_usd": usage_usd,
-            }),
-        )?;
+        let payload = serde_json::json!({
+            "type": "openrouter_ephemeral_lease_settlement",
+            "issued_at": lease.issued_at,
+            "expires_at": lease.expires_at,
+            "usage_usd": usage_usd,
+        })
+        .to_string();
         let provider_response = SettlementResult {
             status_code: 200,
             payload,
@@ -1339,12 +1240,6 @@ impl RequestProcessor {
                 "Groth16 verification returned false".to_string(),
             ));
         }
-
-        // Proof verification is synchronous but can be slow. Recheck expiry
-        // and newest-observed price at reservation, under the issuance lock.
-        // An exact existing reservation returned above keeps its frozen quote.
-        self.billing
-            .assert_admissible(&self.lease_authorization(request)?.1, current_timestamp())?;
         self.store.reserve_openrouter_lease(request)?;
         Ok(None)
     }
@@ -1592,7 +1487,9 @@ impl RequestProcessor {
                 active_root: public.active_root,
                 anon_commitment: anonymous,
                 solvency_bound: public.solvency_bound,
-                solvency_bound_usd: pricing::micro_usd_to_usd(self.lease_limit_micro_usd(request)?),
+                solvency_bound_usd: pricing::micro_usd_to_usd(billing::lease_limit_micro_usd(
+                    public.solvency_bound,
+                )?),
                 proof_backend: "groth16_bn254".to_string(),
                 proof_public_output_hash: public.authorization_tag,
                 proof_size_bytes: proof_bytes.len(),
@@ -1602,11 +1499,7 @@ impl RequestProcessor {
                 response_hash,
                 usage: provider_response.usage.clone(),
                 charge_applied: signed.charge,
-                charge_usd: provider_response
-                    .usage
-                    .as_ref()
-                    .map(|usage| usage.cost_usd)
-                    .unwrap_or(0.0),
+                charge_usd: pricing::micro_usd_to_usd(signed.charge),
                 next_commitment: signed.next_commitment.clone(),
                 next_anchor: signed.next_anchor,
                 blind_delta_srv: signed.blind_delta,
@@ -1836,7 +1729,7 @@ mod tests {
     use zkapi_types::wire::{Groth16ProofWire, ProofBackendWire};
     use zkapi_types::RequestPublicInputsV2;
 
-    use crate::test_support::{lease_payload_with, quote, NullifierRead, StubBilling, StubLedger};
+    use crate::test_support::{lease_payload, NullifierRead, StubLedger};
 
     fn setup_directory() -> String {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1861,21 +1754,18 @@ mod tests {
         test_processor(config, store, signer)
     }
 
-    /// A processor whose chain reads fail and whose oracle accepts any
-    /// fresh quote for the deployment.
+    /// A processor whose chain reads fail.
     fn test_processor(
         config: ServerConfig,
         store: Arc<NullifierStore>,
         signer: Arc<ServerSigner>,
     ) -> RequestProcessor {
         let ledger = StubLedger::unavailable(&config);
-        let billing = StubBilling::accepting(&config);
-        RequestProcessor::try_new(config, store, signer, Felt252::ZERO, ledger, billing).unwrap()
+        RequestProcessor::try_new(config, store, signer, Felt252::ZERO, ledger).unwrap()
     }
 
     fn replace_ledger(processor: &mut RequestProcessor, read: NullifierRead) {
-        let billing = processor.billing.clone();
-        processor.replace_backends(StubLedger::new(&processor.config, read), billing);
+        processor.set_ledger(StubLedger::new(&processor.config, read));
     }
 
     fn unspent_ledger(processor: &mut RequestProcessor) {
@@ -1883,7 +1773,7 @@ mod tests {
     }
 
     fn unverified_lease_request(processor: &RequestProcessor) -> ApiRequestV2 {
-        let payload = crate::test_support::lease_payload(&processor.config, current_timestamp());
+        let payload = lease_payload();
         let state_key = processor.state_signing_key();
         ApiRequestV2 {
             client_request_id: "pre-oa-failure-request".to_string(),
@@ -2048,8 +1938,8 @@ mod tests {
             ));
             processor.oa_org = None;
         }
-        // Resume at the durable verified boundary, with a frozen quote and
-        // request that have aged out. The admission proof tests are separate.
+        // Resume at the durable verified boundary, with a request that has
+        // aged out. The admission proof tests are separate.
         let mut request = unverified_lease_request(&processor);
         let commitment = zkapi_proof::compact::balance_commitment(
             3_000_000,
@@ -2058,8 +1948,6 @@ mod tests {
         );
         request.public_inputs.anonymous_commitment_x = commitment.x;
         request.public_inputs.anonymous_commitment_y = commitment.y;
-        request.payload = crate::test_support::lease_payload(&processor.config, 100);
-        request.payload_hash = canonical_payload_hash(request.payload.as_bytes());
         request.public_inputs.request_time = 100;
         request.proof.proof = base64::engine::general_purpose::STANDARD.encode(b"verified-proof");
         store.reserve_openrouter_lease(&request).unwrap();
@@ -2089,7 +1977,7 @@ mod tests {
             .begin_oa_issuance(&request.client_request_id)
             .unwrap();
         let expected_id = RequestProcessor::native_oa_request_id(&request).unwrap();
-        let expected_cap = processor.lease_limit_micro_usd(&request).unwrap();
+        let expected_cap = request.public_inputs.solvency_bound;
         let expected_usd = pricing::micro_usd_to_usd(expected_cap);
         let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let reconciliation_seen = seen.clone();
@@ -2161,8 +2049,8 @@ mod tests {
                 .status,
             NullifierStatus::Reserved
         );
-        // Resume from the durable metadata boundary without reconciliation,
-        // replaying issuance, or changing the original quote.
+        // Resume from the durable metadata boundary without reconciliation
+        // or replaying issuance.
         processor.settle_due_openrouter_leases().await;
         let lease = processor
             .store
@@ -2171,8 +2059,8 @@ mod tests {
         assert_eq!(lease.status, "finalized");
         assert_eq!(lease.key_hash.as_deref(), Some("recovered-hash"));
         assert_eq!(lease.expires_at, 570);
-        let expected_charge = processor.lease_charge_units(&request, 1_000_000).unwrap();
-        assert!(expected_charge > 0);
+        // One USDC base unit per metered micro-USD.
+        let expected_charge = 1_000_000;
         assert_eq!(lease.charge_applied, Some(expected_charge));
         let record = processor
             .store
@@ -2184,10 +2072,6 @@ mod tests {
             serde_json::from_str(record.response_payload.as_deref().unwrap()).unwrap();
         assert_eq!(payload["type"], "oa_org_ephemeral_lease_settlement");
         assert_eq!(payload["usage_credits"], 1_000_000);
-        assert_eq!(
-            payload["billing_quote"],
-            serde_json::from_str::<Value>(&request.payload).unwrap()["billing_quote"]
-        );
         processor
             .retire_openrouter_lease(&request.client_request_id, &request)
             .await
@@ -2251,10 +2135,6 @@ mod tests {
             serde_json::from_str(record.response_payload.as_ref().unwrap()).unwrap();
         assert_eq!(payload["type"], "oa_org_unissued_lease_cancellation");
         assert_eq!(payload["issued"], false);
-        assert_eq!(
-            payload["billing_quote"],
-            serde_json::from_str::<serde_json::Value>(&request.payload).unwrap()["billing_quote"]
-        );
         assert_eq!(
             processor
                 .openrouter_lease_status(&request.client_request_id)
@@ -2416,10 +2296,13 @@ mod tests {
             .unwrap();
         let settlement = SettlementResult {
             status_code: 200,
-            payload: processor.settlement_payload(&request, serde_json::json!({
+            payload: serde_json::json!({
                 "type":"oa_org_unissued_lease_cancellation", "issued":false, "usage_credits":0
-            })).unwrap(),
-            charge_applied: 0, usage: None, billing_label: "test".into(),
+            })
+            .to_string(),
+            charge_applied: 0,
+            usage: None,
+            billing_label: "test".into(),
         };
         processor.settle(&request, &settlement).unwrap();
         let signed = processor.sign_settled(&request, None).unwrap();
@@ -2440,16 +2323,39 @@ mod tests {
         server.abort();
     }
 
-    fn test_settlement(processor: &RequestProcessor, request: &ApiRequestV2) -> SettlementResult {
+    fn test_settlement() -> SettlementResult {
         SettlementResult {
             status_code: 200,
-            payload: processor
-                .settlement_payload(request, serde_json::json!({"usage_usd": 0.0}))
-                .unwrap(),
+            payload: serde_json::json!({"usage_usd": 0.0}).to_string(),
             charge_applied: 5,
             usage: None,
             billing_label: "test".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn dashboard_reports_settled_usdc_not_upstream_cost() {
+        let state = Arc::new(std::sync::Mutex::new(IssuanceMock::default()));
+        let (processor, request, server) = issuance_processor(false, state).await;
+        let hub = Arc::new(DashboardHub::new(4));
+        let processor = processor.with_dashboard(hub.clone());
+        let mut settlement = test_settlement();
+        settlement.usage = Some(UsageInfo {
+            cost_usd: 0.000_004_1,
+            cost_source: "test".into(),
+        });
+        processor
+            .settle_and_sign(&request, settlement)
+            .await
+            .unwrap();
+        let events = hub.recent();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].charge_applied, 5);
+        assert_eq!(events[0].charge_usd, pricing::micro_usd_to_usd(5));
+        assert_eq!(events[0].usage.as_ref().unwrap().cost_usd, 0.000_004_1);
+        assert_eq!(hub.totals().total_micro_usdc_charged, 5);
+        assert_eq!(hub.totals().total_cost_usd, pricing::micro_usd_to_usd(5));
+        server.abort();
     }
 
     /// Threat (G2 withhold-safety): a cheater escapes, consuming `N` (or
@@ -2468,7 +2374,7 @@ mod tests {
         let (processor, request, server) = issuance_processor(false, state.clone()).await;
         let nullifier = request.public_inputs.request_nullifier;
         let settled = processor
-            .settle_and_sign(&request, test_settlement(&processor, &request))
+            .settle_and_sign(&request, test_settlement())
             .await
             .unwrap();
         assert_eq!(settled.settled_charge, Some(5));
@@ -2491,7 +2397,7 @@ mod tests {
         assert!(record.next_state_sig.is_none());
         assert_eq!(record.exit_deferred_since, Some(since));
         // A different settlement cannot change the persisted charge.
-        let mut higher = test_settlement(&processor, &request);
+        let mut higher = test_settlement();
         higher.charge_applied = 9;
         assert_eq!(
             processor.settle(&request, &higher).unwrap().settled_charge,
@@ -2535,7 +2441,7 @@ mod tests {
         let (processor, request, server) = issuance_processor(false, state.clone()).await;
         let nullifier = request.public_inputs.request_nullifier;
         processor
-            .settle_and_sign(&request, test_settlement(&processor, &request))
+            .settle_and_sign(&request, test_settlement())
             .await
             .unwrap();
         let since = processor
@@ -2593,7 +2499,7 @@ mod tests {
         let (processor, request, server) = issuance_processor(false, state).await;
         let nullifier = request.public_inputs.request_nullifier;
         processor
-            .settle_and_sign(&request, test_settlement(&processor, &request))
+            .settle_and_sign(&request, test_settlement())
             .await
             .unwrap();
         let record = processor.store.lookup_by_nullifier(&nullifier).unwrap();
@@ -2750,16 +2656,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unspent_reserved_retry_keeps_frozen_quote_after_unrelated_root_change() {
+    async fn unspent_reserved_retry_resumes_after_unrelated_root_change() {
         for oa in [false, true] {
             let state = Arc::new(std::sync::Mutex::new(IssuanceMock::default()));
             let (processor, request, server) = issuance_processor(oa, state.clone()).await;
             processor.update_root(Felt252::from_u64(999));
-            let quote = processor.lease_authorization(&request).unwrap().1;
-            assert!(quote.expires_at < current_timestamp());
             let issued = processor.issue_openrouter_lease(&request).await.unwrap();
             assert_eq!(issued.lease.api_key, "runtime-key");
-            assert_eq!(issued.billing_quote, quote);
+            // The 3_000_000 base-unit solvency bound is a $3 budget.
             assert_eq!(issued.lease.spending_limit_usd, 3.0);
             let state = state.lock().unwrap();
             assert_eq!(state.creates, 1);
@@ -3055,8 +2959,7 @@ mod tests {
         let store = Arc::new(NullifierStore::in_memory().unwrap());
         let processor = oa_lease_processor(store.clone());
         let request = unverified_lease_request(&processor);
-        let original_limit =
-            pricing::micro_usd_to_usd(processor.lease_limit_micro_usd(&request).unwrap());
+        let original_limit = pricing::micro_usd_to_usd(request.public_inputs.solvency_bound);
 
         // This is the durable state left after proof verification and lease
         // reservation but before OA successfully returns a key.
@@ -3320,9 +3223,8 @@ mod tests {
         ));
         unspent_ledger(&mut processor);
         let mut request = unverified_lease_request(&processor);
-        request.payload = lease_payload_with(&quote(&processor.config, now, "250000000000"));
-        request.payload_hash = canonical_payload_hash(request.payload.as_bytes());
-        request.public_inputs.solvency_bound = 400_000;
+        // $1: the OA mock's credit limit.
+        request.public_inputs.solvency_bound = 1_000_000;
         let id = RequestProcessor::native_oa_request_id(&request).unwrap();
         // Resume at the already-verified durable boundary, avoiding mock proofs
         // at admission; the real-proof tests separately cover that boundary.
@@ -3358,64 +3260,40 @@ mod tests {
         server.abort();
     }
 
+    /// The lease payload is exactly the prompt-free authorization: an extra
+    /// field (such as a price) or any other change is refused before
+    /// reservation, and a persisted request resumes only through its exact
+    /// retry.
     #[tokio::test]
-    async fn native_lease_persists_frozen_quote_and_rejects_missing_or_changed_quotes() {
+    async fn lease_payload_is_exactly_the_prompt_free_authorization() {
         let store = Arc::new(NullifierStore::in_memory().unwrap());
         let mut processor = oa_lease_processor(store.clone());
         unspent_ledger(&mut processor);
-        let mut request = unverified_lease_request(&processor);
-        request.payload = serde_json::to_string(&OpenRouterLeaseAuthorization::default()).unwrap();
-        assert!(processor.lease_authorization(&request).is_err());
-        // $2500/SOL, published long ago: one lamport is 2.5 micro-USD.
-        let quote = quote(&processor.config, 100, "250000000000");
-        request.payload = lease_payload_with(&quote);
-        request.payload_hash = canonical_payload_hash(request.payload.as_bytes());
-        request.public_inputs.solvency_bound = 400_000;
+        let request = unverified_lease_request(&processor);
         assert_eq!(
-            processor.lease_limit_micro_usd(&request).unwrap(),
-            1_000_000
+            request.payload,
+            r#"{"mode":"openrouter_ephemeral_lease","version":1}"#
         );
-        assert_eq!(
-            processor.lease_charge_units(&request, 123_456).unwrap(),
-            49_383
-        );
-        assert!(matches!(
-            processor.issue_openrouter_lease(&request).await,
-            Err(ServerError::NativeQuoteExpired)
-        ));
-        assert!(store
-            .lookup_by_nullifier(&request.public_inputs.request_nullifier)
-            .is_none());
-        let expired = processor
-            .expire_unaccepted_native_lease(&request.client_request_id, &request)
-            .await
-            .unwrap();
-        assert_eq!(expired["status"], "expired_unaccepted");
-        assert_eq!(
-            expired["payload_hash"],
-            serde_json::to_value(request.payload_hash).unwrap()
-        );
-        assert_eq!(
-            expired["request_nullifier"],
-            serde_json::to_value(request.public_inputs.request_nullifier).unwrap()
-        );
-        assert!(store
-            .lookup_by_nullifier(&request.public_inputs.request_nullifier)
-            .is_none());
-        // An expiry check must wait behind in-flight issuance. Simulate that
-        // issuer accepting the request before it releases the shared lock.
-        let issuance_guard = processor.lease_issue_lock.lock().await;
-        let expiry_check =
-            processor.expire_unaccepted_native_lease(&request.client_request_id, &request);
-        tokio::pin!(expiry_check);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(25), &mut expiry_check)
-                .await
-                .is_err()
-        );
+        RequestProcessor::check_lease_authorization(&request).unwrap();
+        for payload in [
+            r#"{"mode":"openrouter_ephemeral_lease","version":1,"price":"1"}"#,
+            r#"{"mode":"openrouter_ephemeral_lease","version":2}"#,
+            r#"{"mode":"openrouter_ephemeral_lease"}"#,
+            "[]",
+        ] {
+            let changed = mutated_request(&request, |value| {
+                value.payload = payload.into();
+                value.payload_hash = canonical_payload_hash(payload.as_bytes());
+            });
+            assert!(matches!(
+                processor.issue_openrouter_lease(&changed).await,
+                Err(ServerError::InvalidRequest(_))
+            ));
+            assert!(store
+                .lookup_by_nullifier(&changed.public_inputs.request_nullifier)
+                .is_none());
+        }
         store.reserve_openrouter_lease(&request).unwrap();
-        drop(issuance_guard);
-        assert!(matches!(expiry_check.await, Err(ServerError::LeasePending)));
         store
             .create_openrouter_lease_with_oa_id(
                 &request,
@@ -3423,29 +3301,21 @@ mod tests {
                 100,
                 400,
                 400,
-                1.0,
+                3.0,
                 Some(&RequestProcessor::native_oa_request_id(&request).unwrap()),
             )
             .unwrap();
         let restored = store
             .lookup_openrouter_lease(&request.client_request_id)
             .unwrap();
-        assert_eq!(
-            processor
-                .lease_authorization(&restored.api_request)
-                .unwrap()
-                .1,
-            quote.clone()
-        );
-        // Retry must reach the unavailable issuer, not fetch/reprice an expired
-        // quote. This confirms that a restarted lease uses its persisted quote.
+        // The exact retry resumes and reaches the unavailable issuer.
         let error = processor
             .issue_openrouter_lease(&restored.api_request)
             .await
             .err()
             .unwrap();
         assert!(
-            !error.to_string().contains("stale") && !error.to_string().contains("oracle"),
+            !matches!(error, ServerError::Replay | ServerError::InvalidRequest(_)),
             "{error}"
         );
         let mut collision = restored.api_request.clone();
@@ -3457,233 +3327,46 @@ mod tests {
         assert!(store
             .lookup_by_nullifier(&collision.public_inputs.request_nullifier)
             .is_none());
-        let mut mutation = restored.api_request.clone();
-        let mut payload: serde_json::Value = serde_json::from_str(&mutation.payload).unwrap();
-        payload["billing_quote"]["price"] = "500000000000".into();
-        mutation.payload = payload.to_string();
-        mutation.payload_hash = canonical_payload_hash(mutation.payload.as_bytes());
+        let payload = format!(" {}", restored.api_request.payload);
+        let mutation = mutated_request(&restored.api_request, |value| {
+            value.payload_hash = canonical_payload_hash(payload.as_bytes());
+            value.payload = payload;
+        });
         assert!(matches!(
             processor.issue_openrouter_lease(&mutation).await,
             Err(ServerError::Replay)
         ));
-        // A quote pinned to another deployment never authenticates.
-        let mut foreign = request.clone();
-        let mut payload: serde_json::Value = serde_json::from_str(&foreign.payload).unwrap();
-        payload["billing_quote"]["vault"] = "another-vault".into();
-        foreign.payload = payload.to_string();
-        assert!(processor.lease_authorization(&foreign).is_err());
     }
 
-    #[tokio::test]
-    async fn native_quote_rechecks_expiry_after_delayed_oracle_read() {
-        use crate::billing::{BillingFuture, BillingPins};
-        use std::time::Duration;
-
-        struct DelayedQuote {
-            pins: BillingPins,
-            quote: BillingQuote,
-        }
-        impl BillingPriceSource for DelayedQuote {
-            fn quote(&self, now: u64) -> BillingFuture<'_, BillingQuote> {
-                Box::pin(async move {
-                    self.assert_fresh(&self.quote, now)?;
-                    while current_timestamp() < self.quote.expires_at {
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                    }
-                    Ok(self.quote.clone())
-                })
-            }
-
-            fn validate_identity(&self, quote: &BillingQuote) -> Result<(), ServerError> {
-                quote.validate_identity(&self.pins)
-            }
-
-            fn validate<'a>(&'a self, quote: &'a BillingQuote, now: u64) -> BillingFuture<'a, ()> {
-                Box::pin(async move { self.assert_fresh(quote, now) })
-            }
-        }
-
-        let store = Arc::new(NullifierStore::in_memory().unwrap());
-        let mut processor = oa_lease_processor(store);
-        let expires_at = current_timestamp() + 2;
-        let billing = Arc::new(DelayedQuote {
-            pins: processor.config.billing_pins(),
-            quote: quote(
-                &processor.config,
-                expires_at - processor.config.profile.pyth.max_age_seconds,
-                "250000000000",
-            ),
-        });
-        let ledger = processor.ledger.clone();
-        processor.replace_backends(ledger, billing);
-        let result = tokio::time::timeout(Duration::from_secs(5), processor.billing_quote())
-            .await
-            .unwrap();
-        assert!(matches!(result, Err(ServerError::NativeQuoteExpired)));
-    }
-
-    #[tokio::test]
-    async fn native_issuance_rechecks_expiry_after_delayed_oracle_read() {
-        use std::time::Duration;
-        use tokio::sync::Notify;
-
-        let oracle_read_started = Arc::new(Notify::new());
-        let finish_oracle_read = Arc::new(Notify::new());
+    /// Admission requires the proof-bound solvency bound to cover the vault's
+    /// request charge cap, $1 = 1_000_000 USDC base units: one base unit less
+    /// is refused, and the cap itself proceeds to proof verification.
+    #[test]
+    fn admission_requires_the_one_dollar_request_charge_cap() {
         let store = Arc::new(NullifierStore::in_memory().unwrap());
         let mut processor = oa_lease_processor(store.clone());
-        let started = oracle_read_started.clone();
-        let finish = finish_oracle_read.clone();
-        let billing = StubBilling::new(
-            &processor.config,
-            Arc::new(move |_| {
-                let started = started.clone();
-                let finish = finish.clone();
-                Box::pin(async move {
-                    started.notify_one();
-                    finish.notified().await;
-                    Ok(())
-                })
-            }),
-        );
-        let ledger = processor.ledger.clone();
-        processor.replace_backends(ledger, billing);
-        let processor = Arc::new(processor);
-        let max_age = processor.config.profile.pyth.max_age_seconds;
-        let expires_at = current_timestamp() + 5;
-        let quote = quote(&processor.config, expires_at - max_age, "250000000000");
+        processor.config.profile.vault.request_charge_cap =
+            crate::config::SharedProfile::embedded()
+                .vault
+                .request_charge_cap;
+        assert_eq!(processor.config.request_charge_cap(), 1_000_000);
         let mut request = unverified_lease_request(&processor);
-        request.payload = lease_payload_with(&quote);
-        request.payload_hash = canonical_payload_hash(request.payload.as_bytes());
-        request.public_inputs.solvency_bound = 400_000;
-        let issuer = processor.clone();
-        let issued_request = request.clone();
-        let issuance =
-            tokio::spawn(async move { issuer.issue_openrouter_lease(&issued_request).await });
-        tokio::time::timeout(Duration::from_secs(10), oracle_read_started.notified())
-            .await
-            .unwrap();
-        while current_timestamp() < expires_at {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        finish_oracle_read.notify_one();
-        let result = tokio::time::timeout(Duration::from_secs(5), issuance)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(result, Err(ServerError::NativeQuoteExpired)));
-        assert!(store
-            .lookup_by_nullifier(&request.public_inputs.request_nullifier)
-            .is_none());
-        assert!(store
-            .lookup_openrouter_lease(&request.client_request_id)
-            .is_none());
-        assert_eq!(
-            processor
-                .expire_unaccepted_native_lease(&request.client_request_id, &request)
-                .await
-                .unwrap()["status"],
-            "expired_unaccepted"
+        request.public_inputs.solvency_bound = 999_999;
+        let error = processor.validate_and_reserve(&request).err().unwrap();
+        assert!(
+            matches!(&error, ServerError::InvalidRequest(message)
+                if message == "solvency_bound 999999 is below required 1000000"),
+            "{error}"
         );
-    }
-
-    /// A fresh quote the oracle no longer authenticates is superseded: issuance
-    /// refuses it before reserving, the client can acknowledge the request as
-    /// `superseded_unaccepted`, and an already accepted request keeps its
-    /// frozen price.
-    #[tokio::test]
-    async fn superseded_quote_is_refused_and_accepted_request_keeps_its_price() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let superseded = Arc::new(AtomicBool::new(false));
-        let store = Arc::new(NullifierStore::in_memory().unwrap());
-        let mut processor = oa_lease_processor(store.clone());
-        let flag = superseded.clone();
-        let billing = StubBilling::new(
-            &processor.config,
-            Arc::new(move |_| {
-                let superseded = flag.load(Ordering::SeqCst);
-                Box::pin(async move {
-                    if superseded {
-                        Err(ServerError::NativeQuoteSuperseded)
-                    } else {
-                        Ok(())
-                    }
-                })
-            }),
-        );
-        let ledger = processor.ledger.clone();
-        processor.replace_backends(ledger, billing);
-        let published = current_timestamp() - 5;
-        let quote = quote(&processor.config, published, "250000000000");
-        processor
-            .billing
-            .validate(&quote, current_timestamp())
-            .await
-            .unwrap();
-        let mut request = unverified_lease_request(&processor);
-        request.payload = lease_payload_with(&quote);
-        request.payload_hash = canonical_payload_hash(request.payload.as_bytes());
-        request.public_inputs.solvency_bound = 400_000;
+        request.public_inputs.solvency_bound = 1_000_000;
+        // Past the cap check, the fixture's unbound authorization tag fails.
         assert!(matches!(
-            processor
-                .expire_unaccepted_native_lease(&request.client_request_id, &request)
-                .await,
-            Err(ServerError::LeasePending)
-        ));
-        superseded.store(true, Ordering::SeqCst);
-        assert!(matches!(
-            processor.issue_openrouter_lease(&request).await,
-            Err(ServerError::NativeQuoteSuperseded)
+            processor.validate_and_reserve(&request),
+            Err(ServerError::InvalidProof(_))
         ));
         assert!(store
             .lookup_by_nullifier(&request.public_inputs.request_nullifier)
             .is_none());
-        let ack = processor
-            .expire_unaccepted_native_lease(&request.client_request_id, &request)
-            .await
-            .unwrap();
-        assert_eq!(ack["status"], "superseded_unaccepted");
-        assert_eq!(
-            ack["payload_hash"],
-            serde_json::to_value(request.payload_hash).unwrap()
-        );
-        assert_eq!(
-            ack["request_nullifier"],
-            serde_json::to_value(request.public_inputs.request_nullifier).unwrap()
-        );
-        // A request accepted before the quote was superseded: recovery never
-        // discards it and measured usage uses its frozen price.
-        store.reserve_openrouter_lease(&request).unwrap();
-        store
-            .create_openrouter_lease_with_oa_id(
-                &request,
-                "oa_org",
-                published,
-                published + 300,
-                published + 300,
-                1.0,
-                Some(&RequestProcessor::native_oa_request_id(&request).unwrap()),
-            )
-            .unwrap();
-        assert!(matches!(
-            processor
-                .expire_unaccepted_native_lease(&request.client_request_id, &request)
-                .await,
-            Err(ServerError::LeasePending)
-        ));
-        assert_eq!(
-            processor.lease_charge_units(&request, 123_456).unwrap(),
-            49_383
-        );
-        let error = processor
-            .issue_openrouter_lease(&request)
-            .await
-            .err()
-            .unwrap();
-        assert!(!matches!(
-            error,
-            ServerError::NativeQuoteSuperseded | ServerError::NativeQuoteExpired
-        ));
     }
 
     fn browser_processor(adversary: Option<crate::adversary::AdversaryMode>) -> RequestProcessor {
@@ -3694,13 +3377,13 @@ mod tests {
         processor
     }
 
-    /// A real browser proof binds the native quote; the honest successor is
+    /// A real browser proof binds the lease payload; the honest successor is
     /// installed by the wallet (S1–S5), while every adversary mode is, from
     /// the wallet's side, a withheld successor: `withhold` signs nothing and
     /// recovery stays `reserved` without a response; `random-anchor` and
     /// `born-spent` fail S4; `overcharge` fails S3.
     #[tokio::test]
-    async fn native_quote_is_bound_by_real_browser_proof_and_adversaries_are_withheld() {
+    async fn real_browser_proof_binds_the_lease_payload_and_adversaries_are_withheld() {
         use crate::adversary::AdversaryMode;
         use zkapi_browser::{
             BrowserWalletConfig, CompleteResponseArgs, ConfirmDepositArgs, PrepareRequestArgs,
@@ -3735,8 +3418,7 @@ mod tests {
         );
         processor.update_root(tree.root());
         let now = current_timestamp();
-        let quote = quote(&processor.config, now, "250000000000");
-        let payload = lease_payload_with(&quote);
+        let payload = lease_payload();
         let key =
             std::fs::read(std::path::Path::new(&setup_directory()).join("request.pk")).unwrap();
         let prepared = zkapi_browser::prepare_request(
@@ -3753,86 +3435,13 @@ mod tests {
             &key,
         )
         .unwrap();
-        // Simulate a newer adverse observation after RPC validation and then
-        // after Groth16 verification. Neither boundary may reserve the request.
-        struct SupersedingBilling {
-            pins: crate::billing::BillingPins,
-            quote: BillingQuote,
-            checks: std::sync::atomic::AtomicUsize,
-            reject_after: usize,
-        }
-        impl BillingPriceSource for SupersedingBilling {
-            fn quote(&self, _: u64) -> crate::billing::BillingFuture<'_, BillingQuote> {
-                Box::pin(async { Ok(self.quote.clone()) })
-            }
-
-            fn validate_identity(&self, quote: &BillingQuote) -> Result<(), ServerError> {
-                quote.validate_identity(&self.pins)
-            }
-
-            fn validate<'a>(
-                &'a self,
-                quote: &'a BillingQuote,
-                now: u64,
-            ) -> crate::billing::BillingFuture<'a, ()> {
-                Box::pin(async move { self.assert_fresh(quote, now) })
-            }
-
-            fn assert_admissible(&self, quote: &BillingQuote, now: u64) -> Result<(), ServerError> {
-                self.assert_fresh(quote, now)?;
-                if self
-                    .checks
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    >= self.reject_after
-                {
-                    Err(ServerError::NativeQuoteSuperseded)
-                } else {
-                    Ok(())
-                }
-            }
-        }
-        for reject_after in [0, 1] {
-            let mut guarded = browser_processor(None);
-            guarded.update_root(tree.root());
-            let billing = Arc::new(SupersedingBilling {
-                pins: guarded.config.billing_pins(),
-                quote: quote.clone(),
-                checks: std::sync::atomic::AtomicUsize::new(0),
-                reject_after,
-            });
-            let ledger = guarded.ledger.clone();
-            guarded.replace_backends(ledger, billing.clone());
-            assert!(matches!(
-                guarded.issue_openrouter_lease(&prepared.request).await,
-                Err(ServerError::NativeQuoteSuperseded)
-            ));
-            assert_eq!(
-                billing.checks.load(std::sync::atomic::Ordering::SeqCst),
-                reject_after + 1
-            );
-            assert!(guarded
-                .store
-                .lookup_by_nullifier(&prepared.request.public_inputs.request_nullifier)
-                .is_none());
-            assert!(guarded
-                .store
-                .lookup_openrouter_lease(&prepared.request.client_request_id)
-                .is_none());
-            // The quote response performs the same post-read check.
-            assert!(matches!(
-                guarded.billing_quote().await,
-                Err(ServerError::NativeQuoteSuperseded)
-            ));
-        }
         assert_eq!(prepared.request.payload, payload);
         let serialized = serde_json::to_string(&prepared.journal).unwrap();
         let journal: zkapi_browser::PendingRequestJournal =
             serde_json::from_str(&serialized).unwrap();
         assert_eq!(journal.prepared_request.payload, payload);
         let mut changed = prepared.request.clone();
-        let mut changed_payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        changed_payload["billing_quote"]["price"] = "500000000000".into();
-        changed.payload = changed_payload.to_string();
+        changed.payload = format!(" {payload}");
         changed.payload_hash = canonical_payload_hash(changed.payload.as_bytes());
         assert!(matches!(
             processor.validate_and_reserve(&changed),
@@ -3845,13 +3454,11 @@ mod tests {
             processor.validate_and_reserve(&changed),
             Err(ServerError::InvalidProof(_))
         ));
-        let charge = processor
-            .lease_charge_units(&prepared.request, 123_456)
-            .unwrap();
-        assert_eq!(charge, 49_383);
+        let charge = billing::charge_units(123_456).unwrap();
+        assert_eq!(charge, 123_456);
         let settlement = SettlementResult {
             status_code: 200,
-            payload: serde_json::json!({"billing_quote":quote,"usage_credits":123456}).to_string(),
+            payload: serde_json::json!({"usage_credits":123456}).to_string(),
             charge_applied: charge,
             usage: None,
             billing_label: "native-test".into(),

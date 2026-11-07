@@ -139,7 +139,8 @@ pub struct DepositRequest {
 
 /// Both mutual close and escape initiation use the same proof statement. The
 /// concrete destination is supplied separately so a Solana program can
-/// recompute the statement's 160-bit destination binding. Exits are
+/// recompute the statement's 160-bit destination binding; on Solana it is the
+/// payout token account of the ledger asset, not a wallet. Exits are
 /// leaf-bound and root-free, so no Merkle path is carried.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WithdrawalRequest {
@@ -180,6 +181,30 @@ pub struct FinalizeEscapeRequest {
 pub struct ClaimExpiredRequest {
     pub payer: LedgerAccount,
     pub note_id: u32,
+}
+
+/// Pay an escape payout that finalization parked because its bound account
+/// could not be credited then. Permissionless; pays only that account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseEscapePayoutRequest {
+    pub payer: LedgerAccount,
+    pub note_id: u32,
+}
+
+/// Return pending-escape rent that was parked because the escaper's address
+/// could not receive it. Permissionless; pays only the escaper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefundPendingRentRequest {
+    pub payer: LedgerAccount,
+    pub note_id: u32,
+}
+
+/// Create `owner`'s canonical account for the ledger asset (idempotent;
+/// `payer` funds it), the default deposit source and payout destination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateUsdcAccountRequest {
+    pub payer: LedgerAccount,
+    pub owner: LedgerAccount,
 }
 
 /// Permissionless removal of a closed note's leaf (current-leaf path).
@@ -340,6 +365,27 @@ pub trait CreditLedger: Send + Sync {
         _request: ClaimExpiredRequest,
     ) -> LedgerFuture<'_, PreparedLedgerOperation> {
         unsupported("claim_expired")
+    }
+
+    fn prepare_release_escape_payout(
+        &self,
+        _request: ReleaseEscapePayoutRequest,
+    ) -> LedgerFuture<'_, PreparedLedgerOperation> {
+        unsupported("release_escape_payout")
+    }
+
+    fn prepare_refund_pending_rent(
+        &self,
+        _request: RefundPendingRentRequest,
+    ) -> LedgerFuture<'_, PreparedLedgerOperation> {
+        unsupported("refund_pending_rent")
+    }
+
+    fn prepare_create_usdc_account(
+        &self,
+        _request: CreateUsdcAccountRequest,
+    ) -> LedgerFuture<'_, PreparedLedgerOperation> {
+        unsupported("create_usdc_account")
     }
 
     fn submit(&self, _transaction: SignedLedgerTransaction) -> LedgerFuture<'_, LedgerSubmission> {

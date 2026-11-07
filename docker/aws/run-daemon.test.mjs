@@ -96,7 +96,7 @@ test('server passes the OA org URL when configured', { skip }, async () => {
 });
 
 test('launcher refuses an unknown role', { skip }, async () => {
-    const { result } = await launch('pyth-pusher');
+    const { result } = await launch('price-pusher');
     assert.equal(result.status, 2);
     assert.equal(result.stdout, '');
     assert.match(result.stderr, /Usage: dagon-zkapi-run server\|indexer\|challenger/);

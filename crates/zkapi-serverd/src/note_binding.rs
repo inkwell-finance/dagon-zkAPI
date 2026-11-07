@@ -61,11 +61,10 @@ async fn sequential_signed_state_cannot_branch_across_equal_or_unequal_notes() {
             signer.clone(),
             root,
             crate::test_support::StubLedger::unavailable(&config),
-            crate::test_support::StubBilling::accepting(&config),
         )
         .unwrap();
         let prepare = |id: &str, witness: &RequestWitnessData| {
-            let payload = crate::test_support::lease_payload(&config, now);
+            let payload = crate::test_support::lease_payload();
             let payload_hash = canonical_payload_hash(payload.as_bytes());
             let context = canonical_request_context(id, &payload_hash);
             let leaf = core::note_leaf(

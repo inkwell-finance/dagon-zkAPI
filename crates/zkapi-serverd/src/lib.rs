@@ -1,8 +1,9 @@
 //! Server-side logic for the Dagon zkAPI protocol on Solana.
 //!
 //! This crate implements proof verification, nullifier storage, prompt-private
-//! lease issuance and settlement against Pyth SOL/USD quotes, Baby-JubJub
-//! Schnorr signing, the concession-exit challenger, and the HTTP routes.
+//! lease issuance and USDC settlement (one base unit per metered micro-USD),
+//! Baby-JubJub Schnorr signing, the concession-exit challenger, and the HTTP
+//! routes.
 
 #[cfg(any(test, feature = "adversary"))]
 pub mod adversary;
@@ -22,7 +23,6 @@ pub mod routes;
 pub mod settlement;
 #[path = "signer_v2.rs"]
 pub mod signer;
-pub mod sol_billing;
 pub mod successor;
 pub mod testnet_auth;
 pub mod watcher;

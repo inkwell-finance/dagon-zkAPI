@@ -2,7 +2,7 @@
   "name": "@dagon/zkapi-browser-sdk",
   "version": "0.2.0",
   "private": true,
-  "description": "Dagon zkAPI browser wallet on Solana: Groth16 proofs, native-SOL vault lifecycle and Wallet Standard transport",
+  "description": "Dagon zkAPI browser wallet on Solana: Groth16 proofs, USDC vault lifecycle and Wallet Standard transport",
   "engines": {
     "node": ">=24"
   },
@@ -35,7 +35,7 @@
     "./expiry-history": "./sdk/services/zkapiExpiryHistory.mjs",
     "./active-root": "./sdk/services/zkapiActiveRoot.mjs",
     "./exit-policy": "./sdk/services/zkapiExitPolicy.mjs",
-    "./native-sol": "./sdk/services/zkapiNativeSol.mjs",
+    "./usdc": "./sdk/services/zkapiUsdc.mjs",
     "./wallet-error": "./sdk/services/zkapiWalletError.mjs",
     "./package.json": "./package.json"
   },

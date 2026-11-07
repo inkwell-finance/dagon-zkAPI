@@ -6,10 +6,10 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-dagon_zkapi_vault = "7NdY5ZVP2He8gSiDHZbkfmNfSgKWV2tkZmZgty2C1d8H"
+dagon_zkapi_vault = "8cYsHTNTvS5DwNqFaJ3LDZo8ed1k53cdgWQVZqEN45BX"
 
 [programs.mainnet]
-dagon_zkapi_vault = "7NdY5ZVP2He8gSiDHZbkfmNfSgKWV2tkZmZgty2C1d8H"
+dagon_zkapi_vault = "8cYsHTNTvS5DwNqFaJ3LDZo8ed1k53cdgWQVZqEN45BX"
 
 [provider]
 cluster = "Localnet"

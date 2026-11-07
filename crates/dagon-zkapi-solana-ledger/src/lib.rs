@@ -1,10 +1,13 @@
 //! Production Solana implementation of the Dagon zkAPI [`CreditLedger`].
 //!
-//! Deposits carry an insertion proof too large for one packet, so they are
-//! serialized into an authenticated operation buffer over multiple
-//! transactions and consumed by one atomic vault instruction. Exits are
-//! leaf-bound and root-free, so escape, close, defeat, raise, finalize, claim
-//! and closed-leaf retirement are each one direct transaction.
+//! The ledger asset is Circle USDC under the classic SPL Token program; one
+//! base unit is one micro-USD. Deposits carry an insertion proof too large for
+//! one packet, so they are serialized into an authenticated operation buffer
+//! over multiple transactions and consumed by one atomic vault instruction
+//! that pulls USDC from the payer's canonical associated token account. Exits
+//! are leaf-bound and root-free, so escape, close, defeat, raise, finalize,
+//! release, claim and closed-leaf retirement are each one direct transaction;
+//! payouts go to proof-bound USDC token accounts of any owner.
 
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
@@ -15,7 +18,10 @@ use anchor_lang::{
 };
 use base64::Engine;
 use dagon_zkapi_ledger::*;
-use dagon_zkapi_profile::{executable_sha256, to_hex, ResolvedIdentity, SharedProfile};
+use dagon_zkapi_profile::{
+    executable_sha256, to_hex, usdc_associated_token_address, vault_token_address,
+    ResolvedIdentity, SharedProfile,
+};
 use dagon_zkapi_vault as vault_program;
 use rand::RngCore;
 use serde::de::DeserializeOwned;
@@ -45,6 +51,15 @@ const ACCOUNT_PAGE_SIZE: u32 = 100;
 const HASH_COMPUTE_UNITS: u32 = 1_400_000;
 const HASH_HEAP_BYTES: u32 = 128 * 1_024;
 const EXPIRY_BUCKET_SECONDS: u64 = 86_400;
+/// Classic SPL Token account (`Account::LEN`) layout offsets.
+const TOKEN_ACCOUNT_LEN: usize = 165;
+const TOKEN_ACCOUNT_STATE_OFFSET: usize = 108;
+const TOKEN_ACCOUNT_INITIALIZED: u8 = 1;
+const TOKEN_ACCOUNT_FROZEN: u8 = 2;
+/// Associated Token Account program; `CreateIdempotent` is instruction 1.
+pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
+    anchor_lang::prelude::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const ATA_CREATE_IDEMPOTENT: u8 = 1;
 const TRANSITION_PROVING_KEY: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../protocol/setup/solana-transition-v1/transition.pk"
@@ -93,14 +108,20 @@ pub struct SolanaCreditLedger {
 /// authoritative Solana deployment.
 ///
 /// Values are returned only after the ledger has verified the pinned cluster,
-/// account owner, vault PDA/bump, version, chain ID, and protocol binding.
+/// account owner, vault PDA/bump, version, chain ID, and protocol binding,
+/// and that the vault token account is a classic-Token account of the vault's
+/// mint whose token authority is the vault. Amounts are USDC base units.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolanaVaultRuntimeView {
     pub state: LedgerState,
     pub paused: bool,
     pub version: u8,
     pub authority: [u8; 32],
-    pub treasury: [u8; 32],
+    /// The pinned classic-USDC account that receives treasury withdrawals.
+    pub treasury_token: [u8; 32],
+    pub mint: [u8; 32],
+    /// The vault's own USDC account (PDA `["vault-token", vault]`).
+    pub vault_token: [u8; 32],
     pub request_charge_cap: u64,
     pub note_ttl: u64,
     /// The vault's escape challenge period in seconds.
@@ -109,6 +130,15 @@ pub struct SolanaVaultRuntimeView {
     pub state_signing_key_y: Felt252,
     pub clearance_signing_key_x: Felt252,
     pub clearance_signing_key_y: Felt252,
+    /// Active note collateral.
+    pub total_credits: u64,
+    /// Operator revenue awaiting `withdraw_treasury`.
+    pub treasury_accrued: u64,
+    /// Finalized escape payouts parked until their account is creditable.
+    pub deferred_payouts: u64,
+    /// USDC held by the vault token account; at least the three liabilities
+    /// above, any excess being unsolicited donations.
+    pub vault_token_balance: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +147,50 @@ struct SolanaAccountSnapshot {
     owner: Pubkey,
     executable: bool,
     observed_slot: u64,
+}
+
+/// The fields of a classic SPL Token account the ledger relies on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TokenAccountView {
+    mint: Pubkey,
+    owner: Pubkey,
+    amount: u64,
+    frozen: bool,
+}
+
+impl TokenAccountView {
+    /// Decode an initialized or frozen classic-Token account. System-owned,
+    /// Token-2022 and forged program accounts are not token accounts.
+    fn decode(snapshot: &SolanaAccountSnapshot) -> Option<Self> {
+        let data = &snapshot.data;
+        if snapshot.owner != vault_program::token::TOKEN_PROGRAM_ID
+            || snapshot.executable
+            || data.len() != TOKEN_ACCOUNT_LEN
+        {
+            return None;
+        }
+        let frozen = match data[TOKEN_ACCOUNT_STATE_OFFSET] {
+            TOKEN_ACCOUNT_INITIALIZED => false,
+            TOKEN_ACCOUNT_FROZEN => true,
+            _ => return None,
+        };
+        let key = |offset: usize| {
+            Pubkey::new_from_array(data[offset..offset + 32].try_into().expect("32-byte key"))
+        };
+        Some(Self {
+            mint: key(0),
+            owner: key(32),
+            amount: u64::from_le_bytes(data[64..72].try_into().expect("8-byte amount")),
+            frozen,
+        })
+    }
+
+    /// Whether the vault could pay into this account: initialized, unfrozen
+    /// and of the vault's mint (the vault token account itself is excluded
+    /// by the caller).
+    fn creditable(&self, mint: &Pubkey) -> bool {
+        !self.frozen && self.mint == *mint
+    }
 }
 
 impl SolanaCreditLedger {
@@ -156,9 +230,11 @@ impl SolanaCreditLedger {
                 protocol_binding: binding,
                 vault: LedgerAccount::new(config.vault_state),
                 asset: LedgerAsset {
-                    symbol: "SOL".into(),
-                    decimals: 9,
-                    mint: None,
+                    symbol: "USDC".into(),
+                    decimals: vault_program::token::USDC_DECIMALS,
+                    mint: Some(LedgerAccount::new(
+                        vault_program::token::USDC_MINT.to_bytes(),
+                    )),
                 },
             },
             config,
@@ -177,7 +253,65 @@ impl SolanaCreditLedger {
     pub async fn finalized_vault(&self) -> Result<SolanaVaultRuntimeView, LedgerError> {
         let commitment = LedgerCommitment::Finalized;
         let (vault, slot) = self.vault_account(commitment).await?;
-        runtime_view(vault, slot, commitment)
+        let balance = self.vault_token_balance(&vault, commitment).await?;
+        runtime_view(vault, slot, commitment, balance)
+    }
+
+    /// The vault token account's USDC balance, after checking it is a
+    /// classic-Token account of the vault's mint held by the vault PDA.
+    async fn vault_token_balance(
+        &self,
+        vault: &vault_program::VaultState,
+        commitment: LedgerCommitment,
+    ) -> Result<u64, LedgerError> {
+        let account = self
+            .account_snapshot(vault.vault_token, commitment)
+            .await?
+            .as_ref()
+            .and_then(TokenAccountView::decode)
+            .filter(|account| account.mint == vault.mint && account.owner == self.vault)
+            .ok_or_else(|| {
+                LedgerError::DeploymentMismatch(format!(
+                    "vault token account {} is not the vault's classic-Token USDC account",
+                    vault.vault_token
+                ))
+            })?;
+        Ok(account.amount)
+    }
+
+    /// The classic-Token account at `address`, if one exists there.
+    async fn token_account(
+        &self,
+        address: Pubkey,
+        commitment: LedgerCommitment,
+    ) -> Result<Option<TokenAccountView>, LedgerError> {
+        Ok(self
+            .account_snapshot(address, commitment)
+            .await?
+            .as_ref()
+            .and_then(TokenAccountView::decode))
+    }
+
+    /// Reject, before any fee is spent, a payout target the vault would
+    /// refuse: it must be an initialized, unfrozen classic-Token account of
+    /// the vault's mint other than the vault token account (any owner).
+    async fn require_creditable_payout(
+        &self,
+        vault: &vault_program::VaultState,
+        destination: Pubkey,
+    ) -> Result<(), LedgerError> {
+        let creditable = destination != vault.vault_token
+            && self
+                .token_account(destination, LedgerCommitment::Tip)
+                .await?
+                .is_some_and(|account| account.creditable(&vault.mint));
+        if creditable {
+            Ok(())
+        } else {
+            Err(LedgerError::Rejected(format!(
+                "payout account {destination} is not a creditable classic-Token USDC account"
+            )))
+        }
     }
 
     /// Verify that the pinned program is an executable loader-v3 deployment
@@ -269,9 +403,9 @@ impl SolanaCreditLedger {
     }
 
     /// Build a transaction, payable by anyone, that sweeps the operator share
-    /// accrued in the vault to the pinned treasury. Exits never touch the
-    /// treasury account, so a treasury that cannot receive lamports cannot
-    /// block a user's payout.
+    /// accrued in the vault to the pinned treasury token account. Exits never
+    /// touch that account, so a treasury account that cannot receive USDC
+    /// (closed, frozen) cannot block a user's payout.
     pub async fn prepare_withdraw_treasury(
         &self,
         payer: LedgerAccount,
@@ -283,11 +417,16 @@ impl SolanaCreditLedger {
                 "no treasury share has accrued".into(),
             ));
         }
+        self.require_creditable_payout(&vault, vault.treasury_token)
+            .await?;
         let instruction = Instruction {
             program_id: self.program_id,
             accounts: vault_program::accounts::WithdrawTreasury {
                 vault: self.vault,
-                treasury: vault.treasury,
+                treasury_token: vault.treasury_token,
+                vault_token: vault.vault_token,
+                mint: vault.mint,
+                token_program: vault_program::token::TOKEN_PROGRAM_ID,
             }
             .to_account_metas(None),
             data: vault_program::instruction::WithdrawTreasury {}.data(),
@@ -640,7 +779,7 @@ impl SolanaCreditLedger {
             }
             start = end;
         }
-        let state = runtime_view(vault, slot, commitment)?.state;
+        let state = ledger_state(&vault, slot, commitment)?;
         if tree.root() != state.root {
             return Err(LedgerError::Rejected(
                 "live note snapshot does not reconstruct the vault root; refresh the path".into(),
@@ -898,23 +1037,34 @@ fn decode_scanned_account<T: AccountDeserialize + Space>(
         .map_err(|error| LedgerError::InvalidData(error.to_string()))
 }
 
+fn ledger_state(
+    vault: &vault_program::VaultState,
+    slot: u64,
+    commitment: LedgerCommitment,
+) -> Result<LedgerState, LedgerError> {
+    Ok(LedgerState {
+        root: Felt252::try_from_bytes_be(vault.current_root).map_err(LedgerError::InvalidData)?,
+        next_note_id: vault.next_note_id,
+        observed_height: Some(slot),
+        commitment,
+    })
+}
+
 fn runtime_view(
     vault: vault_program::VaultState,
     slot: u64,
     commitment: LedgerCommitment,
+    vault_token_balance: u64,
 ) -> Result<SolanaVaultRuntimeView, LedgerError> {
     let felt = |bytes| Felt252::try_from_bytes_be(bytes).map_err(LedgerError::InvalidData);
     Ok(SolanaVaultRuntimeView {
-        state: LedgerState {
-            root: felt(vault.current_root)?,
-            next_note_id: vault.next_note_id,
-            observed_height: Some(slot),
-            commitment,
-        },
+        state: ledger_state(&vault, slot, commitment)?,
         paused: vault.paused,
         version: vault.version,
         authority: vault.authority.to_bytes(),
-        treasury: vault.treasury.to_bytes(),
+        treasury_token: vault.treasury_token.to_bytes(),
+        mint: vault.mint.to_bytes(),
+        vault_token: vault.vault_token.to_bytes(),
         request_charge_cap: vault.request_charge_cap,
         note_ttl: vault.note_ttl,
         challenge_period: vault.challenge_period,
@@ -922,17 +1072,23 @@ fn runtime_view(
         state_signing_key_y: felt(vault.state_signing_key_y)?,
         clearance_signing_key_x: felt(vault.clearance_signing_key_x)?,
         clearance_signing_key_y: felt(vault.clearance_signing_key_y)?,
+        total_credits: vault.total_credits,
+        treasury_accrued: vault.treasury_accrued,
+        deferred_payouts: vault.deferred_payouts,
+        vault_token_balance,
     })
 }
 
-/// The finalized vault must carry exactly the profile's parameters and the
-/// identity's accounts.
+/// The finalized vault must carry exactly the profile's parameters and
+/// asset mint, the identity's authority and treasury token account, and the
+/// canonical vault token PDA.
 pub fn check_vault_profile(
     view: &SolanaVaultRuntimeView,
     profile: &SharedProfile,
     identity: &ResolvedIdentity,
 ) -> Result<(), LedgerError> {
     let vault = &profile.vault;
+    let vault_token = vault_token_address(&profile.program_id(), &identity.vault_state);
     let mismatches: Vec<String> = [
         ("version", u64::from(view.version), u64::from(vault.version)),
         (
@@ -950,8 +1106,21 @@ pub fn check_vault_profile(
     .into_iter()
     .filter(|(_, actual, expected)| actual != expected)
     .map(|(name, actual, expected)| format!("{name} {actual} (profile {expected})"))
-    .chain((view.authority != identity.vault_authority).then(|| "authority".to_string()))
-    .chain((view.treasury != identity.treasury).then(|| "treasury".to_string()))
+    .chain(
+        [
+            ("authority", view.authority, identity.vault_authority),
+            (
+                "treasury_token",
+                view.treasury_token,
+                identity.treasury_token_account,
+            ),
+            ("mint", view.mint, profile.usdc_mint()),
+            ("vault_token", view.vault_token, vault_token),
+        ]
+        .into_iter()
+        .filter(|(_, actual, expected)| actual != expected)
+        .map(|(name, _, _)| name.to_string()),
+    )
     .collect();
     if mismatches.is_empty() {
         Ok(())
@@ -963,6 +1132,42 @@ pub fn check_vault_profile(
     }
 }
 
+/// Mark the pending-rent refund account writable. Its Anchor field is not
+/// `mut` (a read-only escaper must not be able to block the instruction at
+/// account validation), but the program refuses a read-only refund target,
+/// so every prepared finalize and release passes it writable.
+fn refund_writable(
+    mut metas: Vec<solana_instruction::AccountMeta>,
+    rent_payer: Pubkey,
+) -> Vec<solana_instruction::AccountMeta> {
+    for meta in &mut metas {
+        if meta.pubkey == rent_payer {
+            meta.is_writable = true;
+        }
+    }
+    metas
+}
+
+/// The ATA program's `CreateIdempotent` for `owner`'s canonical USDC
+/// account, rent paid by `payer`. Succeeds without change if the account
+/// already exists.
+pub fn create_usdc_ata_idempotent_instruction(payer: &Pubkey, owner: &Pubkey) -> Instruction {
+    use solana_instruction::AccountMeta;
+    let ata = Pubkey::new_from_array(usdc_associated_token_address(&owner.to_bytes()));
+    Instruction {
+        program_id: ASSOCIATED_TOKEN_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(*owner, false),
+            AccountMeta::new_readonly(vault_program::token::USDC_MINT, false),
+            AccountMeta::new_readonly(anchor_lang::system_program::ID, false),
+            AccountMeta::new_readonly(vault_program::token::TOKEN_PROGRAM_ID, false),
+        ],
+        data: vec![ATA_CREATE_IDEMPOTENT],
+    }
+}
+
 impl CreditLedger for SolanaCreditLedger {
     fn deployment(&self) -> &LedgerDeployment {
         &self.deployment
@@ -971,13 +1176,7 @@ impl CreditLedger for SolanaCreditLedger {
     fn state(&self, commitment: LedgerCommitment) -> LedgerFuture<'_, LedgerState> {
         Box::pin(async move {
             let (vault, slot) = self.vault_account(commitment).await?;
-            Ok(LedgerState {
-                root: Felt252::try_from_bytes_be(vault.current_root)
-                    .map_err(LedgerError::InvalidData)?,
-                next_note_id: vault.next_note_id,
-                observed_height: Some(slot),
-                commitment,
-            })
+            ledger_state(&vault, slot, commitment)
         })
     }
 
@@ -1166,6 +1365,11 @@ impl CreditLedger for SolanaCreditLedger {
                             "pending withdrawal does not match its canonical PDA".into(),
                         ));
                     }
+                    // Finalized (payout or rent refund parked): the note is
+                    // closed and nothing remains to challenge.
+                    if pending.stage != vault_program::PENDING_STAGE_OPEN {
+                        continue;
+                    }
                     let felt =
                         |bytes| Felt252::try_from_bytes_be(bytes).map_err(LedgerError::InvalidData);
                     if pending.final_balance.checked_add(pending.conceded)
@@ -1219,6 +1423,22 @@ impl CreditLedger for SolanaCreditLedger {
             let (vault, observed_slot) = self.vault_account(LedgerCommitment::Tip).await?;
             if vault.next_note_id != request.expected_note_id {
                 return Err(LedgerError::Rejected("deposit note ID is stale".into()));
+            }
+            // The payer is the note-rent payer and the USDC token authority;
+            // the vault pulls exactly `amount` from its canonical ATA.
+            let source = Pubkey::new_from_array(usdc_associated_token_address(&payer.to_bytes()));
+            let funded = self
+                .token_account(source, LedgerCommitment::Tip)
+                .await?
+                .is_some_and(|account| {
+                    account.creditable(&vault.mint)
+                        && account.owner == payer
+                        && account.amount >= amount
+                });
+            if !funded {
+                return Err(LedgerError::Rejected(format!(
+                    "deposit source {source} is not the payer's unfrozen USDC account holding {amount} base units"
+                )));
             }
             let old_root =
                 Felt252::try_from_bytes_be(vault.current_root).map_err(LedgerError::InvalidData)?;
@@ -1275,6 +1495,11 @@ impl CreditLedger for SolanaCreditLedger {
                     operation,
                     note,
                     owner: payer,
+                    depositor: payer,
+                    source_token: source,
+                    vault_token: vault.vault_token,
+                    mint: vault.mint,
+                    token_program: vault_program::token::TOKEN_PROGRAM_ID,
                     system_program: anchor_lang::system_program::ID,
                 }
                 .to_account_metas(None),
@@ -1477,23 +1702,35 @@ impl CreditLedger for SolanaCreditLedger {
     ) -> LedgerFuture<'_, PreparedLedgerOperation> {
         Box::pin(async move {
             let payer = account_pubkey(request.payer);
-            // Deployment check only: the operator share accrues in the vault,
-            // so finalization never touches the treasury account.
-            self.vault_account(LedgerCommitment::Tip).await?;
+            // The operator share accrues in the vault, so finalization never
+            // touches the treasury account. The payout goes only to the saved
+            // destination (parked if it cannot be credited) and the pending
+            // rent only to the escaper.
+            let (vault, _) = self.vault_account(LedgerCommitment::Tip).await?;
             let (note, _) = note_address(self.vault, request.note_id, self.program_id);
             let (pending_address, pending) = self
                 .pending_account(request.note_id, LedgerCommitment::Tip)
                 .await?;
+            if pending.stage != vault_program::PENDING_STAGE_OPEN {
+                return Err(LedgerError::Rejected("escape is already finalized".into()));
+            }
             let instruction = Instruction {
                 program_id: self.program_id,
-                accounts: vault_program::accounts::FinalizeEscape {
-                    vault: self.vault,
-                    note,
-                    pending: pending_address,
-                    payer,
-                    destination: pending.destination,
-                }
-                .to_account_metas(None),
+                accounts: refund_writable(
+                    vault_program::accounts::FinalizeEscape {
+                        vault: self.vault,
+                        note,
+                        pending: pending_address,
+                        payer,
+                        rent_payer: pending.rent_payer,
+                        destination_token: pending.destination,
+                        vault_token: vault.vault_token,
+                        mint: vault.mint,
+                        token_program: vault_program::token::TOKEN_PROGRAM_ID,
+                    }
+                    .to_account_metas(None),
+                    pending.rent_payer,
+                ),
                 data: vault_program::instruction::FinalizeEscape {
                     note_id: request.note_id,
                 }
@@ -1509,7 +1746,7 @@ impl CreditLedger for SolanaCreditLedger {
     ) -> LedgerFuture<'_, PreparedLedgerOperation> {
         Box::pin(async move {
             let payer = account_pubkey(request.payer);
-            self.vault_account(LedgerCommitment::Tip).await?;
+            let (vault, _) = self.vault_account(LedgerCommitment::Tip).await?;
             let note_state = self
                 .note_account(request.note_id, LedgerCommitment::Tip)
                 .await?;
@@ -1525,6 +1762,7 @@ impl CreditLedger for SolanaCreditLedger {
                     vault: self.vault,
                     note,
                     owner: payer,
+                    vault_token: vault.vault_token,
                 }
                 .to_account_metas(None),
                 data: vault_program::instruction::ExecuteClaimExpired {
@@ -1533,6 +1771,101 @@ impl CreditLedger for SolanaCreditLedger {
                 .data(),
             };
             self.direct_operation(payer, instruction).await
+        })
+    }
+
+    /// A transaction, payable by anyone, that pays a parked escape payout to
+    /// its proof-bound token account once that account can be credited
+    /// again. The pending rent returns only to the escaper.
+    fn prepare_release_escape_payout(
+        &self,
+        request: ReleaseEscapePayoutRequest,
+    ) -> LedgerFuture<'_, PreparedLedgerOperation> {
+        Box::pin(async move {
+            let payer = account_pubkey(request.payer);
+            let note_id = request.note_id;
+            let (vault, _) = self.vault_account(LedgerCommitment::Tip).await?;
+            let (pending_address, pending) =
+                self.pending_account(note_id, LedgerCommitment::Tip).await?;
+            if pending.stage != vault_program::PENDING_STAGE_PAYOUT_PARKED {
+                return Err(LedgerError::Rejected("escape payout is not parked".into()));
+            }
+            self.require_creditable_payout(&vault, pending.destination)
+                .await?;
+            let (note, _) = note_address(self.vault, note_id, self.program_id);
+            let instruction = Instruction {
+                program_id: self.program_id,
+                accounts: refund_writable(
+                    vault_program::accounts::ReleaseEscapePayout {
+                        vault: self.vault,
+                        note,
+                        pending: pending_address,
+                        payer,
+                        rent_payer: pending.rent_payer,
+                        destination_token: pending.destination,
+                        vault_token: vault.vault_token,
+                        mint: vault.mint,
+                        token_program: vault_program::token::TOKEN_PROGRAM_ID,
+                    }
+                    .to_account_metas(None),
+                    pending.rent_payer,
+                ),
+                data: vault_program::instruction::ReleaseEscapePayout { note_id }.data(),
+            };
+            self.direct_operation(payer, instruction).await
+        })
+    }
+
+    /// A transaction, payable by anyone, that returns pending rent parked
+    /// because the escaper's address could not receive lamports when the
+    /// payout completed. Only the stored escaper is paid.
+    fn prepare_refund_pending_rent(
+        &self,
+        request: RefundPendingRentRequest,
+    ) -> LedgerFuture<'_, PreparedLedgerOperation> {
+        Box::pin(async move {
+            let payer = account_pubkey(request.payer);
+            let note_id = request.note_id;
+            self.vault_account(LedgerCommitment::Tip).await?;
+            let (pending_address, pending) =
+                self.pending_account(note_id, LedgerCommitment::Tip).await?;
+            if pending.stage != vault_program::PENDING_STAGE_RENT_PARKED {
+                return Err(LedgerError::Rejected(
+                    "escape has no parked rent refund".into(),
+                ));
+            }
+            let (note, _) = note_address(self.vault, note_id, self.program_id);
+            let instruction = Instruction {
+                program_id: self.program_id,
+                accounts: vault_program::accounts::RefundPendingRent {
+                    vault: self.vault,
+                    note,
+                    pending: pending_address,
+                    rent_payer: pending.rent_payer,
+                }
+                .to_account_metas(None),
+                data: vault_program::instruction::RefundPendingRent { note_id }.data(),
+            };
+            self.direct_operation(payer, instruction).await
+        })
+    }
+
+    /// A `payer`-signed transaction that creates `owner`'s canonical USDC
+    /// associated token account if it does not exist (idempotent; the payer
+    /// funds its rent). Deposits draw from, and clients default payouts to,
+    /// this account.
+    fn prepare_create_usdc_account(
+        &self,
+        request: CreateUsdcAccountRequest,
+    ) -> LedgerFuture<'_, PreparedLedgerOperation> {
+        Box::pin(async move {
+            let payer = account_pubkey(request.payer);
+            let owner = account_pubkey(request.owner);
+            self.direct_operation(
+                payer,
+                create_usdc_ata_idempotent_instruction(&payer, &owner),
+            )
+            .await
         })
     }
 
@@ -1709,8 +2042,12 @@ impl SolanaCreditLedger {
                 "withdrawal balance exceeds the note deposit".into(),
             ));
         }
+        // A close pays strictly and an escape is refused unless the bound
+        // token account can be credited now (a zero-balance close pays none).
+        if !close || public.final_balance > 0 {
+            self.require_creditable_payout(&vault, destination).await?;
+        }
         let payload = vault_program::WithdrawalPayload {
-            destination,
             public_inputs: withdrawal_inputs(public),
             proof,
         };
@@ -1728,7 +2065,10 @@ impl SolanaCreditLedger {
                     note,
                     used_nullifier,
                     owner: payer,
-                    destination,
+                    destination_token: destination,
+                    vault_token: vault.vault_token,
+                    mint: vault.mint,
+                    token_program: vault_program::token::TOKEN_PROGRAM_ID,
                     system_program: anchor_lang::system_program::ID,
                 }
                 .to_account_metas(None),
@@ -2155,12 +2495,19 @@ mod tests {
         let authority = Pubkey::new_unique();
         let (address, bump) =
             Pubkey::find_program_address(&[b"vault", authority.as_ref()], &program_id);
+        let (vault_token, vault_token_bump) = Pubkey::find_program_address(
+            &[vault_program::VAULT_TOKEN_SEED, address.as_ref()],
+            &program_id,
+        );
         let state = vault_program::VaultState {
             version: vault_program::VAULT_VERSION,
             bump,
             paused: false,
             authority,
-            treasury: Pubkey::new_unique(),
+            treasury_token: Pubkey::new_unique(),
+            mint: vault_program::token::USDC_MINT,
+            vault_token,
+            vault_token_bump,
             genesis_hash,
             chain_id: solana_chain_id(&genesis_hash),
             protocol_binding: *solana_deployment_binding(
@@ -2183,6 +2530,7 @@ mod tests {
             last_pause_end: 0,
             total_paused_duration: 0,
             treasury_accrued: 0,
+            deferred_payouts: 0,
         };
         (address, state)
     }
@@ -2443,31 +2791,34 @@ mod tests {
         let (vault, state) = test_vault(program_id, genesis_hash, core::EMPTY_MERKLE_ROOT, count);
         let authority = state.authority;
         let vault_response = program_account(&state, program_id);
+        let pending_record = |note_id: u32, stage: u8| {
+            let (_, bump) = pending_address(vault, note_id, program_id);
+            let pending = vault_program::PendingWithdrawal {
+                vault,
+                note_id,
+                nullifier: *Felt252::from_u64(u64::from(note_id) + 1).as_bytes(),
+                next_nullifier: *Felt252::from_u64(u64::from(note_id) + 100_000).as_bytes(),
+                state_balance: 10,
+                conceded: 9,
+                final_balance: 1,
+                destination: authority,
+                deadline: 1_900_000_000,
+                bump,
+                rent_payer: authority,
+                stage,
+            };
+            let mut data = Vec::new();
+            pending.try_serialize(&mut data).unwrap();
+            rpc_account(&SolanaAccountSnapshot {
+                data,
+                owner: program_id,
+                executable: false,
+                observed_slot: 44,
+            })["value"]
+                .clone()
+        };
         let accounts: Vec<Value> = (0..count)
-            .map(|note_id| {
-                let (_, bump) = pending_address(vault, note_id, program_id);
-                let pending = vault_program::PendingWithdrawal {
-                    vault,
-                    note_id,
-                    nullifier: *Felt252::from_u64(u64::from(note_id) + 1).as_bytes(),
-                    next_nullifier: *Felt252::from_u64(u64::from(note_id) + 100_000).as_bytes(),
-                    state_balance: 10,
-                    conceded: 9,
-                    final_balance: 1,
-                    destination: authority,
-                    deadline: 1_900_000_000,
-                    bump,
-                };
-                let mut data = Vec::new();
-                pending.try_serialize(&mut data).unwrap();
-                rpc_account(&SolanaAccountSnapshot {
-                    data,
-                    owner: program_id,
-                    executable: false,
-                    observed_slot: 44,
-                })["value"]
-                    .clone()
-            })
+            .map(|note_id| pending_record(note_id, vault_program::PENDING_STAGE_OPEN))
             .collect();
         assert!(serde_json::to_vec(&accounts).unwrap().len() > MAX_RPC_RESPONSE_BYTES);
         let mut responses = vec![
@@ -2508,13 +2859,17 @@ mod tests {
         server.await.unwrap();
 
         // Funding the pending PDA of a non-escaped note (a System transfer
-        // anyone can make) must not hide the real escapes from the challenger.
+        // anyone can make) must not hide the real escapes from the challenger,
+        // and a finalized escape (payout or rent refund parked) is not
+        // challengeable.
         let unclaimed = json!({
             "owner": anchor_lang::system_program::ID.to_string(), "executable": false,
             "lamports": 890_880, "data": ["", "base64"],
         });
         let mut funded = accounts.clone();
         funded[7] = unclaimed.clone();
+        funded[9] = pending_record(9, vault_program::PENDING_STAGE_PAYOUT_PARKED);
+        funded[10] = pending_record(10, vault_program::PENDING_STAGE_RENT_PARKED);
         funded[count as usize - 1] = unclaimed;
         let mut responses = vec![
             json!(Hash::new_from_array(genesis_hash).to_string()),
@@ -2534,10 +2889,10 @@ mod tests {
             .pending_escapes(LedgerCommitment::Finalized)
             .await
             .unwrap();
-        assert_eq!(escapes.len(), count as usize - 2);
+        assert_eq!(escapes.len(), count as usize - 4);
         assert!(escapes
             .iter()
-            .all(|escape| escape.note_id != 7 && escape.note_id != count - 1));
+            .all(|escape| ![7, 9, 10, count - 1].contains(&escape.note_id)));
         assert!(escapes.iter().any(|escape| escape.note_id == 8));
         server.await.unwrap();
 
@@ -2576,6 +2931,8 @@ mod tests {
                 destination: authority,
                 deadline: 1_900_000_000,
                 bump,
+                rent_payer: authority,
+                stage: vault_program::PENDING_STAGE_OPEN,
             },
             program_id,
         )["value"]
@@ -2605,13 +2962,18 @@ mod tests {
         let state_y = Felt252::from_u64(12);
         let clear_x = Felt252::from_u64(13);
         let clear_y = Felt252::from_u64(14);
+        let treasury_token = Pubkey::new_unique();
+        let vault_token = Pubkey::new_unique();
         let view = runtime_view(
             vault_program::VaultState {
                 version: vault_program::VAULT_VERSION,
                 bump: 1,
                 paused: true,
                 authority: Pubkey::new_unique(),
-                treasury: Pubkey::new_unique(),
+                treasury_token,
+                mint: vault_program::token::USDC_MINT,
+                vault_token,
+                vault_token_bump: 254,
                 genesis_hash: [3; 32],
                 chain_id: 9,
                 protocol_binding: [4; 32],
@@ -2628,10 +2990,12 @@ mod tests {
                 paused_at: 1_900_000_000,
                 last_pause_end: 0,
                 total_paused_duration: 0,
-                treasury_accrued: 0,
+                treasury_accrued: 3_000,
+                deferred_payouts: 500,
             },
             42,
             LedgerCommitment::Finalized,
+            2_003_600,
         )
         .unwrap();
 
@@ -2648,10 +3012,23 @@ mod tests {
         assert_eq!(view.state_signing_key_y, state_y);
         assert_eq!(view.clearance_signing_key_x, clear_x);
         assert_eq!(view.clearance_signing_key_y, clear_y);
+        assert_eq!(view.treasury_token, treasury_token.to_bytes());
+        assert_eq!(view.mint, vault_program::token::USDC_MINT.to_bytes());
+        assert_eq!(view.vault_token, vault_token.to_bytes());
+        assert_eq!(
+            (
+                view.total_credits,
+                view.treasury_accrued,
+                view.deferred_payouts,
+                view.vault_token_balance
+            ),
+            (2_000_000, 3_000, 500, 2_003_600)
+        );
     }
 
-    /// The vault must carry exactly the profile's parameters and the
-    /// identity's authority and treasury; each difference is reported.
+    /// The vault must carry exactly the profile's parameters and mint, the
+    /// identity's authority and treasury token account, and the canonical
+    /// vault token PDA; each difference is reported.
     #[test]
     fn vault_profile_gate_rejects_every_parameter_and_account_difference() {
         let profile = SharedProfile::embedded();
@@ -2659,8 +3036,7 @@ mod tests {
             genesis_hash: [3; 32],
             vault_authority: [5; 32],
             vault_state: [6; 32],
-            treasury: [7; 32],
-            pyth_price_account: [8; 32],
+            treasury_token_account: [7; 32],
         };
         let view = SolanaVaultRuntimeView {
             state: LedgerState {
@@ -2672,7 +3048,9 @@ mod tests {
             paused: false,
             version: profile.vault.version,
             authority: identity.vault_authority,
-            treasury: identity.treasury,
+            treasury_token: identity.treasury_token_account,
+            mint: profile.usdc_mint(),
+            vault_token: vault_token_address(&profile.program_id(), &identity.vault_state),
             request_charge_cap: profile.vault.request_charge_cap,
             note_ttl: profile.vault.note_ttl_seconds,
             challenge_period: profile.vault.challenge_period_seconds,
@@ -2680,16 +3058,22 @@ mod tests {
             state_signing_key_y: Felt252::ZERO,
             clearance_signing_key_x: Felt252::ZERO,
             clearance_signing_key_y: Felt252::ZERO,
+            total_credits: 0,
+            treasury_accrued: 0,
+            deferred_payouts: 0,
+            vault_token_balance: 0,
         };
         check_vault_profile(&view, profile, &identity).unwrap();
         type Mutation = (&'static str, fn(&mut SolanaVaultRuntimeView));
-        let mutations: [Mutation; 6] = [
+        let mutations: [Mutation; 8] = [
             ("version", |view| view.version += 1),
             ("request_charge_cap", |view| view.request_charge_cap += 1),
             ("note_ttl", |view| view.note_ttl -= 1),
             ("challenge_period", |view| view.challenge_period = 3_600),
             ("authority", |view| view.authority = [9; 32]),
-            ("treasury", |view| view.treasury = [9; 32]),
+            ("treasury_token", |view| view.treasury_token = [9; 32]),
+            ("mint", |view| view.mint = [9; 32]),
+            ("vault_token", |view| view.vault_token = [9; 32]),
         ];
         for (name, mutate) in mutations {
             let mut changed = view.clone();
@@ -2733,11 +3117,14 @@ mod tests {
         let payer = Pubkey::new_unique();
         let vault = Pubkey::new_unique();
         let destination = Pubkey::new_unique();
+        let vault_token = Pubkey::new_unique();
+        let mint = vault_program::token::USDC_MINT;
+        let token_program = vault_program::token::TOKEN_PROGRAM_ID;
         let system_program = anchor_lang::system_program::ID;
         let felt = [7; 32];
         let unique = Pubkey::new_unique;
+        let escaper = unique();
         let withdrawal = vault_program::WithdrawalPayload {
-            destination,
             public_inputs: vault_program::WithdrawalInputs {
                 protocol_version: u16::MAX,
                 chain_id: u64::MAX,
@@ -2815,7 +3202,10 @@ mod tests {
                         note: unique(),
                         used_nullifier: unique(),
                         owner: payer,
-                        destination,
+                        destination_token: destination,
+                        vault_token,
+                        mint,
+                        token_program,
                         system_program,
                     }
                     .to_account_metas(None),
@@ -2884,12 +3274,59 @@ mod tests {
                 ),
             ),
             (
+                "finalize",
+                true,
+                build(
+                    refund_writable(
+                        accounts::FinalizeEscape {
+                            vault,
+                            note: unique(),
+                            pending: unique(),
+                            payer,
+                            rent_payer: escaper,
+                            destination_token: destination,
+                            vault_token,
+                            mint,
+                            token_program,
+                        }
+                        .to_account_metas(None),
+                        escaper,
+                    ),
+                    instruction::FinalizeEscape { note_id: u32::MAX }.data(),
+                ),
+            ),
+            (
+                "release",
+                true,
+                build(
+                    refund_writable(
+                        accounts::ReleaseEscapePayout {
+                            vault,
+                            note: unique(),
+                            pending: unique(),
+                            payer,
+                            rent_payer: escaper,
+                            destination_token: destination,
+                            vault_token,
+                            mint,
+                            token_program,
+                        }
+                        .to_account_metas(None),
+                        escaper,
+                    ),
+                    instruction::ReleaseEscapePayout { note_id: u32::MAX }.data(),
+                ),
+            ),
+            (
                 "withdraw_treasury",
                 true,
                 build(
                     accounts::WithdrawTreasury {
                         vault,
-                        treasury: unique(),
+                        treasury_token: unique(),
+                        vault_token,
+                        mint,
+                        token_program,
                     }
                     .to_account_metas(None),
                     instruction::WithdrawTreasury {}.data(),
@@ -2903,6 +3340,7 @@ mod tests {
                         vault,
                         note: unique(),
                         owner: payer,
+                        vault_token,
                     }
                     .to_account_metas(None),
                     instruction::ExecuteClaimExpired { note_id: u32::MAX }.data(),
@@ -3021,6 +3459,8 @@ mod tests {
             destination: Pubkey::new_unique(),
             deadline: 1_900_000_000,
             bump,
+            rent_payer: Pubkey::new_unique(),
+            stage: vault_program::PENDING_STAGE_OPEN,
         };
         let request = |nullifier, solvency_bound| RequestPublicInputsV2 {
             protocol_version: PROTOCOL_VERSION,
@@ -3112,19 +3552,218 @@ mod tests {
         }
     }
 
+    /// A classic-Token account RPC reply with the given fields.
+    fn token_account_reply(
+        owner_program: Pubkey,
+        mint: Pubkey,
+        owner: Pubkey,
+        amount: u64,
+        state: u8,
+    ) -> Value {
+        let mut data = vec![0; TOKEN_ACCOUNT_LEN];
+        data[..32].copy_from_slice(mint.as_ref());
+        data[32..64].copy_from_slice(owner.as_ref());
+        data[64..72].copy_from_slice(&amount.to_le_bytes());
+        data[TOKEN_ACCOUNT_STATE_OFFSET] = state;
+        rpc_account(&SolanaAccountSnapshot {
+            data,
+            owner: owner_program,
+            executable: false,
+            observed_slot: 44,
+        })
+    }
+
+    #[test]
+    fn token_accounts_decode_only_classic_initialized_layouts() {
+        let mint = vault_program::token::USDC_MINT;
+        let owner = Pubkey::new_unique();
+        let snapshot = |program: Pubkey, len: usize, state: u8| {
+            let mut data = vec![0; len.max(TOKEN_ACCOUNT_LEN)];
+            data[..32].copy_from_slice(mint.as_ref());
+            data[32..64].copy_from_slice(owner.as_ref());
+            data[64..72].copy_from_slice(&7u64.to_le_bytes());
+            data[TOKEN_ACCOUNT_STATE_OFFSET] = state;
+            data.truncate(len);
+            SolanaAccountSnapshot {
+                data,
+                owner: program,
+                executable: false,
+                observed_slot: 1,
+            }
+        };
+        let classic = vault_program::token::TOKEN_PROGRAM_ID;
+        let view = TokenAccountView::decode(&snapshot(classic, TOKEN_ACCOUNT_LEN, 1)).unwrap();
+        assert_eq!(
+            (view.mint, view.owner, view.amount, view.frozen),
+            (mint, owner, 7, false)
+        );
+        assert!(view.creditable(&mint));
+        assert!(!view.creditable(&Pubkey::new_unique()));
+        let frozen = TokenAccountView::decode(&snapshot(classic, TOKEN_ACCOUNT_LEN, 2)).unwrap();
+        assert!(frozen.frozen && !frozen.creditable(&mint));
+        for rejected in [
+            snapshot(classic, TOKEN_ACCOUNT_LEN, 0),
+            snapshot(classic, TOKEN_ACCOUNT_LEN + 1, 1),
+            snapshot(
+                vault_program::token::TOKEN_2022_PROGRAM_ID,
+                TOKEN_ACCOUNT_LEN,
+                1,
+            ),
+            snapshot(vault_program::ID, TOKEN_ACCOUNT_LEN, 1),
+        ] {
+            assert_eq!(TokenAccountView::decode(&rejected), None);
+        }
+    }
+
+    #[test]
+    fn usdc_ata_creation_is_the_canonical_create_idempotent() {
+        let profile = SharedProfile::embedded();
+        assert_eq!(
+            ASSOCIATED_TOKEN_PROGRAM_ID.to_bytes(),
+            profile.associated_token_program()
+        );
+        assert_eq!(
+            vault_program::token::TOKEN_PROGRAM_ID.to_bytes(),
+            profile.token_program()
+        );
+        assert_eq!(
+            vault_program::token::USDC_MINT.to_bytes(),
+            profile.usdc_mint()
+        );
+        let (payer, owner) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let instruction = create_usdc_ata_idempotent_instruction(&payer, &owner);
+        let (ata, _) = Pubkey::find_program_address(
+            &[
+                owner.as_ref(),
+                vault_program::token::TOKEN_PROGRAM_ID.as_ref(),
+                vault_program::token::USDC_MINT.as_ref(),
+            ],
+            &ASSOCIATED_TOKEN_PROGRAM_ID,
+        );
+        assert_eq!(instruction.program_id, ASSOCIATED_TOKEN_PROGRAM_ID);
+        assert_eq!(instruction.data, vec![1]);
+        let metas: Vec<_> = instruction
+            .accounts
+            .iter()
+            .map(|meta| (meta.pubkey, meta.is_signer, meta.is_writable))
+            .collect();
+        assert_eq!(
+            metas,
+            vec![
+                (payer, true, true),
+                (ata, false, true),
+                (owner, false, false),
+                (vault_program::token::USDC_MINT, false, false),
+                (anchor_lang::system_program::ID, false, false),
+                (vault_program::token::TOKEN_PROGRAM_ID, false, false),
+            ]
+        );
+    }
+
+    /// Deposits draw from the payer's canonical USDC ATA; a missing, frozen,
+    /// foreign-mint, Token-2022 or underfunded source is refused before any
+    /// proving or fee.
+    #[tokio::test]
+    async fn deposit_source_must_be_the_funded_canonical_usdc_account() {
+        let program_id = vault_program::ID;
+        let genesis_hash = [3; 32];
+        let (vault_address, vault) =
+            test_vault(program_id, genesis_hash, core::EMPTY_MERKLE_ROOT, 0);
+        let payer = Pubkey::new_unique();
+        let usdc = vault_program::token::USDC_MINT;
+        let classic = vault_program::token::TOKEN_PROGRAM_ID;
+        let genesis = json!(Hash::new_from_array(genesis_hash).to_string());
+        for source in [
+            json!({"context": {"slot": 44}, "value": null}),
+            token_account_reply(classic, usdc, payer, 999, 1),
+            token_account_reply(classic, usdc, payer, 1_000, 2),
+            token_account_reply(classic, Pubkey::new_unique(), payer, 1_000, 1),
+            token_account_reply(
+                vault_program::token::TOKEN_2022_PROGRAM_ID,
+                usdc,
+                payer,
+                1_000,
+                1,
+            ),
+        ] {
+            let (rpc_url, server) = response_sequence_rpc(vec![
+                genesis.clone(),
+                program_account(&vault, program_id),
+                source,
+            ])
+            .await;
+            let ledger = SolanaCreditLedger::new(SolanaLedgerConfig {
+                rpc_url,
+                indexer_url: None,
+                network: "localnet".into(),
+                program_id: program_id.to_bytes(),
+                vault_state: vault_address.to_bytes(),
+                genesis_hash,
+            })
+            .unwrap();
+            let result = ledger
+                .prepare_deposit(DepositRequest {
+                    payer: LedgerAccount::new(payer.to_bytes()),
+                    expected_note_id: 0,
+                    commitment: Felt252::from_u64(5),
+                    amount: 1_000,
+                    zero_path: [Felt252::ZERO; zkapi_types::MERKLE_DEPTH],
+                })
+                .await;
+            assert!(
+                matches!(result, Err(LedgerError::Rejected(_))),
+                "{result:?}"
+            );
+            server.await.unwrap();
+        }
+    }
+
     /// Exits accrue the operator share in the vault; anyone may sweep it to
-    /// the pinned treasury, and nothing is prepared when nothing accrued.
+    /// the pinned treasury token account, and nothing is prepared when
+    /// nothing accrued or when that account cannot receive USDC.
     #[tokio::test]
     async fn treasury_sweep_targets_the_pinned_treasury_only_when_accrued() {
         let program_id = vault_program::ID;
         let genesis_hash = [3; 32];
         let genesis = json!(Hash::new_from_array(genesis_hash).to_string());
-        for accrued in [0, 250_000] {
+        let usdc = vault_program::token::USDC_MINT;
+        let classic = vault_program::token::TOKEN_PROGRAM_ID;
+        let owner = Pubkey::new_unique();
+        for (accrued, treasury, accepted) in [
+            (0, None, false),
+            (
+                250_000,
+                Some(token_account_reply(classic, usdc, owner, 0, 2)),
+                false,
+            ),
+            (
+                250_000,
+                Some(token_account_reply(
+                    classic,
+                    Pubkey::new_unique(),
+                    owner,
+                    0,
+                    1,
+                )),
+                false,
+            ),
+            (
+                250_000,
+                Some(json!({"context": {"slot": 44}, "value": null})),
+                false,
+            ),
+            (
+                250_000,
+                Some(token_account_reply(classic, usdc, owner, 0, 1)),
+                true,
+            ),
+        ] {
             let (vault_address, mut vault) =
                 test_vault(program_id, genesis_hash, core::EMPTY_MERKLE_ROOT, 0);
             vault.treasury_accrued = accrued;
             let mut responses = vec![genesis.clone(), program_account(&vault, program_id)];
-            if accrued > 0 {
+            responses.extend(treasury);
+            if accepted {
                 responses.push(genesis.clone());
                 responses.push(json!({"context": {"slot": 44}, "value": {
                     "blockhash": Hash::new_unique().to_string(), "lastValidBlockHeight": 10,
@@ -3143,15 +3782,19 @@ mod tests {
             let result = ledger
                 .prepare_withdraw_treasury(LedgerAccount::new([6; 32]))
                 .await;
-            if accrued == 0 {
-                assert!(matches!(result, Err(LedgerError::Rejected(_))));
-            } else {
+            if accepted {
                 let operation = result.unwrap();
                 assert_eq!(operation.transactions.len(), 1);
                 let message: Message =
                     bincode::deserialize(&operation.transactions[0].bytes).unwrap();
-                assert!(message.account_keys.contains(&vault.treasury));
+                assert!(message.account_keys.contains(&vault.treasury_token));
+                assert!(message.account_keys.contains(&vault.vault_token));
                 assert_eq!(message.account_keys[0], Pubkey::new_from_array([6; 32]));
+            } else {
+                assert!(
+                    matches!(result, Err(LedgerError::Rejected(_))),
+                    "{result:?}"
+                );
             }
             server.await.unwrap();
         }

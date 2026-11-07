@@ -1,534 +1,111 @@
-//! Price boundary between Pyth SOL/USD quotes and lamport credits. A price
-//! source is not a credit ledger.
+//! Boundary between metered upstream spend and the vault's USDC credits.
 //!
-//! Quotes carry an explicit source and deployment binding; callers must
-//! authenticate them through `BillingPriceSource::validate` before first
-//! acceptance. Settlement only uses the already accepted, proof-bound quote.
-
-use std::{future::Future, pin::Pin};
-
-use dagon_zkapi_profile::PYTH_MAX_AGE_CEILING_SECONDS;
-use serde::{Deserialize, Serialize};
-use zkapi_types::Felt252;
+//! One vault base unit is one micro-USDC, which the server bills as one
+//! micro-USD: a request's proof-bound `solvency_bound` is its upstream spend
+//! budget and metered micro-USD (already rounded up by
+//! [`crate::pricing::usd_to_micro_usd`]) is its charge. Both stay within the
+//! integers a JavaScript number represents exactly.
 
 use crate::error::ServerError;
 
-pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
-pub const PYTH_SOURCE: &str = "pyth_solana_receiver";
 /// Largest integer a JavaScript number represents exactly.
 pub const MAX_SAFE_UNITS: u128 = 9_007_199_254_740_991;
 
-pub type BillingFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ServerError>> + Send + 'a>>;
-
-/// Authentication and acquisition of prices, independent of chain accounting.
-/// `validate` must check the pinned finalized source, not just quote syntax.
-/// `validate_identity` intentionally omits freshness so accepted quotes remain
-/// usable for settlement and exact retries after their issuance window expires.
-pub trait BillingPriceSource: Send + Sync {
-    fn quote(&self, now: u64) -> BillingFuture<'_, BillingQuote>;
-    fn validate<'a>(&'a self, quote: &'a BillingQuote, now: u64) -> BillingFuture<'a, ()>;
-    fn validate_identity(&self, quote: &BillingQuote) -> Result<(), ServerError>;
-
-    fn assert_fresh(&self, quote: &BillingQuote, now: u64) -> Result<(), ServerError> {
-        self.validate_identity(quote)?;
-        quote.assert_fresh(now)
+/// Upstream spend budget, in micro-USD, of a request's proof-bound solvency
+/// bound. Zero and browser-unsafe budgets fail closed.
+pub fn lease_limit_micro_usd(solvency_bound: u128) -> Result<u128, ServerError> {
+    if solvency_bound == 0 || solvency_bound > MAX_SAFE_UNITS {
+        return Err(ServerError::InvalidRequest(
+            "USDC lease budget is outside browser-safe bounds".into(),
+        ));
     }
-
-    /// Recheck immediately before returning a quote or reserving a request.
-    /// Stateful sources additionally enforce their newest-observed price policy.
-    fn assert_admissible(&self, quote: &BillingQuote, now: u64) -> Result<(), ServerError> {
-        self.assert_fresh(quote, now)
-    }
+    Ok(solvency_bound)
 }
 
-/// Pins owned by the operator, never supplied by an API caller. The transport
-/// adapter must decode/validate addresses and verify the actual account owner
-/// using the official receiver SDK before constructing an authenticated quote.
-#[derive(Debug, Clone)]
-pub struct BillingPins {
-    pub chain_id: u64,
-    pub deployment_binding: Felt252,
-    pub backend: String,
-    pub network: String,
-    pub vault: String,
-    pub feed_id: String,
-    pub feed_account: String,
-    pub receiver_program: String,
-    pub max_age_seconds: u64,
-    pub max_confidence_bps: u16,
-}
-
-/// A finalized Pyth SOL/USD price bound to one deployment.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct BillingQuote {
-    pub asset: String,
-    pub source: String,
-    pub credit_unit: String,
-    pub base_units_per_asset: u64,
-    /// Full u64 identity must not be rounded by JavaScript JSON consumers.
-    pub chain_id: String,
-    pub deployment_binding: Felt252,
-    pub backend: String,
-    pub network: String,
-    pub vault: String,
-    pub feed_id: String,
-    pub feed_account: String,
-    pub receiver_program: String,
-    /// Positive canonical decimal integer, matching Pyth's signed i64 price.
-    pub price: String,
-    pub exponent: i32,
-    pub confidence: String,
-    pub publish_time: u64,
-    pub expires_at: u64,
-    pub posted_slot: u64,
-}
-
-impl BillingQuote {
-    pub fn validate_identity(&self, pins: &BillingPins) -> Result<(), ServerError> {
-        if self.asset != "native_sol"
-            || self.source != PYTH_SOURCE
-            || self.credit_unit != "lamports"
-            || self.base_units_per_asset != LAMPORTS_PER_SOL
-            || self.chain_id != pins.chain_id.to_string()
-            || self.deployment_binding != pins.deployment_binding
-            || self.backend != pins.backend
-            || self.network != pins.network
-            || self.vault != pins.vault
-            || self.feed_id != pins.feed_id
-            || self.feed_account != pins.feed_account
-            || self.receiver_program != pins.receiver_program
-            || pins.backend != "dagon.solana.groth16.v1"
-            || pins.network.trim().is_empty()
-            || pins.vault.trim().is_empty()
-            || pins.feed_id.is_empty()
-            || pins.feed_account.is_empty()
-            || pins.receiver_program.is_empty()
-            || pins.max_age_seconds == 0
-            || pins.max_age_seconds > PYTH_MAX_AGE_CEILING_SECONDS
-            || !(1..=100).contains(&pins.max_confidence_bps)
-            || self.publish_time == 0
-            || self.expires_at
-                != self
-                    .publish_time
-                    .checked_add(pins.max_age_seconds)
-                    .ok_or_else(|| invalid("SOL billing quote expiry overflow"))?
-        {
-            return Err(invalid(
-                "SOL billing quote does not match the pinned deployment/source",
-            ));
-        }
-        let price = positive_price(&self.price)?;
-        // Reject an interval that permits a zero/negative native-asset price.
-        let confidence = canonical_u64(&self.confidence)?;
-        if confidence >= price
-            || u128::from(confidence) * 10_000
-                > u128::from(price) * u128::from(pins.max_confidence_bps)
-        {
-            return Err(invalid(
-                "SOL billing price confidence permits a nonpositive price",
-            ));
-        }
-        self.micro_usd_per_lamport()?;
-        Ok(())
+/// Charge, in USDC base units, for metered micro-USD. Callers cap it by the
+/// request's solvency bound, which is also its spend budget.
+pub fn charge_units(micro_usd: u128) -> Result<u128, ServerError> {
+    if micro_usd > MAX_SAFE_UNITS {
+        return Err(ServerError::InvalidRequest(
+            "USDC usage is outside browser-safe bounds".into(),
+        ));
     }
-
-    pub fn assert_fresh(&self, now: u64) -> Result<(), ServerError> {
-        if self.publish_time == 0 || self.publish_time > now {
-            return Err(invalid(
-                "billing price publication time is invalid or in the future",
-            ));
-        }
-        if self.expires_at <= now {
-            return Err(ServerError::NativeQuoteExpired);
-        }
-        Ok(())
-    }
-
-    /// Whether a newer conservative price fell by more than the profile's
-    /// tolerance from this quote. Compare exact integers across exponents;
-    /// overflow while scaling one side proves it exceeds the other u128 side.
-    pub fn is_superseded_by(&self, newer: &Self, tolerance_bps: u16) -> Result<bool, ServerError> {
-        if tolerance_bps >= 10_000
-            || !(-18..=18).contains(&self.exponent)
-            || !(-18..=18).contains(&newer.exponent)
-        {
-            return Err(invalid("invalid SOL supersession policy or exponent"));
-        }
-        let conservative = |quote: &Self| -> Result<u128, ServerError> {
-            positive_price(&quote.price)?
-                .checked_sub(canonical_u64(&quote.confidence)?)
-                .filter(|price| *price > 0)
-                .map(u128::from)
-                .ok_or_else(|| invalid("SOL lower-bound price must be positive"))
-        };
-        let quoted = conservative(self)? * u128::from(10_000 - tolerance_bps);
-        let current = conservative(newer)? * 10_000;
-        if newer.publish_time <= self.publish_time {
-            return Ok(false);
-        }
-        let difference = self.exponent - newer.exponent;
-        Ok(if difference >= 0 {
-            quoted
-                .checked_mul(10u128.pow(difference as u32))
-                .is_none_or(|scaled| scaled > current)
-        } else {
-            current
-                .checked_mul(10u128.pow((-difference) as u32))
-                .is_some_and(|scaled| quoted > scaled)
-        })
-    }
-
-    /// Exact rational number of micro-USD per lamport. Reject unsupported
-    /// exponents/overflow rather than saturating, using floats, or weakening
-    /// rounding. The production adapter uses the same arithmetic at issuance.
-    fn micro_usd_per_lamport(&self) -> Result<(u128, u128), ServerError> {
-        if self.asset != "native_sol"
-            || self.credit_unit != "lamports"
-            || self.base_units_per_asset != LAMPORTS_PER_SOL
-            || !(-18..=18).contains(&self.exponent)
-        {
-            return Err(invalid("unsupported SOL billing units or exponent"));
-        }
-        let price = positive_price(&self.price)?;
-        let confidence = canonical_u64(&self.confidence)?;
-        let price = u128::from(
-            price
-                .checked_sub(confidence)
-                .filter(|price| *price > 0)
-                .ok_or_else(|| invalid("SOL lower-bound price must be positive"))?,
-        );
-        // price * 10^(exponent + 6) / 10^9; combine powers before
-        // multiplying and reduce the resulting ratio to avoid avoidable overflow.
-        let power = self.exponent - 3;
-        let (numerator, denominator) = if power >= 0 {
-            (
-                price
-                    .checked_mul(10u128.pow(power as u32))
-                    .ok_or_else(|| invalid("SOL billing price scale overflow"))?,
-                1,
-            )
-        } else {
-            (price, 10u128.pow((-power) as u32))
-        };
-        let divisor = gcd(numerator, denominator);
-        Ok((numerator / divisor, denominator / divisor))
-    }
-
-    /// Floor the spend budget: never provision more micro-USD than the proof's
-    /// lamport bound covers. Zero and browser-unsafe budgets fail closed.
-    pub fn limit_micro_usd(&self, lamports: u128) -> Result<u128, ServerError> {
-        if lamports == 0 || lamports > MAX_SAFE_UNITS {
-            return Err(invalid("SOL lease amount is outside browser-safe bounds"));
-        }
-        let (numerator, denominator) = self.micro_usd_per_lamport()?;
-        let (value, _) = mul_div(lamports, numerator, denominator)?;
-        if value == 0 || value > MAX_SAFE_UNITS {
-            return Err(invalid(
-                "SOL lease USD budget is outside browser-safe bounds",
-            ));
-        }
-        Ok(value)
-    }
-
-    /// Ceil the charge: any fractional lamport is charged upward. Validate the
-    /// price even for zero usage; malformed quotes cannot bypass arithmetic.
-    pub fn charge_units(&self, micro_usd: u128) -> Result<u128, ServerError> {
-        let (numerator, denominator) = self.micro_usd_per_lamport()?;
-        if micro_usd > MAX_SAFE_UNITS {
-            return Err(invalid("SOL usage is outside browser-safe bounds"));
-        }
-        let (floor, remainder) = mul_div(micro_usd, denominator, numerator)?;
-        let charge = floor
-            .checked_add(u128::from(remainder))
-            .ok_or_else(|| invalid("SOL billing charge overflow"))?;
-        if charge > MAX_SAFE_UNITS {
-            return Err(invalid("SOL billing charge is outside browser-safe bounds"));
-        }
-        Ok(charge)
-    }
-}
-
-fn invalid(message: &str) -> ServerError {
-    ServerError::InvalidRequest(message.into())
-}
-
-fn canonical_u64(value: &str) -> Result<u64, ServerError> {
-    if value.is_empty()
-        || value.len() > 20
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-        || (value.len() > 1 && value.starts_with('0'))
-    {
-        return Err(invalid("invalid SOL billing quote integer"));
-    }
-    value
-        .parse()
-        .map_err(|_| invalid("SOL billing quote integer overflow"))
-}
-
-fn positive_price(value: &str) -> Result<u64, ServerError> {
-    let price = canonical_u64(value)?;
-    if price == 0 || price > i64::MAX as u64 {
-        return Err(invalid("SOL billing price must be a positive i64"));
-    }
-    Ok(price)
-}
-
-fn gcd(mut a: u128, mut b: u128) -> u128 {
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    a
-}
-
-/// Return floor(a*b/d) and whether its exact rational value is fractional.
-/// Cancel denominator factors first; overflow is always an error.
-fn mul_div(a: u128, b: u128, d: u128) -> Result<(u128, bool), ServerError> {
-    let g = gcd(a, d);
-    let (a, d) = (a / g, d / g);
-    let g = gcd(b, d);
-    let (b, d) = (b / g, d / g);
-    let product = a
-        .checked_mul(b)
-        .ok_or_else(|| invalid("SOL billing conversion overflow"))?;
-    Ok((product / d, product % d != 0))
+    Ok(micro_usd)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pricing::usd_to_micro_usd;
 
-    const FEED: &str = "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
-
-    fn quote(price: &str, exponent: i32) -> BillingQuote {
-        BillingQuote {
-            asset: "native_sol".into(),
-            source: PYTH_SOURCE.into(),
-            credit_unit: "lamports".into(),
-            base_units_per_asset: LAMPORTS_PER_SOL,
-            chain_id: "7".into(),
-            deployment_binding: Felt252::from_u64(8),
-            backend: "dagon.solana.groth16.v1".into(),
-            network: "localnet".into(),
-            vault: "pinned-vault".into(),
-            feed_id: FEED.into(),
-            feed_account: "pinned-price-account".into(),
-            receiver_program: "pinned-receiver".into(),
-            price: price.into(),
-            exponent,
-            confidence: "0".into(),
-            publish_time: 100,
-            expires_at: 130,
-            posted_slot: 90,
+    #[test]
+    fn budget_and_charge_are_identity_conversions_within_safe_bounds() {
+        for units in [1, 999_999, 1_000_000, MAX_SAFE_UNITS] {
+            assert_eq!(lease_limit_micro_usd(units).unwrap(), units);
+            assert_eq!(charge_units(units).unwrap(), units);
         }
+        assert_eq!(charge_units(0).unwrap(), 0);
+        assert!(lease_limit_micro_usd(0).is_err());
+        assert!(lease_limit_micro_usd(MAX_SAFE_UNITS + 1).is_err());
+        assert!(charge_units(MAX_SAFE_UNITS + 1).is_err());
     }
 
-    fn pins(q: &BillingQuote, max_age_seconds: u64) -> BillingPins {
-        BillingPins {
-            chain_id: 7,
-            deployment_binding: q.deployment_binding,
-            backend: q.backend.clone(),
-            network: q.network.clone(),
-            vault: q.vault.clone(),
-            feed_id: FEED.into(),
-            feed_account: q.feed_account.clone(),
-            receiver_program: q.receiver_program.clone(),
-            max_age_seconds,
-            max_confidence_bps: 100,
-        }
-    }
-
+    /// Fractional micro-USD spend is charged upward, and the charge for a
+    /// lease's whole budget never exceeds its solvency bound.
     #[test]
-    fn sol_budget_floors_and_charge_ceils() {
-        let q = quote("15000000000", -8); // $150 / SOL
-        assert_eq!(q.limit_micro_usd(1_000_000_000).unwrap(), 150_000_000);
-        assert_eq!(q.limit_micro_usd(10).unwrap(), 1);
-        assert_eq!(q.charge_units(1).unwrap(), 7);
-        assert_eq!(q.charge_units(3).unwrap(), 20);
-        assert_eq!(q.charge_units(0).unwrap(), 0);
-        for lamports in [7, 10, 20, 999, MAX_SAFE_UNITS] {
-            let budget = q.limit_micro_usd(lamports).unwrap();
-            assert!(q.charge_units(budget).unwrap() <= lamports);
-        }
-    }
-
-    #[test]
-    fn positive_negative_and_zero_exponents_are_exact() {
-        for q in [quote("15", 1), quote("150", 0), quote("15000000000", -8)] {
-            assert_eq!(q.limit_micro_usd(1_000_000_000).unwrap(), 150_000_000);
-            assert_eq!(q.charge_units(150_000_000).unwrap(), 1_000_000_000);
-        }
-    }
-
-    #[test]
-    fn bounds_and_overflow_fail_closed() {
-        for price in ["0", "-1", "+1", "01", "1.0", "9223372036854775808"] {
-            assert!(quote(price, -8).charge_units(0).is_err());
-        }
-        assert!(quote("1", i32::MIN).charge_units(0).is_err());
-        assert!(quote("1", i32::MAX).charge_units(0).is_err());
-        let q = quote("15000000000", -8);
-        assert!(q.limit_micro_usd(0).is_err());
-        assert!(q.limit_micro_usd(MAX_SAFE_UNITS + 1).is_err());
-        assert!(q.charge_units(MAX_SAFE_UNITS + 1).is_err());
-        assert!(quote("1", -18).charge_units(1).is_err());
-        assert!(quote("9223372036854775807", 18)
-            .limit_micro_usd(MAX_SAFE_UNITS)
-            .is_err());
-    }
-
-    #[test]
-    fn identity_is_source_asset_feed_and_deployment_bound() {
-        let q = quote("15000000000", -8);
-        let pins = pins(&q, 30);
-        q.validate_identity(&pins).unwrap();
-        for mutate in [
-            (|q: &mut BillingQuote| q.asset = "native_usdc".into()) as fn(&mut BillingQuote),
-            |q| q.source = "http_price".into(),
-            |q| q.credit_unit = "micro_usd".into(),
-            |q| q.base_units_per_asset += 1,
-            |q| q.chain_id = "8".into(),
-            |q| q.backend = "other.groth16.v1".into(),
-            |q| q.network = "other".into(),
-            |q| q.vault = "other".into(),
-            |q| q.deployment_binding = Felt252::ZERO,
-            |q| q.feed_id = "other-feed".into(),
-            |q| q.feed_account = "other-account".into(),
-            |q| q.receiver_program = "other-owner".into(),
-            |q| q.expires_at += 1,
-            |q| q.confidence = q.price.clone(),
-        ] {
-            let mut changed = q.clone();
-            mutate(&mut changed);
-            assert!(changed.validate_identity(&pins).is_err());
-        }
-    }
-
-    #[test]
-    fn production_confidence_age_and_exponent_boundaries() {
-        let mut q = quote("15000000000", -8);
-        let mut pins = pins(&q, PYTH_MAX_AGE_CEILING_SECONDS);
-        q.expires_at = 100 + PYTH_MAX_AGE_CEILING_SECONDS;
-        q.confidence = "150000000".into();
-        q.validate_identity(&pins).unwrap();
-        q.confidence = "150000001".into();
-        assert!(q.validate_identity(&pins).is_err());
-        q.confidence = "0".into();
-        pins.max_age_seconds = PYTH_MAX_AGE_CEILING_SECONDS + 1;
-        q.expires_at = 100 + PYTH_MAX_AGE_CEILING_SECONDS + 1;
-        assert!(q.validate_identity(&pins).is_err());
-        pins.max_age_seconds = PYTH_MAX_AGE_CEILING_SECONDS;
-        q.expires_at = 100 + PYTH_MAX_AGE_CEILING_SECONDS;
-        for exponent in [-19, -18, 18, 19] {
-            q.exponent = exponent;
-            assert_eq!(
-                q.validate_identity(&pins).is_ok(),
-                (-18..=18).contains(&exponent)
-            );
-        }
-        q.exponent = -8;
-        for field in [0, 1, 2, 3] {
-            let mut empty = pins.clone();
-            match field {
-                0 => empty.backend.clear(),
-                1 => empty.network.clear(),
-                2 => empty.vault.clear(),
-                _ => empty.feed_id.clear(),
-            }
-            assert!(q.validate_identity(&empty).is_err());
-        }
-    }
-
-    #[test]
-    fn confidence_uses_lower_bound_and_chain_id_is_lossless() {
-        let mut q = quote("15000000000", -8);
-        q.confidence = "150000000".into(); // 1%, lower price $148.50
-        q.chain_id = u64::MAX.to_string();
-        assert_eq!(q.limit_micro_usd(1_000_000_000).unwrap(), 148_500_000);
-        assert_eq!(q.charge_units(148_500_000).unwrap(), 1_000_000_000);
-        let encoded = serde_json::to_value(&q).unwrap();
-        assert_eq!(encoded["chain_id"], u64::MAX.to_string());
-        q.confidence = q.price.clone();
-        assert!(q.charge_units(0).is_err());
-    }
-
-    #[test]
-    fn supersession_compares_conservative_prices_at_the_exact_boundary() {
-        let tolerance = dagon_zkapi_profile::SharedProfile::embedded()
-            .pyth
-            .max_supersession_bps;
-        assert_eq!(tolerance, 100);
-        let older = quote("10000", -2);
-        for (price, superseded) in [
-            ("10100", false),
-            ("10000", false),
-            ("9901", false),
-            ("9900", false),
-            ("9899", true),
-        ] {
-            let mut newer = quote(price, -2);
-            newer.publish_time += 1;
-            assert_eq!(
-                older.is_superseded_by(&newer, tolerance).unwrap(),
-                superseded
-            );
-        }
-        let mut newer = quote("10000", -2);
-        newer.publish_time += 1;
-        newer.confidence = "100".into();
-        assert!(!older.is_superseded_by(&newer, tolerance).unwrap());
-        newer.price = "9999".into(); // raw drop <1%, conservative drop >1%
-        assert!(older.is_superseded_by(&newer, tolerance).unwrap());
-        let mut discounted = older.clone();
-        discounted.confidence = "100".into();
-        assert!(!discounted.is_superseded_by(&newer, tolerance).unwrap());
-        newer.publish_time = older.publish_time;
-        assert!(!older.is_superseded_by(&newer, tolerance).unwrap());
-    }
-
-    #[test]
-    fn supersession_handles_exponent_changes_without_rounding_or_overflow() {
-        let mut newer = quote("990000", -4);
-        newer.publish_time += 1;
-        let older = quote("100", 0);
-        assert!(!older.is_superseded_by(&newer, 100).unwrap());
-        newer.price = "989999".into();
-        assert!(older.is_superseded_by(&newer, 100).unwrap());
-        newer.price = i64::MAX.to_string();
-        newer.exponent = -18;
-        let large = quote(&i64::MAX.to_string(), 18);
-        assert!(large.is_superseded_by(&newer, 100).unwrap());
-        let small = quote("1", -18);
-        newer.exponent = 18;
-        assert!(!small.is_superseded_by(&newer, 100).unwrap());
-        newer.exponent = i32::MIN;
-        assert!(small.is_superseded_by(&newer, 100).is_err());
-        assert!(older.is_superseded_by(&older, 10_000).is_err());
-    }
-
-    #[test]
-    fn freshness_is_separate_from_frozen_quote_conversion() {
-        let q = quote("15000000000", -8);
-        q.assert_fresh(100).unwrap();
-        assert!(q.assert_fresh(99).is_err());
-        assert!(matches!(
-            q.assert_fresh(130),
-            Err(ServerError::NativeQuoteExpired)
-        ));
-        // Settlement is allowed to use an already accepted quote after expiry.
-        assert_eq!(q.charge_units(3).unwrap(), 20);
-    }
-
-    #[test]
-    fn wire_object_round_trips_and_unknown_fields_fail() {
-        let q = quote("15000000000", -8);
-        let encoded = serde_json::to_value(&q).unwrap();
+    fn metered_spend_ceils_and_a_full_budget_charge_fits_the_bound() {
+        assert_eq!(charge_units(usd_to_micro_usd(0.000_000_1)).unwrap(), 1);
         assert_eq!(
-            serde_json::from_value::<BillingQuote>(encoded.clone()).unwrap(),
-            q
+            charge_units(usd_to_micro_usd(1.234_567_1)).unwrap(),
+            1_234_568
         );
-        let mut extra = encoded;
-        extra["untrusted"] = "123".into();
-        assert!(serde_json::from_value::<BillingQuote>(extra).is_err());
+        for bound in [1, 7, 1_000_000, 3_000_000, MAX_SAFE_UNITS] {
+            let budget = lease_limit_micro_usd(bound).unwrap();
+            assert!(charge_units(budget).unwrap() <= bound);
+        }
+    }
+
+    /// Exercise the actual browser implementation, not a second Rust copy.
+    /// Like the SDK gates, this integration test requires Node and npm ci.
+    #[test]
+    fn server_and_sdk_lease_limits_match_bit_for_bit() {
+        let bounds = [
+            1,
+            7,
+            123,
+            246,
+            253,
+            999_999,
+            1_000_000,
+            1_234_567,
+            MAX_SAFE_UNITS,
+        ];
+        let script = r#"
+            import { leaseLimitUsd } from './sdk/services/zkapiUsdc.mjs';
+            const view = new DataView(new ArrayBuffer(8));
+            const bits = JSON.parse(process.argv[1]).map(bound => {
+                view.setFloat64(0, leaseLimitUsd(bound));
+                return view.getBigUint64(0).toString();
+            });
+            console.log(JSON.stringify(bits));
+        "#;
+        let output = std::process::Command::new("node")
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+            .args(["--input-type=module", "-e", script])
+            .arg(serde_json::to_string(&bounds).unwrap())
+            .output()
+            .expect("Node is required for the server/SDK billing parity gate");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bits: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(bits.len(), bounds.len());
+        for (bound, sdk_bits) in bounds.into_iter().zip(bits) {
+            let limit = crate::pricing::micro_usd_to_usd(lease_limit_micro_usd(bound).unwrap());
+            assert_eq!(limit.to_bits().to_string(), sdk_bits, "bound {bound}");
+            assert_eq!(charge_units(bound).unwrap(), bound);
+        }
     }
 }

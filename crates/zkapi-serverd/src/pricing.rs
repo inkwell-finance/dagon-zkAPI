@@ -1,11 +1,11 @@
-//! Upstream USD accounting for native SOL lease settlement.
+//! Upstream USD accounting for USDC lease settlement.
 //!
-//! These units describe provider spend. `BillingQuote` performs the
-//! separate conversion between micro-USD and the vault's lamport ledger.
+//! These units describe provider spend. [`crate::billing`] maps micro-USD to
+//! the vault's USDC base units (one micro-USDC each).
 
 const MICRO_USD_PER_USD: f64 = 1_000_000.0;
 
-/// Round upstream USD spend up to a whole micro-dollar before converting to lamports.
+/// Round upstream USD spend up to a whole micro-dollar, the charge unit.
 pub fn usd_to_micro_usd(cost_usd: f64) -> u128 {
     if !cost_usd.is_finite() || cost_usd <= 0.0 {
         return 0;

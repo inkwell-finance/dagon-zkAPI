@@ -40,7 +40,7 @@ enum Commands {
     /// Run the request server against the identity's vault.
     #[command(name = "serverd")]
     Serverd {
-        /// Network identity file (genesis hash, vault, treasury, Pyth account).
+        /// Network identity file (genesis hash, vault, treasury token account).
         #[arg(long, env = "ZKAPI_SOLANA_IDENTITY")]
         solana_identity: PathBuf,
         /// Solana JSON-RPC endpoint of the identity's cluster (may carry an API key).
@@ -274,8 +274,8 @@ mod tests {
                 "genesis_hash": encode([3; 32]),
                 "vault_authority": encode(authority),
                 "vault_state": encode(vault),
-                "treasury": encode([7; 32]),
-                "pyth_price_account": encode(profile.pyth_push_account()),
+                "treasury_token_account":
+                    encode(dagon_zkapi_profile::usdc_associated_token_address(&[7; 32])),
             })
             .to_string(),
         )
@@ -334,8 +334,8 @@ mod tests {
             ["--solana-vault-state", "x"],
             ["--solana-genesis-hash", "x"],
             ["--solana-network", "x"],
-            ["--pyth-price-account", "x"],
-            ["--pyth-max-age-seconds", "30"],
+            ["--usdc-mint", "x"],
+            ["--treasury-token-account", "x"],
             ["--openrouter-lease-ttl-seconds", "300"],
             ["--challenge-period-seconds", "86400"],
             ["--raise-lead-seconds", "3600"],
@@ -371,8 +371,8 @@ mod tests {
             )
         );
         assert_eq!(
-            config.billing_pins().feed_account,
-            bs58::encode(SharedProfile::embedded().pyth_push_account()).into_string()
+            config.identity.treasury_token_account,
+            dagon_zkapi_profile::usdc_associated_token_address(&[7; 32])
         );
         assert_eq!(
             config.request_charge_cap(),

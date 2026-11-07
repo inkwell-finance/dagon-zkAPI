@@ -5,13 +5,10 @@ use dagon_zkapi_ledger::{
     CreditLedger, LedgerAccount, LedgerAsset, LedgerCommitment, LedgerDeployment, LedgerError,
     LedgerFuture, LedgerNullifierStatus, LedgerPath, LedgerSnapshot, LedgerState,
 };
+use zkapi_types::wire::OpenRouterLeaseAuthorization;
 use zkapi_types::Felt252;
 
-use crate::billing::{
-    BillingFuture, BillingPins, BillingPriceSource, BillingQuote, LAMPORTS_PER_SOL, PYTH_SOURCE,
-};
 use crate::config::{OpenRouterLeaseSourceConfig, ResolvedIdentity, ServerConfig, SharedProfile};
-use crate::error::ServerError;
 
 /// A localnet identity whose vault is the profile program's PDA.
 pub(crate) fn identity() -> ResolvedIdentity {
@@ -23,8 +20,7 @@ pub(crate) fn identity() -> ResolvedIdentity {
             &SharedProfile::embedded().program_id(),
             &vault_authority,
         ),
-        treasury: [7; 32],
-        pyth_price_account: [8; 32],
+        treasury_token_account: dagon_zkapi_profile::usdc_associated_token_address(&[7; 32]),
     }
 }
 
@@ -47,39 +43,9 @@ pub(crate) fn config(lease_source: OpenRouterLeaseSourceConfig) -> ServerConfig 
     )
 }
 
-/// A quote pinned to `config` at `price × 10⁻⁸` USD per SOL.
-pub(crate) fn quote(config: &ServerConfig, publish_time: u64, price: &str) -> BillingQuote {
-    let pins = config.billing_pins();
-    BillingQuote {
-        asset: "native_sol".into(),
-        source: PYTH_SOURCE.into(),
-        credit_unit: "lamports".into(),
-        base_units_per_asset: LAMPORTS_PER_SOL,
-        chain_id: pins.chain_id.to_string(),
-        deployment_binding: pins.deployment_binding,
-        backend: pins.backend,
-        network: pins.network,
-        vault: pins.vault,
-        feed_id: pins.feed_id,
-        feed_account: pins.feed_account,
-        receiver_program: pins.receiver_program,
-        price: price.into(),
-        exponent: -8,
-        confidence: "0".into(),
-        publish_time,
-        expires_at: publish_time + pins.max_age_seconds,
-        posted_slot: 1,
-    }
-}
-
-pub(crate) fn lease_payload_with(quote: &BillingQuote) -> String {
-    serde_json::json!({"mode":"openrouter_ephemeral_lease","version":1,"billing_quote":quote})
-        .to_string()
-}
-
-pub(crate) fn lease_payload(config: &ServerConfig, now: u64) -> String {
-    // A fixed $1000/SOL test quote makes one micro-USD equal one lamport.
-    lease_payload_with(&quote(config, now, "100000000000"))
+/// The exact prompt-free lease payload.
+pub(crate) fn lease_payload() -> String {
+    serde_json::to_string(&OpenRouterLeaseAuthorization::default()).unwrap()
 }
 
 pub(crate) type NullifierRead =
@@ -101,9 +67,9 @@ impl StubLedger {
                 protocol_binding: config.contract_address(),
                 vault: LedgerAccount::new(config.identity.vault_state),
                 asset: LedgerAsset {
-                    symbol: "SOL".into(),
-                    decimals: 9,
-                    mint: None,
+                    symbol: "USDC".into(),
+                    decimals: 6,
+                    mint: Some(LedgerAccount::new(config.profile.usdc_mint())),
                 },
             },
             nullifier,
@@ -147,44 +113,5 @@ impl CreditLedger for StubLedger {
     ) -> LedgerFuture<'_, LedgerNullifierStatus> {
         let result = (self.nullifier)();
         Box::pin(async move { result })
-    }
-}
-
-pub(crate) type QuoteCheck = Arc<dyn Fn(BillingQuote) -> BillingFuture<'static, ()> + Send + Sync>;
-
-/// A price source whose authenticated-source check is `check`, after the
-/// same identity and freshness checks as the Pyth oracle.
-pub(crate) struct StubBilling {
-    pins: BillingPins,
-    check: QuoteCheck,
-}
-
-impl StubBilling {
-    pub(crate) fn new(config: &ServerConfig, check: QuoteCheck) -> Arc<Self> {
-        Arc::new(Self {
-            pins: config.billing_pins(),
-            check,
-        })
-    }
-
-    pub(crate) fn accepting(config: &ServerConfig) -> Arc<Self> {
-        Self::new(config, Arc::new(|_| Box::pin(async { Ok(()) })))
-    }
-}
-
-impl BillingPriceSource for StubBilling {
-    fn quote(&self, _: u64) -> BillingFuture<'_, BillingQuote> {
-        Box::pin(async { Err(ServerError::Internal("test oracle has no quotes".into())) })
-    }
-
-    fn validate<'a>(&'a self, quote: &'a BillingQuote, now: u64) -> BillingFuture<'a, ()> {
-        Box::pin(async move {
-            self.assert_fresh(quote, now)?;
-            (self.check)(quote.clone()).await
-        })
-    }
-
-    fn validate_identity(&self, quote: &BillingQuote) -> Result<(), ServerError> {
-        quote.validate_identity(&self.pins)
     }
 }

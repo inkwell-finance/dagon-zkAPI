@@ -379,7 +379,10 @@ mod tests {
             bump: 1,
             paused: false,
             authority: Pubkey::new_unique(),
-            treasury: Pubkey::new_unique(),
+            treasury_token: Pubkey::new_unique(),
+            mint: dagon_zkapi_vault::token::USDC_MINT,
+            vault_token: Pubkey::new_unique(),
+            vault_token_bump: 1,
             genesis_hash: [3; 32],
             chain_id: 0,
             protocol_binding: [0; 32],
@@ -397,6 +400,7 @@ mod tests {
             last_pause_end: 0,
             total_paused_duration: 0,
             treasury_accrued: 0,
+            deferred_payouts: 0,
         }
     }
 

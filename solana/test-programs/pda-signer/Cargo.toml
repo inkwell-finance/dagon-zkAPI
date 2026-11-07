@@ -1,0 +1,22 @@
+[package]
+name = "dagon-zkapi-test-pda-signer"
+description = "Test-only PDA-signing CPI relay for the localnet lifecycle test (stands in for a CCTP forwarder)"
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "dagon_zkapi_test_pda_signer"
+
+[features]
+no-entrypoint = []
+
+[dependencies]
+anchor-lang = "=0.32.1"
+
+[workspace]
+
+[profile.release]
+overflow-checks = true

@@ -7,6 +7,8 @@
 //! - POST /v2/openrouter/leases/:id -- retire a rejected runtime-key lease
 //! - POST /v2/withdraw/clearance    -- request mutual-close clearance
 //! - POST /v2/ledger/*/prepare      -- prepare pinned Solana wallet operations
+//!   (USDC deposit, close, escape, escape finalization, parked payout release,
+//!   parked rent refund, canonical USDC account creation)
 //! - GET  /v2/requests/:id          -- recover by client_request_id
 //! - GET  /v2/nullifiers/:nullifier -- recover by nullifier
 
@@ -23,8 +25,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use dagon_zkapi_ledger::{
-    DepositRequest, FinalizeEscapeRequest, LedgerAccount, LedgerCommitment,
-    PreparedLedgerOperation, WithdrawalRequest,
+    CreateUsdcAccountRequest, DepositRequest, FinalizeEscapeRequest, LedgerAccount,
+    LedgerCommitment, PreparedLedgerOperation, RefundPendingRentRequest,
+    ReleaseEscapePayoutRequest, WithdrawalRequest,
 };
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
@@ -81,7 +84,6 @@ pub async fn run_server(mut config: crate::config::ServerConfig) -> anyhow::Resu
         signer,
         backends.initial_root,
         backends.ledger,
-        backends.billing,
     )?;
     let processor = Arc::new(processor.with_dashboard(dashboard));
     spawn_root_poller(
@@ -105,21 +107,19 @@ pub async fn run_server(mut config: crate::config::ServerConfig) -> anyhow::Resu
 
 pub struct ValidatedSolanaBackends {
     pub ledger: Arc<dyn dagon_zkapi_ledger::CreditLedger>,
-    pub billing: Arc<dyn crate::billing::BillingPriceSource>,
     pub initial_root: Felt252,
 }
 
 /// Fail-closed authoritative startup reads; deliberately independent of SQLite.
 ///
 /// The finalized deployment must be the profile's (identity genesis hash,
-/// immutable program with the profile's executable hash, vault parameters),
-/// the vault must be unpaused and pin this server's signing keys, and the
-/// identity's Pyth account must yield a fresh, fully verified quote.
+/// immutable program with the profile's executable hash, vault parameters,
+/// USDC mint, vault token account and the identity's treasury token account),
+/// and the vault must be unpaused and pin this server's signing keys.
 pub async fn prepare_solana_backends(
     config: &crate::config::ServerConfig,
     signer: &crate::signer::ServerSigner,
 ) -> anyhow::Result<ValidatedSolanaBackends> {
-    use crate::billing::BillingPriceSource;
     config.validate()?;
     let ledger = Arc::new(dagon_zkapi_solana_ledger::SolanaCreditLedger::new(
         config.ledger_config(),
@@ -139,18 +139,8 @@ pub async fn prepare_solana_backends(
             && view.clearance_signing_key_y == clearance_key.y,
         "Solana vault clearance signing key mismatch"
     );
-    let billing = Arc::new(crate::sol_billing::PythBillingOracle::new(config)?);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
-    let quote = billing.quote(now).await?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
-    billing.assert_admissible(&quote, now)?;
     Ok(ValidatedSolanaBackends {
         ledger,
-        billing,
         initial_root: view.state.root,
     })
 }
@@ -176,15 +166,10 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
                 .allow_methods([Method::GET, Method::HEAD]),
         )
         .route("/v2/auth", get(handle_auth_check))
-        .route("/v2/billing/quote", get(handle_billing_quote))
         .route("/v2/openrouter/leases", post(handle_openrouter_lease))
         .route(
             "/v2/openrouter/leases/{client_request_id}",
             get(handle_openrouter_lease_status).post(handle_openrouter_lease_retirement),
-        )
-        .route(
-            "/v2/openrouter/leases/{client_request_id}/expire",
-            post(handle_native_lease_expiry),
         )
         .route("/v2/withdraw/clearance", post(handle_clearance))
         .route(
@@ -202,6 +187,18 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
         .route(
             "/v2/ledger/escapes/finalize/prepare",
             post(handle_prepare_ledger_finalize_escape),
+        )
+        .route(
+            "/v2/ledger/escapes/release/prepare",
+            post(handle_prepare_ledger_release_escape_payout),
+        )
+        .route(
+            "/v2/ledger/escapes/rent-refund/prepare",
+            post(handle_prepare_ledger_refund_pending_rent),
+        )
+        .route(
+            "/v2/ledger/usdc-accounts/prepare",
+            post(handle_prepare_ledger_usdc_account),
         )
         .route(
             "/v2/requests/{client_request_id}",
@@ -368,38 +365,6 @@ async fn handle_recovery_by_nullifier(
         .map_err(|e| error_to_response(&e, &nullifier_hex, &processor))
 }
 
-async fn handle_native_lease_expiry(
-    State(processor): State<AppState>,
-    Path(client_request_id): Path<String>,
-    Json(request): Json<ApiRequestV2>,
-) -> Result<(HeaderMap, Json<serde_json::Value>), ErrorHttpResponse> {
-    let status = processor
-        .expire_unaccepted_native_lease(&client_request_id, &request)
-        .await
-        .map_err(|error| error_to_response(&error, &client_request_id, &processor))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        axum::http::header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
-    Ok((headers, Json(status)))
-}
-
-async fn handle_billing_quote(
-    State(processor): State<AppState>,
-) -> Result<(HeaderMap, Json<crate::billing::BillingQuote>), ErrorHttpResponse> {
-    let quote = processor
-        .billing_quote()
-        .await
-        .map_err(|error| error_to_response(&error, "billing-quote", &processor))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        axum::http::header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
-    Ok((headers, Json(quote)))
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PrepareDepositBody {
@@ -419,11 +384,19 @@ struct PrepareWithdrawalBody {
     proof: Groth16ProofWire,
 }
 
+/// `{payer, note_id}` of a pending escape (finalize, release, rent refund).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PrepareFinalizeEscapeBody {
+struct PreparePendingEscapeBody {
     payer: String,
     note_id: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareUsdcAccountBody {
+    payer: String,
+    owner: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -534,7 +507,7 @@ async fn handle_prepare_ledger_escape(
 
 async fn handle_prepare_ledger_finalize_escape(
     State(processor): State<AppState>,
-    Json(body): Json<PrepareFinalizeEscapeBody>,
+    Json(body): Json<PreparePendingEscapeBody>,
 ) -> Result<Json<PreparedLedgerOperationResponse>, ErrorHttpResponse> {
     let request = FinalizeEscapeRequest {
         payer: ledger_account(&body.payer, "payer")
@@ -543,6 +516,58 @@ async fn handle_prepare_ledger_finalize_escape(
     };
     let operation = processor
         .prepare_ledger_finalize_escape(request)
+        .await
+        .map_err(|error| error_to_response(&error, "ledger-prepare", &processor))?;
+    Ok(Json(prepared_response(&processor, operation)))
+}
+
+async fn handle_prepare_ledger_release_escape_payout(
+    State(processor): State<AppState>,
+    Json(body): Json<PreparePendingEscapeBody>,
+) -> Result<Json<PreparedLedgerOperationResponse>, ErrorHttpResponse> {
+    let request = ReleaseEscapePayoutRequest {
+        payer: ledger_account(&body.payer, "payer")
+            .map_err(|error| error_to_response(&error, "ledger-prepare", &processor))?,
+        note_id: body.note_id,
+    };
+    let operation = processor
+        .prepare_ledger_release_escape_payout(request)
+        .await
+        .map_err(|error| error_to_response(&error, "ledger-prepare", &processor))?;
+    Ok(Json(prepared_response(&processor, operation)))
+}
+
+async fn handle_prepare_ledger_refund_pending_rent(
+    State(processor): State<AppState>,
+    Json(body): Json<PreparePendingEscapeBody>,
+) -> Result<Json<PreparedLedgerOperationResponse>, ErrorHttpResponse> {
+    let request = RefundPendingRentRequest {
+        payer: ledger_account(&body.payer, "payer")
+            .map_err(|error| error_to_response(&error, "ledger-prepare", &processor))?,
+        note_id: body.note_id,
+    };
+    let operation = processor
+        .prepare_ledger_refund_pending_rent(request)
+        .await
+        .map_err(|error| error_to_response(&error, "ledger-prepare", &processor))?;
+    Ok(Json(prepared_response(&processor, operation)))
+}
+
+/// Idempotently create `owner`'s canonical USDC token account, rent paid by
+/// `payer`; deposits draw from it and payouts default to it.
+async fn handle_prepare_ledger_usdc_account(
+    State(processor): State<AppState>,
+    Json(body): Json<PrepareUsdcAccountBody>,
+) -> Result<Json<PreparedLedgerOperationResponse>, ErrorHttpResponse> {
+    let request = (|| {
+        Ok(CreateUsdcAccountRequest {
+            payer: ledger_account(&body.payer, "payer")?,
+            owner: ledger_account(&body.owner, "owner")?,
+        })
+    })()
+    .map_err(|error| error_to_response(&error, "ledger-prepare", &processor))?;
+    let operation = processor
+        .prepare_ledger_usdc_account(request)
         .await
         .map_err(|error| error_to_response(&error, "ledger-prepare", &processor))?;
     Ok(Json(prepared_response(&processor, operation)))
@@ -560,12 +585,24 @@ struct ServerIdentity {
     upstream_api_base: Option<String>,
     auth_scheme: &'static str,
     policy_enabled: bool,
+    /// USDC base units (micro-USDC).
     request_charge_cap: u128,
-    request_charge_cap_usd: Option<f64>,
-    credits_per_usd: Option<f64>,
+    request_charge_cap_usd: f64,
+    /// One base unit is billed per metered micro-USD.
+    credits_per_usd: f64,
     billing_asset: &'static str,
+    billing_unit: &'static str,
+    asset: BillingAsset,
     state_signing_key: CurvePointWire,
     clearance_signing_key: CurvePointWire,
+}
+
+/// The vault's settlement token.
+#[derive(Debug, Serialize)]
+struct BillingAsset {
+    symbol: String,
+    decimals: u8,
+    mint: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -598,9 +635,15 @@ async fn handle_dashboard_summary(State(processor): State<AppState>) -> Json<Das
         auth_scheme: "state-anchor",
         policy_enabled: false,
         request_charge_cap: config.request_charge_cap(),
-        request_charge_cap_usd: None,
-        credits_per_usd: None,
-        billing_asset: "native_sol",
+        request_charge_cap_usd: crate::pricing::micro_usd_to_usd(config.request_charge_cap()),
+        credits_per_usd: 1_000_000.0,
+        billing_asset: "usdc",
+        billing_unit: "micro_usdc",
+        asset: BillingAsset {
+            symbol: config.profile.asset.symbol.clone(),
+            decimals: config.profile.asset.decimals,
+            mint: config.profile.asset.mint.clone(),
+        },
         state_signing_key: processor.state_signing_key(),
         clearance_signing_key: processor.clearance_signing_key(),
     };
@@ -675,9 +718,7 @@ fn build_error_response(
         | ServerError::InvalidRequest(_)
         | ServerError::OaKeyPolicyRejected
         | ServerError::ProtocolMismatch(_) => StatusCode::BAD_REQUEST,
-        ServerError::StaleRoot { .. }
-        | ServerError::NativeQuoteExpired
-        | ServerError::NativeQuoteSuperseded => StatusCode::CONFLICT,
+        ServerError::StaleRoot { .. } => StatusCode::CONFLICT,
         ServerError::Replay | ServerError::NullifierUsed => StatusCode::CONFLICT,
         ServerError::LeasePending | ServerError::LeaseSettlementPending { .. } => {
             StatusCode::CONFLICT
@@ -801,13 +842,69 @@ mod rate_limit_tests {
         }
     }
 
-    #[test]
-    fn superseded_quote_maps_to_retriable_409() {
-        let (status, _, Json(response)) =
-            build_error_response(&ServerError::NativeQuoteSuperseded, "lease-request", None);
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(response.error_code, "native_quote_superseded");
-        assert!(response.retriable);
+    /// The USDC wallet routes reach the ledger boundary (the stub ledger
+    /// supports none of them) and reject unknown body fields.
+    #[tokio::test]
+    async fn usdc_wallet_routes_reach_the_ledger() {
+        use tower::ServiceExt;
+        let mut config = crate::test_support::config(crate::test_support::oa_source());
+        config.proof_setup_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../protocol/setup/v2")
+            .to_string_lossy()
+            .into_owned();
+        let signer = Arc::new(crate::signer::ServerSigner::new(
+            &config.state_seed,
+            &config.clear_seed,
+        ));
+        let ledger = crate::test_support::StubLedger::unavailable(&config);
+        let store = Arc::new(crate::nullifier_store::NullifierStore::in_memory().unwrap());
+        let processor =
+            RequestProcessor::try_new(config, store, signer, Felt252::ZERO, ledger).unwrap();
+        let router = create_router(Arc::new(processor));
+        let account = bs58::encode([4u8; 32]).into_string();
+        let post = |uri: &str, body: serde_json::Value| {
+            axum::http::Request::post(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        for (uri, body) in [
+            (
+                "/v2/ledger/escapes/release/prepare",
+                serde_json::json!({"payer": account, "note_id": 3}),
+            ),
+            (
+                "/v2/ledger/escapes/rent-refund/prepare",
+                serde_json::json!({"payer": account, "note_id": 3}),
+            ),
+            (
+                "/v2/ledger/usdc-accounts/prepare",
+                serde_json::json!({"payer": account, "owner": account}),
+            ),
+        ] {
+            let response = router.clone().oneshot(post(uri, body)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error_code"], "invalid_request", "{uri}");
+            assert!(
+                body["error_message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("does not support wallet operation"),
+                "{uri}: {body}"
+            );
+        }
+        let unknown_field = router
+            .oneshot(post(
+                "/v2/ledger/usdc-accounts/prepare",
+                serde_json::json!({"payer": account, "owner": account, "mint": account}),
+            ))
+            .await
+            .unwrap();
+        assert!(unknown_field.status().is_client_error());
     }
 
     #[test]

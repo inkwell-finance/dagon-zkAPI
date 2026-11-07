@@ -34,10 +34,9 @@ enum Command {
         solana_rpc_url: String,
         #[arg(long)]
         vault_authority: String,
+        /// The classic-Token USDC account (any owner) that receives treasury withdrawals.
         #[arg(long)]
-        treasury: String,
-        #[arg(long)]
-        pyth_price_account: String,
+        treasury_token_account: String,
         #[arg(long)]
         out: PathBuf,
     },
@@ -50,14 +49,14 @@ enum Command {
         #[arg(long)]
         authority_keypair: PathBuf,
     },
-    /// Print the effective profile observed on chain (program, vault, Pyth, runtime features).
+    /// Print the effective profile observed on chain (program, vault, USDC mint and token programs, runtime features).
     Observe {
         #[arg(long)]
         solana_identity: PathBuf,
         #[arg(long)]
         solana_rpc_url: String,
     },
-    /// Print the mainnet reference profile (profile + identity + live mainnet Pyth/runtime observations).
+    /// Print the mainnet reference profile (profile + identity + live mainnet USDC/runtime observations).
     Expected {
         #[arg(long)]
         solana_identity: PathBuf,
@@ -84,8 +83,7 @@ async fn main() -> Result<()> {
             network,
             solana_rpc_url,
             vault_authority,
-            treasury,
-            pyth_price_account,
+            treasury_token_account,
             out,
         } => {
             let rpc = Rpc::new(solana_rpc_url)?;
@@ -108,8 +106,7 @@ async fn main() -> Result<()> {
                     ))
                     .to_string(),
                 ),
-                treasury: Some(treasury),
-                pyth_price_account: Some(pyth_price_account),
+                treasury_token_account: Some(treasury_token_account),
             };
             let text = serde_json::to_string_pretty(&identity)?;
             NetworkIdentity::parse(&text)?.resolve(p)?;
@@ -206,7 +203,7 @@ async fn main() -> Result<()> {
                 identity.network == "mainnet-beta" && identity.genesis_hash == MAINNET_GENESIS_HASH,
                 "expected requires the mainnet identity"
             );
-            // Fail closed when mainnet cannot be read: no guessed oracle reference.
+            // Fail closed when mainnet cannot be read: no guessed USDC or runtime reference.
             output(&observe(&Rpc::new(mainnet_rpc_url)?, &identity, true).await?)?;
         }
         Command::Diff { local, reference } => {

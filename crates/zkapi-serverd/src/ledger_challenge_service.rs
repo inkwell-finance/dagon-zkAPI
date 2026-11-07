@@ -1055,6 +1055,29 @@ mod tests {
             .all(|job| job.plan.is_none()));
     }
 
+    /// A finalized escape whose USDC payout (or rent refund) is parked is no
+    /// longer an open escape: the ledger's pending scan omits it, so the
+    /// challenger retires its job and never challenges or raises it again.
+    #[tokio::test]
+    async fn finalized_escape_with_parked_payout_is_retired_without_challenge() {
+        let deadline = deadline();
+        let fixture = Fixture::new(&[N], vec![escape(0, deadline - 6_000, deadline)]);
+        fixture
+            .store
+            .record_settlement(&Felt252::from_u64(N), 120, 200, "{}")
+            .unwrap();
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.operations(), vec![("raise", 120)]);
+        assert_eq!(service.outstanding_jobs(), 1);
+        // Finalized with its payout parked: absent from the pending scan.
+        fixture.state.lock().unwrap().pending.clear();
+        service.poll_once().await.unwrap();
+        assert_eq!(service.outstanding_jobs(), 0);
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.operations(), vec![("raise", 120)]);
+    }
+
     /// An unsettled, possibly delivered request is raised to its bound only
     /// at `deadline − raise_lead`, never before.
     #[tokio::test]

@@ -22,7 +22,7 @@ fn request(value: &serde_json::Value, note_id: u32) -> ChallengePayload {
 
 fn withdrawal(value: &serde_json::Value) -> WithdrawalPayload {
     let p: WithdrawalPublicInputsV2 = serde_json::from_value(value["public_inputs"].clone()).unwrap();
-    WithdrawalPayload { destination: Pubkey::new_unique(), proof: proof(value), public_inputs: WithdrawalInputs {
+    WithdrawalPayload { proof: proof(value), public_inputs: WithdrawalInputs {
         protocol_version: p.protocol_version, chain_id: p.chain_id,
         contract_address: *p.contract_address.as_bytes(), registration: *p.registration.as_bytes(),
         state_signing_key_x: *p.state_signing_key_x.as_bytes(), state_signing_key_y: *p.state_signing_key_y.as_bytes(),
@@ -38,14 +38,16 @@ fn state(p: &WithdrawalInputs) -> (VaultState, NoteState, PendingWithdrawal) {
     let key = Pubkey::new_unique();
     let vault = VaultState {
         version: VAULT_VERSION, bump: 255, paused: false, authority: Pubkey::new_unique(),
-        treasury: Pubkey::new_unique(), genesis_hash: [3; 32], chain_id: p.chain_id,
+        treasury_token: Pubkey::new_unique(), mint: crate::token::USDC_MINT,
+        vault_token: Pubkey::new_unique(), vault_token_bump: 255,
+        genesis_hash: [3; 32], chain_id: p.chain_id,
         protocol_binding: p.contract_address, current_root: [7; 32], next_note_id: p.note_id + 1,
         note_ttl: 86_400, challenge_period: 60, request_charge_cap: 100_000,
         total_credits: p.deposit_amount as u64,
         state_signing_key_x: p.state_signing_key_x, state_signing_key_y: p.state_signing_key_y,
         clearance_signing_key_x: p.clearance_signing_key_x, clearance_signing_key_y: p.clearance_signing_key_y,
         paused_at: 0, last_pause_end: 0, total_paused_duration: 0,
-        treasury_accrued: 0,
+        treasury_accrued: 0, deferred_payouts: 0,
     };
     let note = NoteState { vault: key, note_id: p.note_id, commitment: p.registration,
         deposit_amount: p.deposit_amount as u64, expiry: p.expiry_ts,
@@ -54,7 +56,8 @@ fn state(p: &WithdrawalInputs) -> (VaultState, NoteState, PendingWithdrawal) {
         nullifier: p.withdrawal_nullifier, next_nullifier: p.next_nullifier,
         state_balance: (p.final_balance + p.conceded) as u64, conceded: p.conceded as u64,
         final_balance: p.final_balance as u64, destination: Pubkey::new_unique(),
-        deadline: p.expiry_ts + 10, bump: 255 };
+        deadline: p.expiry_ts + 10, bump: 255, rent_payer: Pubkey::new_unique(),
+        stage: PENDING_STAGE_OPEN };
     (vault, note, pending)
 }
 
@@ -129,25 +132,28 @@ fn leaf_binding_exit_ttl_and_pause_checks_ignore_front_running_deposits() {
     let (mut vault, mut note, _) = state(&escape.public_inputs);
     note.status = NOTE_STATUS_ACTIVE;
     // The fixture's real proof is verified above. Bind the destination to this
-    // test's fresh account for the pre-verification account-binding checks.
-    escape.public_inputs.destination = zkapi_types::solana_destination_binding(&escape.destination.to_bytes());
+    // test's fresh token account for the pre-verification account-binding checks.
+    let destination = Pubkey::new_unique();
+    escape.public_inputs.destination = zkapi_types::solana_destination_binding(&destination.to_bytes());
     let now = escape.public_inputs.valid_until.min(note.expiry - 1);
-    assert!(validate_withdrawal(&vault, &note, &escape, &escape.destination, false, now).is_ok());
+    assert!(validate_withdrawal(&vault, &note, &escape, &destination, false, now).is_ok());
+    assert!(validate_withdrawal(&vault, &note, &escape, &Pubkey::new_unique(), false, now).is_err(),
+        "a substituted payout account does not match the proof binding");
     vault.current_root = [11; 32];
     vault.next_note_id += 1;
-    assert!(validate_withdrawal(&vault, &note, &escape, &escape.destination, false, now).is_ok());
+    assert!(validate_withdrawal(&vault, &note, &escape, &destination, false, now).is_ok());
     let mut wrong = escape.clone();
     wrong.public_inputs.registration = [1; 32];
-    assert!(validate_withdrawal(&vault, &note, &wrong, &wrong.destination, false, now).is_err());
+    assert!(validate_withdrawal(&vault, &note, &wrong, &destination, false, now).is_err());
     wrong = escape.clone();
     wrong.public_inputs.deposit_amount += 1;
-    assert!(validate_withdrawal(&vault, &note, &wrong, &wrong.destination, false, now).is_err());
+    assert!(validate_withdrawal(&vault, &note, &wrong, &destination, false, now).is_err());
     wrong = escape.clone();
     wrong.public_inputs.conceded = u128::MAX;
-    assert!(validate_withdrawal(&vault, &note, &wrong, &wrong.destination, false, now).is_err());
-    assert!(validate_withdrawal(&vault, &note, &escape, &escape.destination, false, escape.public_inputs.valid_until + 1).is_err());
+    assert!(validate_withdrawal(&vault, &note, &wrong, &destination, false, now).is_err());
+    assert!(validate_withdrawal(&vault, &note, &escape, &destination, false, escape.public_inputs.valid_until + 1).is_err());
     update_pause(&mut vault, true, now).unwrap();
-    assert!(validate_withdrawal(&vault, &note, &escape, &escape.destination, false, now).is_err());
+    assert!(validate_withdrawal(&vault, &note, &escape, &destination, false, now).is_err());
     escape.public_inputs.valid_until = now + MAX_PAUSE_DURATION;
-    assert!(validate_withdrawal(&vault, &note, &escape, &escape.destination, false, now + MAX_PAUSE_DURATION).is_ok());
+    assert!(validate_withdrawal(&vault, &note, &escape, &destination, false, now + MAX_PAUSE_DURATION).is_ok());
 }

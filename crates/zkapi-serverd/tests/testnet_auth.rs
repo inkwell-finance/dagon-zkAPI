@@ -9,7 +9,6 @@ use zkapi_serverd::{
     processor::RequestProcessor,
     routes::create_router,
     signer::ServerSigner,
-    sol_billing::PythBillingOracle,
     testnet_auth::{TestnetPassword, TESTNET_PASSWORD_HEADER},
 };
 use zkapi_types::Felt252;
@@ -25,8 +24,7 @@ fn config(network: &str, password: Option<TestnetPassword>) -> ServerConfig {
             &SharedProfile::embedded().program_id(),
             &vault_authority,
         ),
-        treasury: [7; 32],
-        pyth_price_account: [8; 32],
+        treasury_token_account: dagon_zkapi_profile::usdc_associated_token_address(&[7; 32]),
     };
     ServerConfig {
         testnet_password: password,
@@ -54,7 +52,6 @@ fn router(protected: bool) -> axum::Router {
     let ledger = Arc::new(
         dagon_zkapi_solana_ledger::SolanaCreditLedger::new(config.ledger_config()).unwrap(),
     );
-    let billing = Arc::new(PythBillingOracle::new(&config).unwrap());
     let signer = Arc::new(ServerSigner::new(&config.state_seed, &config.clear_seed));
     create_router(Arc::new(
         RequestProcessor::try_new(
@@ -63,7 +60,6 @@ fn router(protected: bool) -> axum::Router {
             signer,
             Felt252::ZERO,
             ledger,
-            billing,
         )
         .unwrap(),
     ))
@@ -75,11 +71,12 @@ async fn all_service_routes_reject_missing_or_wrong_password_before_body_parsing
     for (method, path) in [
         ("GET", "/v2/auth"),
         ("POST", "/v2/requests"),
-        ("GET", "/v2/billing/quote"),
+        ("POST", "/v2/ledger/escapes/release/prepare"),
+        ("POST", "/v2/ledger/escapes/rent-refund/prepare"),
+        ("POST", "/v2/ledger/usdc-accounts/prepare"),
         ("POST", "/v2/openrouter/leases"),
         ("GET", "/v2/openrouter/leases/example"),
         ("POST", "/v2/openrouter/leases/example"),
-        ("POST", "/v2/openrouter/leases/example/expire"),
         ("POST", "/v2/withdraw/clearance"),
         ("GET", "/v2/requests/example"),
         ("GET", "/v2/nullifiers/invalid"),

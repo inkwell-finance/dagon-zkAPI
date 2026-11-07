@@ -2,20 +2,20 @@
 
 The operator image runs the Dagon server, finalized tree indexer and optional
 escape challenger against the Solana vault, and ships `dagon-zkapi-deploy`.
-Every shared protocol parameter (program id and executable hash, circuit, vault
-policy, server timing, Pyth programs, feed, shard and policy) is compiled into
-the binaries from `solana/profile/shared.json`; operators supply only the
-network identity file, a finalized RPC URL and secrets. See
-`docs/solana-profile.md`.
+Every shared protocol parameter (program id and executable hash, circuit, USDC
+asset, vault policy, server timing) is compiled into the binaries from
+`solana/profile/shared.json`; operators supply only the network identity file,
+a finalized RPC URL and secrets. See `docs/solana-profile.md`.
 
-The SOL/USD price comes from Pyth's free sponsored push feed (shard 0 of the
-push oracle). The operator posts no prices and needs no Hermes API key or fee
-payer for them. See `docs/SOLANA_SERVER.md`, "Pyth sponsored feed".
+Notes are classic-SPL-Token USDC (Circle mint
+`EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`, 6 decimals). One base unit is
+one micro-USDC, billed as one micro-USD of upstream spend, so the server needs
+no price feed.
 
 This is release-candidate packaging, not a populated production deployment.
 The fresh SBF build and full funded local-validator lifecycle have passed, but
-operators must still review the exact immutable deployment and live Pyth
-accounts they pin. Unit/startup tests cannot substitute for those
+operators must still review the exact immutable deployment, vault and treasury
+token accounts they pin. Unit/startup tests cannot substitute for those
 deployment-specific checks.
 
 ## Files
@@ -51,9 +51,12 @@ vault treasury, vault authority or any user wallet.
 The image contains `solana/profile/mainnet-beta.identity.json` at
 `/srv/zkapi/solana/profile/mainnet-beta.identity.json`, and the launcher uses
 it unless `ZKAPI_SOLANA_IDENTITY` names another file. The identity file holds
-only the allowed per-network values (genesis hash, vault authority, vault state,
-treasury, Pyth price account, which must be the profile's push-oracle
-account). To run against a different deployment, produce a
+only the allowed per-network values (genesis hash, vault authority, vault state
+and treasury token account). The treasury token account is the classic-Token
+USDC account (any owner) that receives the operator's accrued share; operators
+must create it before initializing the vault and record it in the identity as
+`treasury_token_account`, because the vault pins it and server startup checks
+the pin. To run against a different deployment, produce a
 file with `dagon-zkapi-deploy identity ...`, bind-mount it read-only into the
 indexer, server and challenger (for example at
 `/run/dagon-zkapi-identity/identity.json`) and set `ZKAPI_SOLANA_IDENTITY` in
@@ -68,12 +71,6 @@ docker compose -f docker/aws/compose.yml build
 docker compose -f docker/aws/compose.yml up -d indexer server gateway
 ```
 
-The server refuses to start unless the sponsored Pyth account holds a fully
-verified finalized price younger than the profile's 90 s maximum age. Pyth's
-sponsor refreshes it at least once a minute, so this holds unless the sponsor
-has stalled; the `unless-stopped` restart policy then retries startup until
-the feed recovers.
-
 After the server is healthy, enable the challenger profile:
 
 ```sh
@@ -87,8 +84,10 @@ Server startup additionally fails closed unless the RPC genesis matches the
 identity, the program is executable and permanently immutable with an on-chain
 executable hash equal to the profile's `executable_sha256`, the vault PDA,
 version, request charge cap, note TTL, challenge period and signing keys match
-the profile and seeds, the vault is unpaused, and the identity's finalized Pyth
-price account satisfies the profile's receiver/feed/age/confidence policy.
+the profile and seeds, the vault's mint is the profile's USDC mint, its token
+account is the canonical vault token PDA (a classic USDC account held by the
+vault), its treasury token account is the identity's, and the vault is
+unpaused.
 
 ## Operations
 
@@ -100,9 +99,5 @@ price account satisfies the profile's receiver/feed/age/confidence policy.
   vault, setup and SDK artifact hashes.
 - Rotate provider credentials independently of signing seeds. Changing signing
   seeds requires a new vault identity and client configuration.
-- Monitor `/health`, finalized RPC availability, quote freshness, settlement
-  retries and challenger progress. Stop funded operation on any identity drift.
-- Alert on the age of the sponsored Pyth price (page above 90 s, when the
-  server refuses every new quote and lease): probe `/v2/billing/quote` through
-  the gateway as described in `docs/SOLANA_SERVER.md` ("Monitoring and
-  alerting"). No paid service is needed.
+- Monitor `/health`, finalized RPC availability, settlement retries and
+  challenger progress. Stop funded operation on any identity drift.

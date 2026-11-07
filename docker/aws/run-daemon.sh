@@ -1,7 +1,7 @@
 #!/bin/sh
 # Launch a Dagon zkAPI daemon from the deployment identity file, a finalized
 # Solana RPC endpoint and secrets. Every shared protocol parameter (program id,
-# circuit, vault policy, server timing, Pyth programs/feed/shard/policy) is
+# circuit, USDC asset, vault policy, server timing) is
 # compiled into the binaries from solana/profile/shared.json; none is
 # configurable here. Keep private seeds, keypair paths and provider credentials
 # in the process environment.
