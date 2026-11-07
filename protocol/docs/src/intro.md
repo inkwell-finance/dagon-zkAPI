@@ -7,7 +7,7 @@ describes exact interfaces.
 
 The current implementation uses BN254 Groth16 proofs, BN254 Poseidon hashing,
 and Baby-JubJub Schnorr signatures and note-bound balance commitments. The
-Anchor vault program settles native SOL in lamports. These are classical
+Anchor vault program settles Circle USDC in base units (micro-USDC). These are classical
 elliptic-curve primitives. Review the [setup trust assumptions and
 compatibility](../../setup/v2/README.md) before deploying. The protocol descends
 from upstream [ethereum/zkapi](https://github.com/ethereum/zkapi), where its EVM

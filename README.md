@@ -1,7 +1,7 @@
 # Dagon zkAPI
 
 Dagon zkAPI is a Solana private payment layer for AI and other APIs. A
-browser wallet deposits native SOL, proves authorization with Groth16, pays only
+browser wallet deposits USDC, proves authorization with Groth16, pays only
 for completed usage, and withdraws the remaining balance without linking API
 requests to the on-chain deposit.
 
@@ -21,8 +21,11 @@ fixtures, development setup keys, or generated artifacts as production pins.
 ## Security and architecture
 
 - Groth16 over BN254 remains the trusted authorization path.
-- The Anchor vault settles native SOL and verifies request/withdrawal proofs with
-  Solana BN254 syscalls.
+- The Anchor vault settles Circle USDC (classic SPL Token, 6 decimals;
+  Token-2022 is rejected) and verifies request/withdrawal proofs with Solana
+  BN254 syscalls. One credit is one USDC base unit, billed as one micro-USD, so
+  billing needs no price oracle. Users also need a little SOL for transaction
+  fees and account rent.
 - A chain-neutral `CreditLedger` boundary isolates the request/server protocol
   from ledger transport.
 - The browser uses exact decimal strings for Solana-derived `u64` chain IDs and a
@@ -32,13 +35,14 @@ fixtures, development setup keys, or generated artifacts as production pins.
   local validator runs exactly the mainnet configuration (see
   [the Solana profile](docs/solana-profile.md)).
 - Server startup verifies the pinned cluster, immutable program deployment and
-  its executable hash, vault-state PDA, finalized vault metadata, and Pyth
-  SOL/USD source before opening durable state.
-- SOL/USD comes from Pyth's free sponsored push feed (60 s heartbeat, and on
-  any 0.5% move); the server quotes only from a fully verified finalized price
-  at most 90 s old and otherwise refuses new quotes and leases, so a stalled
-  sponsor fails closed rather than mispricing (see
-  [the Solana server](docs/SOLANA_SERVER.md#pyth-sponsored-feed)).
+  its executable hash, vault-state PDA, finalized vault metadata, USDC mint,
+  vault token account and treasury token account before opening durable state.
+- Payouts go to any classic USDC token account bound by the withdrawal proof
+  (wallets, associated token accounts, or PDA-owned accounts such as a CCTP
+  forwarder's). An escape payout that cannot be credited at finalization is
+  parked and released later to the same account (see
+  [the vault](protocol/docs/src/vault.md)). USDC's issuer can freeze any USDC
+  token account, including the vault's; that risk is inherent to USDC.
 - Encrypt/FHE is intentionally absent from the default dependency graph and the
   trusted money path. A future experimental ledger may implement `CreditLedger`
   without changing the request API or vault semantics.
@@ -74,8 +78,8 @@ are recorded in [docs/PORTING_STATUS.md](docs/PORTING_STATUS.md).
 ## Browser SDK
 
 The package identity is `@dagon/zkapi-browser-sdk`. Its public modules include
-the runtime/store/client APIs plus Solana ledger identity, native-SOL billing,
-Wallet Standard transport, and the crash-safe operation journal.
+the runtime/store/client APIs plus Solana ledger identity, USDC token-account
+helpers, Wallet Standard transport, and the crash-safe operation journal.
 
 ```js
 import { BrowserWalletRuntime } from '@dagon/zkapi-browser-sdk/runtime';
@@ -83,8 +87,8 @@ import { SolanaOperationJournal } from '@dagon/zkapi-browser-sdk/solana-journal'
 ```
 
 Applications must pin the server URL, the network identity (genesis hash,
-vault-state PDA, Pyth price account), setup hashes and Wallet Standard account. See [SDK integration](sdk/README.md) and the native-SOL tests under
-`sdk/test/`.
+vault-state PDA, treasury token account), setup hashes and Wallet Standard
+account. See [SDK integration](sdk/README.md) and the tests under `sdk/test/`.
 
 ## Operator services
 
@@ -112,7 +116,7 @@ every placeholder, keep secret files mode `0600`, and run the
 
 | Directory | Purpose |
 | --- | --- |
-| `solana/` | Anchor native-SOL vault and generated Groth16 verifier constants |
+| `solana/` | Anchor USDC vault and generated Groth16 verifier constants |
 | `solana/profile/` | Shared mainnet profile and network identity files |
 | `crates/dagon-zkapi-profile/` | Compiled-in profile, identity loading and parity checks |
 | `crates/dagon-zkapi-deploy/` | Identity, vault initialization and parity tooling |

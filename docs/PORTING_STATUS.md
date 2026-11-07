@@ -102,16 +102,18 @@ protocol semantics.
   statements.
 - Committed Groth16 verifying-key constants are generated from the existing
   setup and real request/withdrawal fixtures pass through the Solana verifier.
-- The Anchor vault implements native-SOL settlement, staged transaction
+- The Anchor vault implements classic-SPL USDC settlement (vault token PDA,
+  pinned treasury token account, parked escape payouts), staged transaction
   payloads, request/withdrawal/transition Groth16 verification, nullifiers,
   mutual close, escape/challenge/finalize, expiry claims, and
   abandoned-operation cleanup. Poseidon Merkle hashing is kept out of the SBF
   trusted path because even a leaf hash exceeded the program compute ceiling.
 - The Solana ledger builds every vault operation and the finalized snapshot
   indexer reconstructs state only when its root matches the vault.
-- Server startup verifies the immutable deployment, finalized
-  vault metadata and pinned finalized Pyth source before opening SQLite. SOL
-  quote arithmetic and settlement stay behind separate ledger/price boundaries.
+- Server startup verifies the immutable deployment and finalized vault
+  metadata (USDC mint, vault token PDA, treasury token account) before opening
+  SQLite. Billing is the identity conversion of one USDC base unit per metered
+  micro-USD; there is no price source.
 - The challenge daemon discovers canonical finalized
   pending PDAs through `CreditLedger`, derives paths from privacy-safe whole-tree
   snapshots, signs prepared staged operations with a restricted keypair, and
@@ -143,34 +145,37 @@ Release gates are now:
 2. Local-validator parity stack: the validator preloads that verifiable program
    at the declared program id as canonical loader-v3 accounts with upgrade
    authority `None` (the state after a final authority revocation), clones the
-   mainnet Pyth receiver/oracle accounts, keeps the price account fresh only
-   by replaying the real guardian-signed updates of Pyth's sponsored feed as
-   they land on mainnet (its ~60 s cadence), initializes the vault with
+   mainnet USDC mint account, preloads a USDC faucet token account and a frozen
+   USDC token account for adversarial tests, loads the test-only PDA-signer
+   program (a stand-in for a CCTP forwarder), initializes the vault with
    `dagon-zkapi-deploy init-vault`, and must pass
    `scripts/check-solana-parity.mjs` against the mainnet reference before the
-   full end-to-end lifecycle runs (the vault lifecycle plus the sponsored-feed
-   freshness test, which stalls the replay past the 90 s maximum age and
-   requires quoting to fail closed). The validator is the pinned, isolated Agave
+   full end-to-end lifecycle runs. The validator is the pinned, isolated Agave
    4.4.1 release (`scripts/localnet/install-validator.sh`) with mainnet's
    feature set cloned. The parity check requires equal activation for every
    feature ID 4.4.1 knows, lists the reviewed retired (hardwired) mainnet IDs
    explicitly, and fails closed on any unclassified active ID (see
    [runtime feature parity](solana-profile.md#runtime-feature-parity)).
 
-### Cutover gate evidence (2026-11-06)
+### USDC cutover (2026-11)
+
+Notes moved from native SOL priced by an oracle to Circle USDC (classic SPL
+Token, 6 decimals; Token-2022 rejected), new immutable program id
+`8cYsHTNTvS5DwNqFaJ3LDZo8ed1k53cdgWQVZqEN45BX`. The oracle, quote endpoint,
+quote-expiry recovery and their replayed-feed tests were deleted outright. The
+gate evidence below predates the cutover and must be re-run against the USDC
+program and profile.
+
+### Cutover gate evidence (2026-11-06, native-SOL program, superseded)
 
 - Verifiable build: executable hash
-  `a61192ae477628c499f35069d39be91f2964f5c39df08d22f65b657f4cb67115`, pinned
-  in the profile; two independent Docker build paths produced it.
+  `a61192ae477628c499f35069d39be91f2964f5c39df08d22f65b657f4cb67115`; two
+  independent Docker build paths produced it.
 - Parity stack on the pinned validator: local `getVersion` 4.4.1, mainnet
   4.4.0, both reporting feature set 2681577653. The 252 known active feature IDs
   matched on both sides (0 missing, 0 extra), with the 59 retired IDs listed
   explicitly. `check-solana-parity.mjs` reported
   `Solana parity PASS (only explicit network identity may differ)`.
-- Billing against the replayed mainnet price account: the server returned HTTP
-  200 for two `/v2/billing/quote` requests 5.5 s apart (publish time
-  1793966005, ages 10 s and 15 s). Later replayed updates arrived at ages 6 s
-  and 8 s.
 - Lifecycle:
   `cargo test --release -p dagon-zkapi-solana-ledger --test localnet -- --ignored --nocapture`
   passed 1/1 in 105.51 s.
@@ -178,20 +183,19 @@ Release gates are now:
   (the same as the lifecycle test). The default 200k limit was exhausted in
   one run, and the CLI now sets the higher limit.
 
-## Earlier release-gate evidence (2026-10-02)
+## Earlier release-gate evidence (2026-10-02, native-SOL program, superseded)
 
 - Solana browser/native wallet transport is complete. It preserves derived
   `u64` chain IDs as canonical decimal strings, validates the exact signer,
   program, vault, message and packet size, journals signed bytes before
   broadcast, resumes ordered staged operations, and keeps background escape
   finalization in a separate durable journal.
-- Native-SOL/Pyth billing validates the full deployment and conservative
-  confidence-adjusted quote with integer arithmetic. Server startup verifies
-  the finalized cluster, vault PDA, immutable loader-v3 program and Pyth source
-  before opening durable state.
+- Billing (then native SOL) validated the full deployment with integer
+  arithmetic. Server startup verifies the finalized cluster, vault PDA and
+  immutable loader-v3 program before opening durable state.
 - The ignored local-validator gate passed against a fresh Agave 3.1.11
   validator and freshly built SBF program in 406.86 seconds. It proved two real
-  deposits, a signed non-genesis mutual close and exact lamport payout, an
+  deposits, a signed non-genesis mutual close and exact payout, an
   escape sharing a nullifier with a historical request proof, a successful
   on-chain challenge, a second signed escape with a new
   anchor/nullifier, enforced deadline, final payout, liability cleanup, and a
@@ -199,7 +203,7 @@ Release gates are now:
   (That gate predates the concession exit: it exercised the former
   one-step challenge-with-restoration, and defeat / raise / retire need
   their own gate run.)
-- `npm test`: 323/323 passed, including native-SOL quote, transport and durable
+- `npm test`: 323/323 passed, including billing, transport and durable
   runtime-journal coverage.
 - `cargo test --locked --manifest-path protocol/rust/Cargo.toml --workspace`:
   all 57 protocol tests passed, including generated transition proof setup and
@@ -217,7 +221,7 @@ Release gates are now:
 The repository is an implementation release candidate, not a deployed
 production service. A real deployment still requires an explicit decision to
 accept or replace both single-party Groth16 setups, operator-managed secrets,
-immutable program deployment, finalized program/vault/oracle pins, and normal
+immutable program deployment, finalized program/vault/treasury pins, and normal
 infrastructure rollout. Those external deployment choices do not change the
 request API, vault protocol, or `CreditLedger` boundary.
 

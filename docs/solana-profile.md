@@ -16,35 +16,28 @@ feature activation equals mainnet's for every feature that release knows (see
 | Section | Values |
 | --- | --- |
 | `protocol` | `protocol_version` 2, `circuit_id` `zkapi-v2-concession-v1`, `transition_circuit_id` `dagon-zkapi-solana-transition-v1` |
-| `program` | `program_id` `7NdY5ZVP2He8gSiDHZbkfmNfSgKWV2tkZmZgty2C1d8H`, upgradeable loader, `upgrade_authority: null`, `executable_sha256` |
-| `vault` | `version` 1, `request_charge_cap` 11000000, `note_ttl_seconds` 2592000, `challenge_period_seconds` 86400, `max_pause_seconds` 604800, `pause_cooldown_seconds` 86400 |
+| `program` | `program_id` `8cYsHTNTvS5DwNqFaJ3LDZo8ed1k53cdgWQVZqEN45BX`, upgradeable loader, `upgrade_authority: null`, `executable_sha256` |
+| `asset` | `symbol` `USDC`, `mint` `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` (Circle USDC), `decimals` 6, `token_program` `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` (classic SPL Token), `associated_token_program` `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL` |
+| `vault` | `version` 1, `request_charge_cap` 1000000, `note_ttl_seconds` 2592000, `challenge_period_seconds` 86400, `max_pause_seconds` 604800, `pause_cooldown_seconds` 86400 |
 | `server` | `lease_ttl_seconds` 300, `settlement_grace_seconds` 5, `settlement_poll_seconds` 2, `raise_lead_seconds` 3600 |
-| `pyth` | `receiver_program` `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`, `push_oracle_program` `pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT`, `wormhole_program` `HDwcJBJXjL9FpJ7UBsYBtaDjsBUhuLCUYoz3zr8SWWaQ`, SOL/USD `feed_id`, `push_shard_id` 0, `max_age_seconds` 90, `max_confidence_bps` 100, `max_supersession_bps` 100 |
+
+The vault holds only Circle USDC under the classic SPL Token program;
+Token-2022 is rejected everywhere. The profile accepts exactly the `asset`
+values above. One USDC base unit is one micro-USDC, which the protocol bills
+as one micro-USD, so note amounts, solvency bounds, charges, payouts and caps
+are all USDC base units and need no price oracle.
 
 `request_charge_cap` is the smallest lease: the server signs no request whose
-proof bound is below it, so every lease is funded with at least 11,000,000
-lamports (0.011 SOL, about $1 at $90/SOL). The cap is fixed in lamports and
-pinned in the vault at initialization, so the smallest lease in USD moves with
-the SOL price (about $0.55 at $50/SOL, $2.20 at $200/SOL); changing it needs a
-new vault.
+proof bound is below it, so every lease is funded with at least 1,000,000 base
+units, exactly $1.00 of USDC at 6 decimals. It is pinned in the vault at
+initialization; changing it needs a new vault.
 
-`push_shard_id` and `feed_id` determine the one SOL/USD account every
-deployment pins: the push-oracle PDA `[push_shard_id (u16 LE), feed_id]`,
-`7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE` for shard 0, which Pyth's
-sponsor keeps updated for free (60 s heartbeat, and on any 0.5% move).
-`max_age_seconds` is 90: one heartbeat plus 30 s for landing, finalization
-and RPC lag. The profile and the server accept at most 90
-(`PYTH_MAX_AGE_CEILING_SECONDS`); see
-[the Solana server](SOLANA_SERVER.md#pyth-sponsored-feed) for the
-justification, timing budget and fail-closed behaviour.
-
-New lease admission reads a fresh finalized price even for an observed quote.
-Older quotes are superseded only when the newest observed conservative price
-(`price - confidence`) is more than 1% below their conservative price, using
-`max_supersession_bps`. Quote responses and reservation recheck the same policy.
-This bounds quote-selection disparity, not market risk during the 300 s frozen
-lease or a sponsor stall before the 90 s age limit. The setting is shared, not
-a network-identity exception or runtime option.
+The profile crate also derives the token accounts every component uses:
+`vault_token_address(program, vault_state)` is the vault's USDC account, PDA
+`["vault-token", vault_state]` of the program (created by `initialize`, token
+authority = the vault state), and `usdc_associated_token_address(owner)` is
+`owner`'s canonical USDC ATA, PDA `[owner, token_program, mint]` of the ATA
+program.
 
 There are no flags or environment variables for any of these. Changing one is a
 source change that produces new binaries.
@@ -67,8 +60,7 @@ per-network values:
   "genesis_hash": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
   "vault_authority": "<base58>",
   "vault_state": "<base58>",
-  "treasury": "<base58>",
-  "pyth_price_account": "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE"
+  "treasury_token_account": "<base58>"
 }
 ```
 
@@ -79,8 +71,12 @@ per-network values:
   `network: "localnet"`.
 - Unknown keys are rejected, so a shared parameter cannot be overridden from an
   identity file. `vault_state` must equal the PDA `["vault", vault_authority]`
-  of the compiled-in program id, `pyth_price_account` must equal the profile's
-  push-oracle account, and `genesis_hash` must equal the RPC's.
+  of the compiled-in program id, and `genesis_hash` must equal the RPC's.
+- `treasury_token_account` is the classic-Token USDC account (any owner, for
+  example the canonical ATA of an operator wallet) that receives treasury
+  withdrawals. `initialize` requires it to be an initialized, unfrozen USDC
+  account and pins it in the vault; it can be neither the vault nor the
+  vault's token account.
 
 Binaries take the identity with `--solana-identity PATH` (server env
 `ZKAPI_SOLANA_IDENTITY`) and an RPC URL; see
@@ -94,9 +90,7 @@ only in:
 
 - `network`, `rpc_url`
 - `genesis_hash` (and the derived `chain_id` and `deployment_binding`)
-- `vault_authority`, `vault_state`, `treasury`
-- `pyth_price_account` (declared per network, but every binary, the SDK build
-  and the parity check require it to be the profile's push-oracle account)
+- `vault_authority`, `vault_state`, `treasury_token_account`
 - `state_signing_key`, `clearance_signing_key`
 
 Anything else, including the program id (embedded in the byte-identical binary;
@@ -107,7 +101,27 @@ The deploy tool validates each effective-profile document before comparing it:
 all observation sections are required, identity values cannot hide nested
 parameters, and both the shared profile and observed program/vault must match
 the compiled profile. Two empty documents or two deployments with the same
-non-profile challenge period cannot pass parity. A deployed mainnet reference
+non-profile challenge period cannot pass parity.
+
+Besides the program and the vault parameters, `observe` and `expected` report
+the USDC facts both networks must share:
+
+- the vault's pinned `mint`; its token account is the canonical
+  `["vault-token", vault_state]` PDA, a classic-Token USDC account whose token
+  authority is the vault, initialized (not frozen), not native, with no
+  delegate or close authority; the pinned treasury token account is an
+  initialized classic-Token USDC account (its owner and every balance are
+  per-deployment and not compared);
+- the USDC mint account: owner (classic Token), decimals, `is_initialized`,
+  `mint_authority` and `freeze_authority`. Supply legitimately differs (the
+  local mint is a clone) and is not reported;
+- the loader, executable hash (and, for an upgradeable program, the upgrade
+  authority) of the classic Token program and of the ATA program, read from
+  each chain, so the local validator must run mainnet's exact executables.
+
+The undeployed mainnet reference reports the vault token facts as the
+profile requires them; the mint and both token programs are always read live
+from mainnet. A deployed mainnet reference
 is subject to these same pins; equality with mainnet alone is insufficient.
 
 ## Deploy tool
@@ -118,11 +132,13 @@ compiled-in profile for mainnet and local deployments:
 ```sh
 # Write an identity file (reads genesis from the RPC, derives the vault PDA).
 dagon-zkapi-deploy identity --network NAME --solana-rpc-url URL \
-  --vault-authority PUBKEY --treasury PUBKEY --pyth-price-account PUBKEY --out PATH
+  --vault-authority PUBKEY --treasury-token-account PUBKEY --out PATH
 
 # Initialize the vault with every vault argument from the profile. Signing
 # seeds come from ZKAPI_STATE_SEED / ZKAPI_CLEAR_SEED. Refuses unless the
-# program is immutable and its executable hash equals the profile.
+# program is immutable and its executable hash equals the profile. The
+# transaction passes the treasury token account, the USDC mint, the vault
+# token PDA (created here) and the classic Token program.
 dagon-zkapi-deploy init-vault --solana-identity PATH --solana-rpc-url URL \
   --authority-keypair PATH
 
@@ -163,32 +179,53 @@ rebuild every operator binary afterwards.
 - the validator is a pinned, isolated Agave 4.4.1 release with mainnet's
   feature set cloned (`--clone-feature-set`); the parity check requires equal
   activation for every feature 4.4.1 knows;
-- the real mainnet Pyth receiver, push-oracle and Wormhole programs and
-  accounts (including the identity's SOL/USD price account) are cloned. The
-  price account is then written only by the replay of Pyth's sponsored feed
-  (`scripts/localnet/pyth-replay.mjs`). It follows every signed mainnet
-  push-oracle update of that account as it lands, whoever paid for it, and
-  posts the newest one locally under the sponsor's target policy: once the
-  local price is 60 s old (the heartbeat) or when the newest price has moved
-  by 0.5%. Third parties may push the mainnet account more often (one pushed
-  it every ~10 s on 2026-11-06); the replay targets the sponsor's policy rather
-  than that optional extra cadence. A posted update carries the same
-  signed instructions as on mainnet: the guardian-signed VAA verified against
-  the cloned Wormhole guardian set (full verification) and the Merkle-proven
-  message posted through the cloned push oracle. Nothing is fabricated or
-  re-signed; only the fee payer and the temporary encoded-VAA account are
-  local. The local price therefore ages like a sponsor-only mainnet account,
-  plus the replay's polling, posting and local finalization delay;
+- the real mainnet USDC mint is cloned (`--clone`, byte-identical to mainnet
+  at clone time), and the classic Token and ATA programs are cloned from
+  mainnet with the flag their mainnet loader needs, so the local executables
+  are mainnet's rather than the validator's bundled copies (parity compares
+  their executable hashes);
+- two USDC token accounts are preloaded as `--account` fixtures: a faucet
+  (the canonical ATA of a stack keypair holding 1,000,000 USDC) and one
+  frozen account (state 2, the canonical ATA of another stack keypair) for
+  adversarial tests. Their balances and states are fabricated local state:
+  only the mint they name is mainnet's, and the cloned mint's supply does not
+  include the faucet balance;
+- the test-only PDA signer (`solana/test-programs/pda-signer`, a CPI relay
+  that signs with its `["forwarder"]` PDA, standing in for a CCTP forwarder)
+  is loaded at the fixed id `FrGKWj9gdt9d7VcjWN6zucZxYgYqyRDeGXdCWeQybr3u` with
+  `--bpf-program`. It is never part of a deployment or the verifiable build.
+  The stack builds it with `scripts/localnet/build-test-programs.sh` when
+  `target/deploy-test/dagon_zkapi_test_pda_signer.so` is missing (needs
+  `cargo build-sbf`);
+- a treasury owner keypair is generated and its canonical USDC ATA is created
+  through the cloned ATA program (`CreateIdempotent`);
 - a localnet identity is written, the vault is initialized with
   `dagon-zkapi-deploy init-vault`, and the stack is diffed against the mainnet
   reference before any test runs.
 
 ```sh
 ZKAPI_STATE_SEED=... ZKAPI_CLEAR_SEED=... \
-  node scripts/localnet/stack.mjs --run-dir PATH [--bin-dir PATH]
+  node scripts/localnet/stack.mjs --run-dir PATH [--bin-dir PATH] [--rpc-port PORT] \
+  [--clock-offset-seconds N | --clock-before-utc-midnight N]
 ```
 
 `--bin-dir` (default `target/release`) must hold `dagon-zkapi-deploy`.
+
+The clock options are test-only, like the token-account fixtures. With a
+nonzero offset the stack compiles `scripts/localnet/clock-offset.c` with
+`gcc -shared -fPIC -O2 -o RUN_DIR/clock-offset.so` and launches the validator
+with `LD_PRELOAD` of that shim and `DAGON_CLOCK_OFFSET_SECONDS`. The shim adds
+the offset to the validator's `CLOCK_REALTIME` (monotonic clocks are
+untouched), so its vote timestamps and the Clock sysvar run that many seconds
+ahead of wall time, consistently from genesis. `--warp-slot` does not move the
+clock and libfaketime crashes Agave, hence the shim. `--clock-before-utc-midnight N`
+sets the offset so that, when the CLI starts, the chain clock reads `N`
+seconds before a UTC midnight (the next one, or the one after if the next is
+closer than `N`); the chain clock then advances in real time, so choose `N`
+larger than the stack's startup time. The expired-claim lifecycle test uses it
+to cross a note's UTC-day expiry bucket within minutes. The default offset 0
+loads no shim. Parity is unaffected: it compares no timestamps, and the
+offset never reaches a deployment.
 
 Under a Node version-manager shim such as Volta, launch the real Node process with `"$(node -p process.execPath)" scripts/localnet/stack.mjs ...` so signals sent to the background PID reach Node rather than the shim.
 
@@ -207,46 +244,28 @@ not run `agave-install`, change the active release or touch `PATH`. The
 launcher uses `.../agave-v4.4.1/solana-release/bin/solana-test-validator`
 unless `DAGON_SOLANA_TEST_VALIDATOR` names another binary.
 
-`MAINNET_RPC_URL` optionally selects the mainnet RPC used for cloning, following
-the sponsored updates and the reference (a public endpoint by default; a live
-RPC is required). The CLI prints `{ rpcUrl, identityPath, authorityKeypairPath,
-payerKeypairPath, treasury, replayControlUrl }` once ready. The JS API for
-end-to-end tests is `startLocalStack({ root, runDir, binDir, log })` from
-`scripts/localnet/stack.mjs`, returning `{ rpcUrl, identityPath, identity,
-authorityKeypairPath, payerKeypairPath, treasury, replayControlUrl,
-stallReplay(), resumeReplay(), replayStatus(), awaitFreshQuote, stop() }` after
-`init-vault`, a passing parity check and one fresh-quote wait.
+`MAINNET_RPC_URL` optionally selects the mainnet RPC used for cloning and the
+reference (a public endpoint by default; a live RPC is required). The CLI
+prints `{ rpcUrl, identityPath, identity, authorityKeypairPath,
+payerKeypairPath, treasuryTokenAccount, usdcFaucetKeypairPath,
+usdcFaucetTokenAccount, frozenUsdcOwnerKeypairPath, frozenUsdcTokenAccount,
+pdaSignerProgramId, clockOffsetSeconds }` as JSON once ready. The JS API for
+end-to-end tests is `startLocalStack({ root, runDir, binDir, log, rpcPort,
+clockOffsetSeconds })` (with `clockOffsetBeforeUtcMidnight(N)` exported to
+compute an offset) from
+`scripts/localnet/stack.mjs`, returning the same fields plus `stop()` after
+`init-vault` and a passing parity check. The authority, payer, faucet and
+frozen-account owners each hold 50 SOL for fees and rent.
 
-`awaitFreshQuote({ minRemainingSeconds = 5, timeoutMs = 180000 } = {})` waits
-until the finalized price account holds a quote newer than the cloned one
-(so one the replay posted) with at least `minRemainingSeconds` of its maximum
-age left, and returns that account's
-`publishTime`, age and `postedSlot` (not a server billing quote). It only
-waits; it never changes the maximum age, the clock or the quote. Call it before
-starting the server and before each quote → prove → lease cycle.
-
-`stallReplay()` stops posting, as when Pyth's sponsor stalls, and resolves
-once no replayed update is in flight; the local price then ages past the
-maximum age and the server must refuse quotes, leases and startup.
-`resumeReplay()` lets the heartbeat post the newest mainnet update at once, as
-a recovering sponsor would. `replayStatus()` reports `{ stalled,
-heartbeat_seconds, deviation_bps, mainnet_updates_seen, updates_posted,
-last_mainnet_tx, last_publish_time, last_reason }`. Tests outside the stack's
-process use the loopback `replayControlUrl` instead: `POST /stall`,
-`POST /resume` and `GET /status` answer the same status as JSON.
-
-The lifecycle gate runs two ignored tests against one stack, concurrently or
-in turn: the vault lifecycle and the sponsored-feed freshness test, which
-checks quoting under the replayed cadence, stalls the replay until the price
-is older than 90 s, requires the server's quote, lease admission and startup
-to refuse it, and resumes:
+The vault lifecycle test runs against a stack:
 
 ```sh
 DAGON_SOLANA_RPC_URL=<rpcUrl> \
+  DAGON_USDC_FAUCET_KEYPAIR=<usdcFaucetKeypairPath> \
+  DAGON_USDC_FROZEN_ACCOUNT=<frozenUsdcTokenAccount> \
+  DAGON_USDC_FROZEN_OWNER_KEYPAIR=<frozenUsdcOwnerKeypairPath> \
+  DAGON_TEST_PDA_SIGNER_PROGRAM=<pdaSignerProgramId> \
   cargo test --release -p dagon-zkapi-solana-ledger --test localnet -- --ignored
-ZKAPI_STATE_SEED=... ZKAPI_CLEAR_SEED=... DAGON_SOLANA_RPC_URL=<rpcUrl> \
-  DAGON_SOLANA_IDENTITY=<identityPath> DAGON_PYTH_REPLAY_CONTROL_URL=<replayControlUrl> \
-  cargo test --release -p zkapi-serverd --test localnet_pyth -- --ignored
 ```
 
 Check a running stack (or any deployment) against the mainnet reference:
@@ -289,9 +308,17 @@ IDs against mainnet's 311, and all 89 missing features were absent from
 ## Test-only override
 
 Exactly one file may deviate from the profile:
-`solana/profile/localnet-test-overrides.json`. It sets only
-`challenge_period_seconds` (40) with a stated reason, so the local-validator
-lifecycle test can exercise challenge deadlines in real time. Only that test
-reads it; no binary does. The server's startup gate rejects a vault whose
-challenge period differs from the profile (and the shortened timing), so a
-vault initialized with the override can never be served.
+`solana/profile/localnet-test-overrides.json`, with a stated reason. It sets
+only:
+
+- `challenge_period_seconds` (40), so the main local-validator lifecycle test
+  can exercise challenge deadlines in real time;
+- `note_ttl_seconds` (1), read only by the ignored expired-claim lifecycle
+  test on a stack started with a clock offset
+  (`--clock-before-utc-midnight`), so a note's UTC-day expiry bucket passes
+  within minutes.
+
+Only those ignored tests read it; no binary does. The server's startup gate
+rejects a vault whose challenge period or note TTL differs from the profile
+(and the shortened timing), so a vault initialized with an override can never
+be served.

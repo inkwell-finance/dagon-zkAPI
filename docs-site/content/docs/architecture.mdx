@@ -1,11 +1,11 @@
 ---
 title: Architecture
-description: Browser wallet, v2 proof services, finalized indexer, and native-SOL settlement
+description: Browser wallet, v2 proof services, finalized indexer, and USDC settlement
 ---
 
 The browser SDK generates note-bound Groth16 proofs locally. `serverd`
 verifies lease authorizations and signs balance updates, the indexer rebuilds
-the finalized active note tree, and the Anchor vault settles native SOL.
+the finalized active note tree, and the Anchor vault settles USDC.
 `dagon-zkapi-challenged` submits evidence against escape withdrawals from already-used
 states. The host application owns the user interface.
 
@@ -30,7 +30,7 @@ crates/
   zkapi-serverd                 # v2 verification, signing, leases and recovery
   zkapi-indexerd                # Finalized Solana account tree reconstruction
   zkapi-cli                     # dagon-zkapi operator command
-solana/programs/dagon-zkapi-vault/ # Anchor native-SOL vault
+solana/programs/dagon-zkapi-vault/ # Anchor USDC vault
 solana/profile/                 # shared.json and network identity files
 sdk/                            # Browser wallet, Wallet Standard transport and journals
 ```
@@ -55,14 +55,14 @@ update before saving the next state.
 
 The server loads the request verifying key and separate Schnorr state and
 clearance signers. Before opening SQLite it verifies the cluster genesis,
-immutable program/program-data accounts, vault PDA and metadata, signing keys,
-unpaused state and pinned finalized Pyth source. It also requires exactly one
-lease issuer.
+immutable program/program-data accounts, vault PDA and metadata (USDC mint,
+vault token account, treasury token account), signing keys and unpaused
+state. It also requires exactly one lease issuer.
 
 | Component | Responsibility |
 |---|---|
 | Groth16 request verifier | Membership, private signed-state validity, solvency, nullifier and authorization relation |
-| Request processor | Deployment/key checks, payload and quote binding, freshness, current root, caps and durable reservation |
+| Request processor | Deployment/key checks, payload binding, freshness, current root, caps and durable reservation |
 | Lease service | Issue a spending-limited runtime key and settle measured usage after retirement |
 | Schnorr signer | Sign the updated commitment and anchor; sign clearance separately |
 | Anchor Groth16 verifier | Verify request challenge proofs and withdrawal proofs with Solana BN254 syscalls |
@@ -73,7 +73,8 @@ lease issuer.
 1. The wallet samples a secret and computes the v2 registration commitment.
 2. It obtains the next note ID and an empty-slot path from the indexed tree.
 3. The server prepares the vault's staged deposit instructions; Wallet Standard
-   signs each exact message and transfers exactly `amount` lamports.
+   signs each exact message, which transfers exactly `amount` USDC base units
+   from the wallet's USDC token account to the vault token account.
 4. The vault emits `NoteDeposited` with the registration commitment, amount,
    expiry and new root; the indexer updates its tree.
 5. The wallet confirms the note and initializes its random blinding and
@@ -94,11 +95,9 @@ sequenceDiagram
   participant O as OpenRouter
   B->>I: Active tree snapshot
   I-->>B: Root and leaves
-  B->>S: GET /v2/billing/quote
-  S-->>B: Finalized native-SOL/Pyth billing quote
-  B->>B: Verify quote, prove and journal authorization
+  B->>B: Prove and journal authorization
   B->>S: POST /v2/openrouter/leases
-  S->>S: Verify proof and quote; reserve nullifier
+  S->>S: Verify proof; reserve nullifier
   S-->>B: Short-lived runtime key
   B->>O: Direct inference calls
   O-->>B: Inference responses
@@ -109,8 +108,8 @@ sequenceDiagram
   B->>B: Verify and save next private state
 ```
 
-The authorization payload contains no prompt. The accepted native-SOL quote
-is bound into that payload and stays fixed through recovery and settlement.
+The authorization payload contains no prompt and no price: credits are USDC
+base units billed one per metered micro-USD, with a $1 minimum bound per lease.
 One lease can cover multiple inference calls; its next signed balance arrives
 after retirement and settlement, rather than after each provider response.
 
@@ -118,9 +117,11 @@ after retirement and settlement, rather than after each provider response.
 
 For mutual close, the wallet fetches a Schnorr clearance signature from
 `POST /v2/withdraw/clearance`, then proves the final balance, destination and
-clearance mode. The signature is a private proof witness. It submits
+clearance mode. The destination is the payout USDC token account (any owner;
+by default the wallet's associated token account, created first if missing).
+The signature is a private proof witness. It submits
 the direct `execute_close` instruction: the proof is leaf-bound and root-free,
-the vault verifies, pays native SOL and marks the note `Closed`; the leaf is
+the vault verifies, pays USDC and marks the note `Closed`; the leaf is
 removed later by `retire_closed_leaf`.
 
 An escape uses a 16-input withdrawal proof without clearance, with a concession
@@ -130,13 +131,15 @@ nullifier equals `N+` (the note stays `Active`, the payout is cancelled), or
 raises the concession up to the request's solvency bound. Neither needs a
 Merkle path or the current root, so no deposit or close can front-run it, and
 there is no restore step. Honest users are paid at least `B_k − b_k` without
-operator cooperation (G1). See [Protocol](/docs/protocol#withdrawal)
+operator cooperation (G1). If the destination cannot be credited at
+finalization, the payout is parked and later released, permissionlessly, to
+the same account. See [Protocol](/docs/protocol#withdrawal)
 and the [vault API](/docs/api-reference/vault).
 
 ## Deployment identity
 
 A deployment fixes the cluster genesis, immutable program, vault-state PDA,
-Pyth source, state signing key and clearance signing key. Clients must pin the
+treasury token account, state signing key and clearance signing key. Clients must pin the
 circuit revision, matching proof assets and deployment identity; fetching a
 manifest is not enough to establish trust in its contents. See
 [setup and compatibility](/docs/cryptography#setup-and-compatibility) for the

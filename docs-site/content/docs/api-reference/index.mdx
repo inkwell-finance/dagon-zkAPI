@@ -1,6 +1,6 @@
 ---
 title: API Reference
-description: Browser SDK, v2 server, finalized indexer, and native-SOL vault
+description: Browser SDK, v2 server, finalized indexer, and USDC vault
 ---
 
 The browser SDK builds proofs and owns wallet recovery. Its package exports and
@@ -9,7 +9,7 @@ integration contract are documented in `sdk/README.md` in the repository.
 <Cards>
   <Card title="serverd" description="v2 requests, OpenRouter leases, recovery, and withdrawal clearance." href="/docs/api-reference/serverd" />
   <Card title="indexer" description="Current roots, note snapshots, and depth-32 Merkle paths." href="/docs/api-reference/indexer" />
-  <Card title="Dagon Solana vault" description="Native-SOL deposits, Groth16 closes, escapes, challenges and expiry." href="/docs/api-reference/vault" />
+  <Card title="Dagon Solana vault" description="USDC deposits, Groth16 closes, escapes, parked payouts, challenges and expiry." href="/docs/api-reference/vault" />
 </Cards>
 
 ```text
@@ -19,7 +19,7 @@ Browser SDK -> WASM prover -> server -> usage settlement and signed next state
   indexer                 SQLite transcripts
      |
      v
-Anchor SOL vault <-------- challenge service
+Anchor USDC vault <------- challenge service
 ```
 
 `protocol/rust/crates/zkapi-types/src/wire.rs` defines the protocol's JSON
@@ -31,7 +31,7 @@ messages. Runtime handlers in `crates/zkapi-serverd/src/routes.rs` and
 The active circuit revision is `zkapi-v2-concession-v1`, using the v2 JSON
 shapes and public-input order. The proving/verifying keys and vault's Groth16
 adapter must match that circuit and setup. Pin the circuit ID, artifact hashes,
-Solana program/vault/genesis identity, Pyth source, and server signing keys for
+Solana program/vault/genesis identity, USDC mint, treasury token account, and server signing keys for
 the configured deployment.
 
 BN254 field values use `0x`-prefixed hexadecimal strings. Solana-derived `u64`

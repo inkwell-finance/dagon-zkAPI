@@ -8,16 +8,17 @@ Inference runs directly against the issued provider key.
 | GET | `/health` | Process and deployment summary |
 | GET | `/v1/attestation` | Public signing keys and protocol pins |
 | GET | `/v2/auth` | Validate the configured testnet shared password without side effects |
-| GET | `/v2/billing/quote` | Finalized native-SOL/Pyth billing quote observed by the server |
 | POST | `/v2/openrouter/leases` | Verify proof and reserve a bounded runtime key |
 | GET | `/v2/openrouter/leases/{client_request_id}` | Non-secret lease status |
 | POST | `/v2/openrouter/leases/{client_request_id}` | Retire and settle the exact lease |
-| POST | `/v2/openrouter/leases/{client_request_id}/expire` | Authoritative recovery of an expired or superseded unaccepted request |
 | POST | `/v2/withdraw/clearance` | Mutual-close Schnorr clearance |
-| POST | `/v2/ledger/deposits/prepare` | Prepare ordered Solana deposit messages |
+| POST | `/v2/ledger/deposits/prepare` | Prepare ordered Solana USDC deposit messages |
 | POST | `/v2/ledger/withdrawals/prepare` | Prepare ordered Solana mutual-close messages |
 | POST | `/v2/ledger/escapes/prepare` | Prepare ordered Solana escape messages |
 | POST | `/v2/ledger/escapes/finalize/prepare` | Prepare Solana escape finalization |
+| POST | `/v2/ledger/escapes/release/prepare` | Prepare release of a parked escape payout (`{payer, note_id}`) |
+| POST | `/v2/ledger/escapes/rent-refund/prepare` | Prepare refund of parked escape rent to the escaper (`{payer, note_id}`) |
+| POST | `/v2/ledger/usdc-accounts/prepare` | Prepare idempotent creation of `owner`'s canonical USDC token account, rent paid by `payer` (`{payer, owner}`) |
 | GET | `/v2/requests/{client_request_id}` | Recover signed settlement |
 | GET | `/v2/nullifiers/{nullifier}` | Recover by nullifier |
 
@@ -29,16 +30,24 @@ transport and credential-lifecycle contract. `mainnet-beta` refuses the gate.
 
 A lease uses `ApiRequestV2`: client request ID, canonical prompt-free payload,
 payload hash, public inputs and `{backend: "groth16_bn254", proof: "base64..."}`.
-The authorization payload includes mode/version and its frozen `billing_quote`.
-The server recomputes payload/request binding, validates the native quote and
-verifies the proof. Proof bytes contain eight canonical 32-byte coordinates
-(256 bytes total). Public inputs, proof coordinates and circuit ID are unchanged.
+The authorization payload is exactly
+`{"mode":"openrouter_ephemeral_lease","version":1}`. The server recomputes
+payload/request binding and verifies the proof. Proof bytes contain eight
+canonical 32-byte coordinates (256 bytes total). Public inputs, proof
+coordinates and circuit ID are unchanged.
 
 The runtime key is returned once. Retry/recovery must preserve the exact saved
-request and journal, including quote and proof. A native lamport solvency bound is
-converted to the provider's USD budget using the frozen quote. Settlement uses
-actual provider usage converted back to lamports, then verifies/installs a signed
-next balance. An unavailable receipt must not be treated as zero usage.
+request, journal and proof. Credits are USDC base units (micro-USDC) billed as
+micro-USD with no price conversion: the proof-bound `solvency_bound` (at least
+the $1 `request_charge_cap`) is the provider spend limit in micro-USD, and
+settlement charges actual provider usage rounded up to whole micro-USD, capped
+at that bound, then verifies/installs a signed next balance. An unavailable
+receipt must not be treated as zero usage.
+
+Withdrawal and escape prepare bodies take `destination` = the payout USDC token
+account (any owner; clients default to the wallet's canonical associated token
+account and create it first with `/v2/ledger/usdc-accounts/prepare`). Deposits
+draw from the payer's canonical USDC token account.
 
 OA-org issuance includes verifier-backed station/org evidence checked by the
 browser's independently pinned verifier. Directly managed keys use durable

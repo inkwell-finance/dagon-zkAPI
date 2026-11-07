@@ -1,9 +1,9 @@
 ---
 title: Dagon zkAPI
-description: Private native-SOL API payments with note-bound Groth16 proofs
+description: Private USDC API payments with note-bound Groth16 proofs
 ---
 
-Dagon zkAPI lets a user fund a private note with native SOL and authorize API
+Dagon zkAPI lets a user fund a private note with USDC and authorize API
 usage with Groth16 proofs generated in the browser. Each accepted authorization
 consumes a nullifier; after usage settles, the server signs the next private
 balance and anchor.
@@ -17,8 +17,8 @@ BN254, Poseidon, note-bound Baby-JubJub commitments, and Schnorr signatures.
 <Callout type="warn" title="Deployment prerequisites">
 The implementation's fresh SBF build and complete funded local-validator
 lifecycle pass. A funded production rollout still requires an explicit setup
-trust decision plus review of the exact immutable program, vault and live Pyth
-accounts selected by the operator.
+trust decision plus review of the exact immutable program, vault and treasury
+token accounts selected by the operator.
 </Callout>
 
 ## What you get
@@ -26,7 +26,7 @@ accounts selected by the operator.
 <Cards>
   <Card title="Browser wallet" description="Wallet Standard signing, local proofs, durable stage journals, leases and withdrawal recovery." href="/docs/architecture" />
   <Card title="Private authorization" description="Prove membership and solvency without disclosing the funded note." href="/docs/protocol" />
-  <Card title="Native-SOL settlement" description="An Anchor vault verifies withdrawals and keeps only public note/account state." href="/docs/api-reference/vault" />
+  <Card title="USDC settlement" description="An Anchor vault holds classic-SPL USDC, verifies withdrawals and keeps only public note/account state." href="/docs/api-reference/vault" />
   <Card title="Ledger isolation" description="A generic CreditLedger boundary keeps request semantics independent of chain transport." href="/docs/architecture" />
 </Cards>
 
@@ -37,8 +37,8 @@ journals locally. It verifies exact deployment pins, generates proofs in WASM,
 and submits prepared Solana stages through Wallet Standard.
 
 **`dagon-zkapi serverd`** verifies proof authorizations, rejects nullifier
-reuse, issues short-lived provider credentials and settles measured usage using
-a pinned finalized Pyth SOL/USD quote.
+reuse, issues short-lived provider credentials and settles measured usage in
+USDC base units, one per metered micro-USD, with no price oracle.
 
 **The Anchor vault, finalized indexer and challenger** maintain the active note
 tree, verify on-chain Groth16 withdrawals, and challenge escape withdrawals

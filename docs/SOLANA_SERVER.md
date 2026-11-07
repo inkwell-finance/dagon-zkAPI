@@ -1,16 +1,16 @@
-# Dagon zkAPI server: Solana startup and SOL billing
+# Dagon zkAPI server: Solana startup and USDC billing
 
-Status: the bounded startup/SOL-billing package is accepted by Daybreak's
-security review in `docs/CODEX_PI_REPLY.md`. **Not approval for production
+Status: the earlier bounded startup/billing package was reviewed by Daybreak in
+`docs/CODEX_PI_REPLY.md` against the former native-SOL design; the USDC
+cutover described here has not been re-reviewed. **Not approval for production
 deployment or funded use.** Browser/native Solana transport uses exact
-decimal-string chain IDs and durable stage journals. Subsequent fresh SBF and
-local-validator lifecycle evidence is recorded in `docs/PORTING_STATUS.md`;
-that evidence does not establish compatibility with a selected live Pyth account.
+decimal-string chain IDs and durable stage journals. Local-validator lifecycle
+evidence is recorded in `docs/PORTING_STATUS.md`.
 
 ## Configuration
 
 Every shared parameter (protocol version, circuit ids, program id and
-executable hash, vault policy, server timing, Pyth receiver/feed/policy) is
+executable hash, USDC asset pins, vault policy, server timing) is
 compiled in from `solana/profile/shared.json`. There are no flags or
 environment variables for them. The operator supplies only the network identity
 file, the RPC URL and secrets (see [the Solana profile](solana-profile.md)):
@@ -48,7 +48,7 @@ read by `dagon-zkapi indexer`, `dagon-zkapi-indexerd` and
 `ZKAPI_CHALLENGE_SOLANA_KEYPAIR`).
 
 The identity file holds only the allowed per-network values: network label,
-genesis hash, vault authority, vault state, treasury and Pyth price account.
+genesis hash, vault authority, vault state and treasury token account.
 Unknown keys (including any shared parameter) are rejected, and the vault state
 must equal the PDA `["vault", authority]` of the compiled-in program id. All
 identities are canonical nonzero base58-encoded 32-byte values. The network
@@ -73,261 +73,60 @@ Before SQLite creation, workers, or listener binding:
 5. Read its finalized vault runtime view, validating owner,
    discriminator/decoding, PDA/bump and deployment binding, and require the
    vault version, request charge cap, note TTL and challenge period to equal
-   the profile.
+   the profile, the pinned mint to be the profile's USDC mint, the vault token
+   account to be the PDA `["vault-token", vault_state]` and the treasury token
+   account to equal the identity's `treasury_token_account`.
 6. Reject paused state or a mismatch in either public signing key derived from
    the configured seeds.
-7. Read a fresh finalized Pyth quote from the identity's price account through
-   the **same RPC**, with a separate genesis check. No tip, HTTP-price or
-   initial-root fallback exists.
-8. Use the finalized vault root to construct the processor with separate
-   `Arc<dyn CreditLedger>` and `Arc<dyn BillingPriceSource>` objects.
+7. Use the finalized vault root to construct the processor with its
+   `Arc<dyn CreditLedger>`. No tip or initial-root fallback exists, and no
+   price source is read: billing needs no oracle.
 
 The program must already be immutable. Do not revoke authority on a deployment
 just to satisfy this check without completing Daybreak's deployment review.
 
-## Pyth pins and quote validation
+## USDC billing and the stable HTTP/proof envelope
 
-The production reader uses official `pyth-solana-receiver-sdk = 1.2.0` with
-`anchor-lang = 0.32.1`. It uses the official account type's discriminator,
-owner and serialization/deserialization APIs, not a hand-written account layout.
-The SDK's broad transitive Solana range is resolved to `solana-program = 2.3.0`
-in the committed workspace lock; use locked builds.
+The vault holds Circle USDC (`EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`,
+6 decimals, classic SPL Token only; Token-2022 is rejected). One protocol
+credit is one USDC base unit, one micro-USDC, and the server bills it as one
+micro-USD. The conversion is the identity, so there is no price oracle, quote,
+quote expiry or market exposure between admission and settlement:
 
-Policy (receiver, push oracle, feed, shard, age and confidence come from the
-profile; the identity's price account must be the profile's push-oracle account):
+- Lease spend limit (micro-USD) = the request's proof-bound `solvency_bound`,
+  which must be in `1..=2^53 - 1` (browser-safe integers).
+- Charge (base units) = metered provider spend in micro-USD, rounded **up** to
+  a whole micro-USD, then capped at `solvency_bound`.
+- Unsafe bounds are errors, never saturation.
 
-- Receiver: `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`, verified against
-  the official `PriceUpdateV2::owner()`.
-- Feed: SOL/USD
-  `0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d`.
-- Price account: the push-oracle PDA `[push_shard_id (u16 LE), feed_id]`
-  (`7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE`, shard 0), declared in the
-  identity file and checked against the profile; never supplied by the API caller.
-- Maximum age: 90 seconds (the ceiling; see [Pyth sponsored feed](#pyth-sponsored-feed)).
-- Maximum confidence: 100 bps (1%).
-- Full verification only; partial guardian verification is rejected.
-- Non-executable data account, exact official allocated length, canonical official
-  serialization with zero trailing allocation padding, and posted slot no later
-  than the finalized response context.
-- Positive price, nonfuture publication, nonexpired quote, allowed exponent
-  `-18..=18`, and bounded confidence. No clamping or floating-point conversion.
+A request's `solvency_bound` must be at least the profile's
+`request_charge_cap`, 1,000,000 base units = $1, so the smallest lease is $1.
+Startup requires the cap to fit browser-safe units.
 
-The strict zero-padding rule deliberately rejects noncanonical allocation data.
-Review this against the actual pinned receiver account before release: an account
-with nonzero unused padding fails closed rather than being silently accepted.
+The lease authorization payload proven by the request proof is exactly
+`{"mode":"openrouter_ephemeral_lease","version":1}`; unknown fields are
+rejected. Settlement payloads and receipts carry no price data. Prepared
+ledger responses carry the chain ID as an exact **decimal string**, not a
+rounded JSON number. The dashboard
+summary reports `billing_asset: "usdc"`, `billing_unit: "micro_usdc"` and
+`asset: {symbol: "USDC", decimals: 6, mint}`.
+Dashboard event `charge_usd` and its running USD total represent the signed
+USDC charge divided by 1,000,000, not the unrounded upstream cost. The latter
+remains separately available as `usage.cost_usd`; it can differ after rounding
+or the proof-bound cap. The billing parity host test invokes the actual SDK
+with Node and compares server/SDK lease-limit IEEE-754 bits at rounding
+boundaries; run `npm ci` before the Rust workspace test gate.
 
-## Pyth sponsored feed
-
-### Source
-
-The pinned account is the push-oracle price account of the SOL/USD feed on
-shard 0, `7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE` (the PDA
-`[push_shard_id (u16 LE), feed_id]` of
-`pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT`, owned by the receiver). Pyth
-sponsors this feed on Solana for free: it posts a new guardian-verified update
-at least once a minute (heartbeat) and whenever the price moves by 0.5%
-([Pyth sponsored feeds](https://docs.pyth.network/pro/sponsored-feeds)). Dagon
-runs no price pusher and holds no Hermes key or price-posting payer; the server
-only reads the account.
-
-Every write goes through the push oracle's `update_price_feed`, which the
-receiver applies only after the Wormhole core bridge
-(`HDwcJBJXjL9FpJ7UBsYBtaDjsBUhuLCUYoz3zr8SWWaQ`) has verified the VAA against
-the current guardian set (`VerifyEncodedVaaV1`, recorded as `Full`), the
-message's Merkle proof matches the signed root, the message carries the
-account's feed, and the update is newer than the stored one. The server trusts
-no writer: it reads the finalized account itself and checks owner, canonical
-layout, full verification, feed, publish time, age and confidence (above).
-
-Measured on mainnet-beta on 2026-11-06 (finalized commitment). Earlier that
-day the account was pushed about every 53–55 s and its age ranged 2–58 s; the
-payer then was `4p16wya1Vw2u9w22oah4yXQgySb6eWKRRLMsEXCreish`, which pushes
-many other feeds and is most likely the sponsor. In a later 15-minute window a third party
-(`U91Qk9dq4MavGViv6pqWteUc8JaPcLXGAARQyQJvg8B`) pushed it every 10–30 s:
-414 samples, all fully verified, age 2.3–30.9 s (median 8.4 s), and each new
-update was readable at finalized commitment 2.3–5.4 s after its publish time.
-The sponsor then had nothing to push, as its heartbeat never came due. Such
-third-party pushes come and go and are not relied on: the bound below assumes
-only the sponsor. Every other fully verified SOL/USD account was days stale.
-
-### Maximum age: 90 s
-
-`pyth.max_age_seconds` is 90, and 90 is also the ceiling the profile parser,
-the server's quote validation and the SDK enforce
-(`dagon_zkapi_profile::PYTH_MAX_AGE_CEILING_SECONDS`, mirrored by the SDK's
-`PYTH_MAX_AGE_CEILING_SECONDS`; the single-profile parity rule is unchanged):
-
-- **Why not less.** A healthy sponsor leaves the finalized account up to one
-  heartbeat (60 s) plus the time to land and finalize the next update old. Any
-  limit below that refuses quotes for part of every heartbeat although nothing
-  is wrong: at the former 30 s, about half the time.
-- **Why 90.** 60 s heartbeat plus 30 s for landing, finalization (legacy
-  finality alone is about 13 s; measured publish→finalized 2–5 s) and RPC lag.
-- **Why not more.** 90 s is an availability allowance, not a bound on price
-  movement: a price can become economically stale before it expires. Older
-  prices are refused to limit that exposure in time. Raising the ceiling is a
-  source change to the profile crate and SDK requiring a new risk assessment.
-  Pyth explicitly warns that sponsored updates can be delayed; neither the
-  heartbeat nor the 0.5% trigger guarantees landing or finalization latency.
-
-### Timing budget
-
-| Window | Value | Relation to the 90 s maximum age |
-| --- | --- | --- |
-| Quote life | `expires_at = publish_time + 90` | a quote is usable from its read until then |
-| Age at quote read, healthy sponsor | nominally 60 s heartbeat + publication/landing/finalization/RPC delay | 15–25 s remaining is an estimate under 15–5 s delay, not a minimum; a successful quote may be arbitrarily close to expiry |
-| Client proof and submission | quote → lease 1.2 s warm, 3.7 s cold (previous native parity-stack measurements) | illustrative only; browser proof times are not measured here |
-| Admission | every new request reads `getGenesisHash` then finalized `getAccountInfo`, each with a 15 s timeout; expiry and supersession recheck after I/O, Groth16 verification, recheck at reservation | unexpired, previously observed quotes remain usable only within the 1% conservative-price tolerance; otherwise retriable `409` and nothing is reserved |
-| Request time | `request_time` within 300 s back, 30 s ahead | longer than 90 s; not binding |
-| Lease TTL, settlement grace | 300 s and 5 s from issuance; settlement uses the accepted quote without a freshness check | independent of the price age |
-| Challenge timing (`check_challenge_timing`) | TTL 300 + 2 × grace 5 + 2 × poll 2 + usage read 600 + raise lead 3,600 + margin 1,800 = 6,314 s ≤ 86,400 s | the price age is not a term; unchanged |
-| Startup | one fresh finalized quote, checked again after RPC | fails if no valid unexpired quote is available, even with a healthy sponsor but slow RPC |
-
-The 90 s policy accommodates the nominal sponsored cadence; it does not
-guarantee every proof or RPC completes before expiry. The two sequential RPC
-calls can consume nearly 30 s, apart from scheduling. The quote endpoint and
-startup recheck expiry and supersession after I/O; admission rechecks after I/O
-and proof verification. A device that misses expiry gets `409 native_quote_expired`
-without a new reservation; the SDK confirms nonacceptance before releasing
-the request. Browser proof latency and production RPC/finality tails must be
-measured separately. The published mainnet samples above are observations,
-not a worst-case bound.
-
-### Pricing exposure
-
-An older server-observed quote remains usable until `publish_time + 90` only
-if it passes the shared profile's `pyth.max_supersession_bps = 100` policy.
-For quoted conservative price `Q = price - confidence` and the newest observed
-conservative price `Qnew`, reject when `Qnew < 0.99 * Q`. Exactly 1% lower,
-unchanged and higher newer prices remain acceptable. The comparison uses exact
-integer arithmetic, including differing price exponents. The tolerance comes
-only from `solana/profile/shared.json`, with the same profile/parity rules as
-the age limit; it is not a runtime override.
-
-Every new admission performs a fresh finalized RPC read, even for a previously
-observed quote. A failed read has no cached fallback. The quote endpoint,
-startup and the final reservation check also enforce the newest-observed
-policy. A lower observation arriving during proof verification therefore
-causes `409 native_quote_superseded` before reservation; the SDK uses the
-existing nonacceptance recovery flow before preparing another proof. Exact
-retries of already reserved requests and settlement retain their frozen quote.
-
-This bounds **selection/gaming disparity against the newest observed price**:
-`Q/Qnew <= 1/0.99`, approximately 1.010101. At billed usage `U`, the value
-shortfall measured at `Qnew` is at most `0.01 * U`, inside a 5% markup's
-`U - U/1.05` margin before other costs. Both sides subtract actual confidence;
-the 100 bps confidence limit is an uncertainty ceiling, not an additional
-guaranteed 1% buffer. The sponsor's 0.5% trigger is an update policy, not a
-market-movement bound.
-
-After acceptance the price stays frozen through the 300 s lease TTL. That
-inherent SOL market risk is borne by the operator: for later realizable price
-`S`, billed-value shortfall is `U * max(0, 1 - S/Q)`, ignoring protective
-integer rounding. `U` is bounded by `ZKAPI_MAX_LEASE_USD` (default $10, configurable)
-per lease, not across all leases. Relative to the admission market price, the
-additional TTL exposure scales with that budget times the adverse SOL move;
-there is no guaranteed bound on the move itself. A sponsor stall is covered
-only by the 90 s age limit; RPC failure refuses admission, but an RPC returning
-a valid aged account can still lag the market. Neither the tolerance nor the
-fee insures against these unobserved or post-acceptance moves.
-
-### When the sponsor stalls: fail closed
-
-From the moment the finalized price is 90 s old (`now >= publish_time + 90`):
-
-- `GET /v2/billing/quote` answers `409 native_quote_expired`;
-- a new lease request answers `409 native_quote_expired` before any nullifier
-  is reserved or key minted, whether its quote was observed earlier or not;
-- server startup fails (the compose restart policy retries it);
-- there is no fallback: no other account, no Hermes read, no cached or
-  extrapolated price.
-
-Everything that needs no new price keeps working: `/health`, the tree,
-deposits, withdrawal clearances and closes, settlement and retirement of
-already issued leases (each with the quote it was accepted with), exact retries
-of requests reserved before the stall, and the challenger. Quoting resumes by
-itself with the sponsor's next update; no restart is needed.
-
-The parity stack exercises this: the lifecycle gate's `localnet_pyth` test
-stalls the replayed feed until the price is older than 90 s and requires the
-server's quote, lease admission and startup to refuse it, then resumes, and the
-gateway's `zkapi-full` e2e requires `409 native_quote_expired` from the running
-server between its two leases.
-
-### Monitoring and alerting
-
-No paid service is needed. Probe the server's own quote endpoint, which reads
-the pinned account through the server's RPC exactly as clients see it, from the
-host every 15 s (cron or a systemd timer), through the gateway published on
-`127.0.0.1:8080` by `docker/aws/compose.yml`:
-
-```sh
-# Prints the price age in seconds. Exits non-zero, naming the server's
-# error_code (native_quote_expired for a stale price), when it refuses to quote;
-# a connection failure leaves jq no input and also exits non-zero.
-curl -sS --max-time 10 http://127.0.0.1:8080/v2/billing/quote \
-  | jq -e 'if .publish_time then (now | floor) - .publish_time else error(.error_code // "no quote") end'
-```
-
-| Condition | Severity | Meaning |
-| --- | --- | --- |
-| the probe reports `native_quote_expired`, or the age exceeds 90 s | page | the sponsor has stalled: the server refuses every new quote and lease |
-| the probe fails otherwise (connection, 5xx, another `error_code`) | page | server, gateway or RPC unavailable, not a price problem |
-| the age exceeds 70 s on two consecutive probes | warn | the sponsor missed its 60 s heartbeat; quoting stops at 90 s |
-
-To check the account independently of the server, read it from any RPC
-(`getAccountInfo`, `encoding: base64`, `commitment: finalized`): the
-134-byte `PriceUpdateV2` data has the verification level at byte 40 (1 =
-`Full`) and `publish_time` as a little-endian `i64` at byte offset 93; its age
-is now minus that value.
-
-The local parity stack replays the sponsor's real mainnet updates instead of
-running a writer of its own (see
-[the Solana profile](solana-profile.md#local-parity-stack)).
-
-## Pricing and the stable HTTP/proof envelope
-
-`GET /v2/billing/quote` remains unchanged as a route. The returned top-level
-object is included under `billing_quote` in the exact payload authorized by the
-existing request proof. The SOL variant identifies `native_sol`, source,
-lamports, base units per SOL, ledger backend/network/vault, deployment binding,
-price account/receiver/feed, raw integer price/confidence/exponent and timestamps.
-Its chain ID is an exact **decimal string**, not a rounded JSON number.
-
-One credit is one lamport, and one SOL is exactly 1,000,000,000 credits. Arithmetic
-uses the conservative price `price - confidence`:
-
-- Lamports -> provider micro-USD budget: **floor**.
-- Settled provider micro-USD -> lamport charge: **ceil**.
-- Unsafe bounds and checked-arithmetic overflow are errors, never saturation.
-
-A request's proof bound (`solvency_bound`) must be at least the profile's
-`request_charge_cap`, 11,000,000 lamports, so the smallest lease is the cap
-converted at the quote's conservative price: about $1 at $90/SOL. The cap is
-fixed in lamports and pinned in the vault at initialization, so the smallest
-lease in USD moves with SOL (about $0.55 at $50/SOL, $2.20 at $200/SOL).
-
-### Quote observation cache
-
-The finalized SOL/USD price account can be updated while a client is
-generating a request proof, so "only the latest update" would reject honest
-requests. The oracle therefore remembers every quote
-it has itself read from the finalized price account, in a bounded cache whose
-entries expire at the quote's `expires_at`. Before first reservation the server
-accepts a submitted quote only if it is still fresh **and** exactly matches a
-cached observation; it rechecks freshness after I/O and again at synchronous
-proof validation/reservation. Unobserved, expired or mismatched quotes cannot
-issue access. A byte-identical already reserved request keeps its original
-accepted quote. Settlement never refreshes/substitutes that quote. No
-fixed/development-price implementation is included.
+USDC carries issuer risk the protocol cannot remove: Circle's freeze authority
+can freeze any USDC token account, including the vault token account itself,
+which would block every deposit, payout and treasury withdrawal until it is
+unfrozen. Users also need a little SOL for transaction fees and rent (operation
+buffer, nullifier and pending-withdrawal records, and their USDC token account).
 
 ## Validation limits
 
-Host tests exercise official serialized vault/Pyth fixtures against a mock
-finalized RPC, including pre-database negative cases. They are not evidence of a
-live Pyth deployment or a local-validator money lifecycle on their own. Daybreak
-subsequently reports a fresh SBF build and local-validator lifecycle in
-`docs/PORTING_STATUS.md`, separately from these startup tests. The former
-Windows checkpoint replacement failures are fixed; the server library passed
-94/94 at the package-review checkpoint. Production pins, setup decisions,
-secrets and live Pyth compatibility remain external release requirements.
+Host tests exercise serialized vault fixtures against a mock finalized RPC,
+including pre-database negative cases. They are not evidence of a
+local-validator money lifecycle on their own; that is reported separately in
+`docs/PORTING_STATUS.md`. Production pins, setup decisions and secrets remain
+external release requirements.

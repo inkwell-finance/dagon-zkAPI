@@ -19,7 +19,7 @@
 
 The client asks for clearance on the current withdrawal nullifier. The server
 reserves it and returns a clearance signature. The client proves the final
-balance and clearance, and the vault pays native SOL to the user's
+balance and clearance, and the vault pays USDC to the user's
 destination, accrues the operator share for the treasury, and marks the note
 `Closed`.
 

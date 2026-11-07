@@ -47,7 +47,7 @@ for the trust assumptions.
 The vault has an immutable verifier and signing keys. Its circuit, proof
 artifacts, denomination, and client pins must match exactly. Wallet state and
 recovery journals are bound to that configuration. See
-[the Solana server](SOLANA_SERVER.md) for asset and quote configuration.
+[the Solana server](SOLANA_SERVER.md) for asset and billing configuration.
 
 ## Challenge and settlement requirements
 

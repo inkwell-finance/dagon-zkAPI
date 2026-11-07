@@ -1,31 +1,34 @@
 ---
 title: serverd
-description: Note-bound proof authorization, native-SOL billing, prepared operations, and recovery
+description: Note-bound proof authorization, USDC billing, prepared operations, and recovery
 ---
 
 The server verifies Groth16-authorized direct OpenRouter leases, reserves
 nullifiers durably, and returns Schnorr-signed state transitions after usage
-settlement. The Solana backend uses one lamport per protocol credit and a pinned
-finalized Pyth SOL/USD quote.
+settlement. One protocol credit is one USDC base unit (micro-USDC), billed as
+one metered micro-USD: there is no price oracle or quote. A lease's spend limit
+is its proof-bound `solvency_bound` (at least $1); its charge is the metered
+spend rounded up to whole micro-USD, capped at that bound.
 
 ## Authorize a direct lease
 
 | Method and path | Purpose |
 |---|---|
-| `GET /v2/billing/quote` | Obtain the finalized native-SOL billing quote |
 | `POST /v2/openrouter/leases` | Verify an `ApiRequestV2`, reserve its nullifier, and return a spending-limited runtime key (201) |
 | `GET /v2/openrouter/leases/{client_request_id}` | Return non-secret lease timing, usage, and status |
 | `POST /v2/openrouter/leases/{client_request_id}` | Retire the lease using the original authenticated request |
-| `POST /v2/openrouter/leases/{client_request_id}/expire` | Reconcile an unaccepted native lease authorization |
 
 ## Prepare Solana wallet operations
 
 | Method and path | Purpose |
 |---|---|
-| `POST /v2/ledger/deposits/prepare` | Prepare the ordered staged deposit messages |
-| `POST /v2/ledger/withdrawals/prepare` | Prepare a mutual-close withdrawal |
-| `POST /v2/ledger/escapes/prepare` | Prepare escape initiation |
-| `POST /v2/ledger/escapes/finalize/prepare` | Prepare escape finalization |
+| `POST /v2/ledger/deposits/prepare` | Prepare the ordered staged deposit messages (from the payer's canonical USDC token account) |
+| `POST /v2/ledger/withdrawals/prepare` | Prepare a mutual-close withdrawal to `destination`, a payout USDC token account |
+| `POST /v2/ledger/escapes/prepare` | Prepare escape initiation to `destination`, a payout USDC token account |
+| `POST /v2/ledger/escapes/finalize/prepare` | Prepare escape finalization (`{payer, note_id}`) |
+| `POST /v2/ledger/escapes/release/prepare` | Prepare release of a parked escape payout (`{payer, note_id}`) |
+| `POST /v2/ledger/escapes/rent-refund/prepare` | Prepare refund of parked pending rent to the escaper (`{payer, note_id}`) |
+| `POST /v2/ledger/usdc-accounts/prepare` | Prepare idempotent creation of `owner`'s canonical USDC token account, rent paid by `payer` (`{payer, owner}`) |
 
 Each response repeats the exact backend, network, decimal-string chain ID,
 deployment binding, program and vault identity. The browser verifies that
@@ -44,7 +47,7 @@ ApiRequestV2 {
 }
 ```
 
-The prompt-free payload binds the billing quote and lease authorization.
+The prompt-free payload is exactly `{"mode":"openrouter_ephemeral_lease","version":1}`.
 Inference goes directly between the browser and OpenRouter. Issuance returns
 the runtime key once; recovery and lease-status responses never return that
 key. There is no ordinary proxy request endpoint.

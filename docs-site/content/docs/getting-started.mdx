@@ -3,7 +3,7 @@ title: Getting Started
 description: Build Dagon zkAPI and integrate the Solana browser wallet
 ---
 
-The repository contains the Anchor native-SOL vault, Rust proof/runtime code,
+The repository contains the Anchor USDC vault, Rust proof/runtime code,
 browser SDK and operator services.
 Use Node 24+, Rust, Solana CLI and Anchor 0.32.1.
 
@@ -46,8 +46,9 @@ const unsubscribe = client.subscribe(snapshot => renderBalance(snapshot));
 For Solana, the host supplies a Wallet Standard account with
 `solana:signTransaction`. The deployment configuration pins the finalized RPC,
 genesis hash, immutable program, vault-state PDA, exact decimal-string chain ID,
-Pyth identities, signing keys and proof hashes. The SDK owns private note state,
-proof generation, signed-transaction journals and recovery.
+USDC mint, treasury token account, signing keys and proof hashes. The SDK owns private note state,
+proof generation, signed-transaction journals and recovery. Wallets need USDC
+in their associated token account to deposit plus a little SOL for fees and rent.
 
 Never log note secrets, proof witnesses, provider credentials or signed
 transactions. Do not clear a durable stage journal from UI state.

@@ -3,8 +3,9 @@ info:
   title: Dagon zkAPI v2
   version: 2.0.0-testnet
   description: >-
-    Solana native-SOL lease, settlement, prepared-operation and withdrawal
-    Groth16 protocol API.
+    Solana USDC lease, settlement, prepared-operation and withdrawal Groth16
+    protocol API. Credits are USDC base units (micro-USDC), billed as
+    micro-USD without any price oracle.
     Non-mainnet deployments may require a shared password, advertised by public
     /health testnet_password_required. All service routes then require the
     TestnetPassword header and return 401 testnet_password_required when absent
@@ -34,33 +35,70 @@ paths:
                 properties:
                   authenticated: {const: true}
         "401": {$ref: "#/components/responses/TestnetPasswordRequired"}
-  /v2/billing/quote:
-    get:
-      summary: Read a finalized Pyth SOL/USD billing quote observed by the server
-      responses:
-        "200":
-          description: Native SOL/Pyth quote with exact deployment binding
-          content:
-            application/json:
-              schema: {$ref: "#/components/schemas/SolBillingQuote"}
   /v2/ledger/deposits/prepare:
     post:
-      summary: Prepare ordered Solana deposit messages for Wallet Standard signing
+      summary: Prepare ordered Solana USDC deposit messages for Wallet Standard signing
+      description: Draws from the payer's canonical USDC token account, which must exist and hold the amount.
       responses:
         "200": {description: Deployment-bound prepared operation and exact legacy messages}
   /v2/ledger/withdrawals/prepare:
     post:
       summary: Prepare an ordered Solana mutual-close operation
+      description: destination is the payout USDC token account (any owner); it must be creditable when the final balance is nonzero.
       responses:
         "200": {description: Deployment-bound prepared operation and exact legacy messages}
   /v2/ledger/escapes/prepare:
     post:
       summary: Prepare an ordered Solana escape initiation
+      description: destination is the payout USDC token account (any owner) and must be creditable at escape time.
       responses:
         "200": {description: Deployment-bound prepared operation and exact legacy messages}
   /v2/ledger/escapes/finalize/prepare:
     post:
       summary: Prepare Solana escape finalization
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PendingEscapeBody"}
+      responses:
+        "200": {description: Deployment-bound prepared operation and exact legacy messages}
+  /v2/ledger/escapes/release/prepare:
+    post:
+      summary: Prepare release of a parked escape payout to its bound destination
+      description: Permissionless and retryable; pays only the proof-bound destination token account.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PendingEscapeBody"}
+      responses:
+        "200": {description: Deployment-bound prepared operation and exact legacy messages}
+  /v2/ledger/escapes/rent-refund/prepare:
+    post:
+      summary: Prepare refund of parked pending-escape rent to the escaper
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PendingEscapeBody"}
+      responses:
+        "200": {description: Deployment-bound prepared operation and exact legacy messages}
+  /v2/ledger/usdc-accounts/prepare:
+    post:
+      summary: Prepare idempotent creation of an owner's canonical USDC token account
+      description: Associated Token Account CreateIdempotent; payer pays the rent.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [payer, owner]
+              properties:
+                payer: {type: string, description: Base58 fee and rent payer}
+                owner: {type: string, description: Base58 token account owner}
       responses:
         "200": {description: Deployment-bound prepared operation and exact legacy messages}
   /v2/openrouter/leases:
@@ -138,32 +176,13 @@ components:
               error: {const: "testnet password required or invalid"}
               retriable: {const: false}
   schemas:
-    SolBillingQuote:
+    PendingEscapeBody:
       type: object
-      description: >-
-        Accepted in a request authorization only while fresh and only if the
-        server itself observed it from the finalized price account.
       additionalProperties: false
-      required: [asset, source, credit_unit, base_units_per_asset, chain_id, deployment_binding, backend, network, vault, feed_id, feed_account, receiver_program, price, exponent, confidence, publish_time, expires_at, posted_slot]
+      required: [payer, note_id]
       properties:
-        asset: {const: native_sol}
-        source: {type: string}
-        credit_unit: {const: lamports}
-        base_units_per_asset: {const: 1000000000}
-        chain_id: {type: string, pattern: "^[0-9]+$", description: Exact decimal u64}
-        deployment_binding: {type: string}
-        backend: {const: dagon.solana.groth16.v1}
-        network: {type: string}
-        vault: {type: string, description: Base58 vault-state PDA}
-        feed_id: {type: string}
-        feed_account: {type: string}
-        receiver_program: {type: string}
-        price: {type: string, pattern: "^[1-9][0-9]*$"}
-        exponent: {type: integer}
-        confidence: {type: string, pattern: "^[0-9]+$"}
-        publish_time: {type: integer}
-        expires_at: {type: integer}
-        posted_slot: {type: integer}
+        payer: {type: string, description: Base58 fee payer}
+        note_id: {type: integer, minimum: 0}
     Groth16Proof:
       type: object
       required: [backend, proof]

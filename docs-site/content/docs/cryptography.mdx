@@ -7,7 +7,7 @@ description: Note-bound Groth16 proofs, Baby-JubJub commitments, and Schnorr sig
 
 The active v2 implementation uses **Groth16 over BN254**, with Poseidon hashes
 and Baby-JubJub commitments and signatures. The circuit revision is
-`zkapi-v2-concession-v1`. The browser SDK proves native-SOL lease
+`zkapi-v2-concession-v1`. The browser SDK proves USDC lease
 authorizations locally using the packaged WASM and matching proving keys.
 
 | Component | Current implementation |
@@ -92,11 +92,11 @@ authorization_tag = Poseidon(domain("zkapi.v2.auth"), x, request_context)
 ```
 
 The request context commits to the exact client request ID and payload digest.
-In the native-SOL flow, this is the prompt-free lease authorization payload,
-including its pinned billing quote. The server recomputes the context and
+For leases, this is the prompt-free lease authorization payload
+`{"mode":"openrouter_ephemeral_lease","version":1}`, which carries no price
+data. The server recomputes the context and
 checks the authorization tag, proof, deployment identity, current root, signing
-key, freshness window, charge cap and nullifier reservation. It separately
-validates the quote identity and freshness. This binds the proof to the exact
+key, freshness window, charge cap and nullifier reservation. This binds the proof to the exact
 lease authorization while keeping the nullifier the same for any attempt to
 spend that state again.
 

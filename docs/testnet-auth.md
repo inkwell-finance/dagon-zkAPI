@@ -16,8 +16,8 @@ The public `GET /health` response reports `chain_id` and
 `testnet_password_required`. Clients validate a supplied password with
 `GET /v2/auth` and header `X-ZKAPI-Testnet-Password`; success returns
 `{"authenticated":true}`. Send this header to the configured test protocol
-server for every `/v2/*` call, including quotes, lease status/retirement,
-settlement recovery, expiry recovery and withdrawal clearance. Never send it
+server for every `/v2/*` call, including lease issuance, status/retirement,
+settlement recovery, prepared ledger operations and withdrawal clearance. Never send it
 to an RPC, indexer, verifier, OA org, provider, or another network. Clients
 must not follow cross-origin redirects with this header.
 
@@ -66,5 +66,5 @@ on-chain escape path cannot be password-gated by this server.
 Before enabling the gate, distribute compatible clients and the password.
 After rollout, verify public health/attestation/indexer access, unauthenticated
 and wrong-password 401 responses, browser preflight, and authenticated
-`/v2/auth` and billing quote requests at both the origin and public HTTPS edge.
+`/v2/auth` requests at both the origin and public HTTPS edge.
 Read-only authentication checks do not establish paid inference or settlement.

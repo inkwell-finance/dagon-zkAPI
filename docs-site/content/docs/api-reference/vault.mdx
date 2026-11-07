@@ -1,17 +1,39 @@
 ---
 title: Dagon Solana Vault
-description: Native-SOL settlement with staged operations and on-chain Groth16 verification
+description: USDC settlement with staged operations and on-chain Groth16 verification
 ---
 
-`dagon_zkapi_vault` is an Anchor program that escrows native SOL, maintains the
-depth-32 note root, verifies request/withdrawal Groth16 proofs through Solana
-BN254 syscalls, and settles mutual or escape withdrawals. One protocol credit
-equals one lamport.
+`dagon_zkapi_vault` is an Anchor program that escrows Circle USDC
+(`EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`, 6 decimals, classic SPL Token;
+Token-2022 mints and accounts are rejected), maintains the depth-32 note root,
+verifies request/withdrawal Groth16 proofs through Solana BN254 syscalls, and
+settles mutual or escape withdrawals. One protocol credit equals one USDC base
+unit (one micro-USDC).
 
-The production program must be executable and permanently immutable. The vault
-PDA stores the cluster genesis hash, derived chain ID/deployment binding,
-treasury, request cap, signer keys, note/challenge policy, total credits and
-current root. Server and browser startup pin and recheck those values.
+The production program (`8cYsHTNTvS5DwNqFaJ3LDZo8ed1k53cdgWQVZqEN45BX`) must
+be executable and permanently immutable. The vault PDA stores the cluster
+genesis hash, derived chain ID/deployment binding, USDC mint, vault token
+account, treasury token account, request cap ($1 = 1,000,000 base units),
+signer keys, note/challenge policy, total credits, accrued treasury, deferred
+payouts and current root. Server and browser startup pin and recheck those
+values.
+
+## Token accounts
+
+- The vault token account is the PDA `["vault-token", vault_state]`, a classic
+  token account whose authority is the vault-state PDA, created by
+  `initialize`.
+- The treasury is one pinned classic USDC token account of any owner.
+- Withdrawal destinations are payout USDC token accounts of any owner:
+  wallets' associated token accounts, other keypair accounts, or PDA-owned
+  accounts (for example a CCTP forwarder). The program never derives an
+  associated token account; clients create the wallet's one first with
+  `CreateIdempotent`, paying its rent.
+- USDC's freeze authority can freeze any USDC token account. A frozen vault
+  token account blocks deposits and payouts until unfrozen; this is inherent
+  to USDC.
+- Users pay SOL transaction fees and rent for the operation buffer, note,
+  nullifier and pending accounts and any token account they create.
 
 ## Staged operations
 
@@ -36,8 +58,11 @@ wallet to sign a replacement operation.
 
 `execute_deposit(expected_note_id)` checks the empty-slot Merkle path against the
 current root, requires a nonzero amount no greater than `2^53 - 1`, transfers
-exactly that many lamports into the vault, creates the canonical note PDA and
-emits `NoteDeposited`.
+exactly that many base units from `source_token` into the vault token account
+(checking the vault's balance rose by exactly the amount), creates the
+canonical note PDA and emits `NoteDeposited`. The operation `owner` signs and
+pays rent; the source account's token authority (`depositor`) may be any
+signer, including a program PDA signing through CPI, and may equal the owner.
 
 The public registration commitment is derived from the private note secret.
 The secret and signed balance state never enter a Solana account.
@@ -46,10 +71,11 @@ The secret and signed balance state never enter a Solana account.
 
 `execute_close(note_id, nullifier)` verifies the withdrawal payload with
 `has_clearance = true`, `next_nullifier = 0` and `conceded = 0`, the actual
-writable destination account, the note fields, `valid_until`, an unused
+destination token account, the note fields, `valid_until`, an unused
 nullifier and immutable deployment fields. It takes no transition proof or root.
 On success it consumes the nullifier, pays the final private balance to the
-destination, accrues the spent remainder to `treasury_accrued`, and marks the note `Closed`.
+destination (failing if it cannot be credited; a zero balance skips the
+transfer), accrues the spent remainder to `treasury_accrued`, and marks the note `Closed`.
 
 The 32-byte Solana destination is domain-separated and hashed into the existing
 160-bit withdrawal public input. The program recomputes that binding from the
@@ -62,11 +88,10 @@ inputs, no clearance, no transition proof) and checks `now <= valid_until`, the
 note fields against the stored note, `f + c <= D`, and the nullifier states. It
 consumes the state nullifier `N` and its derived successor `N+`, and creates a
 pending-withdrawal PDA with `{nullifier, next_nullifier, state_balance,
-conceded, final_balance, destination, deadline}`. The leaf stays in the tree
-and nothing is paid immediately. The destination is passed writable and must be
-creditable at finalization (`DestinationNotCreditable` otherwise): a reserved
-key the runtime demotes to read-only, the vault, or the pending account would
-make finalization fail forever and lock the operator share.
+conceded, final_balance, destination, deadline, rent_payer, stage}`. The leaf
+stays in the tree and nothing is paid immediately. The destination token
+account must be creditable at initiation (initialized, not frozen, USDC mint,
+not the vault token account; `DestinationNotCreditable` otherwise).
 
 Nullifier accounts carry `status`: `0` released, `1` consumed, `2` challenged.
 They are created or updated tolerating pre-funded System-owned PDAs and are
@@ -88,12 +113,28 @@ archived request proof (`ChallengePayload { note_id, public_inputs, proof }`) fo
   value. It emits `EscapeConcessionRaised`, must strictly exceed the existing
   concession, does not change the deadline and does not preclude a later defeat.
 
-After the deadline, `finalize_escape(note_id)` is permissionless, pays the
-recorded destination amount and accrues the operator share to
-`treasury_accrued`. The pending account's rent, paid by the escaper, is refunded
-to that destination rather than to the caller. The browser keeps finalization in a
-separate durable journal. Exits never remove the leaf, so no instruction
-re-inserts one and no challenged note status exists.
+After the deadline, `finalize_escape(note_id)` is permissionless: it closes the
+note, accrues the operator share to `treasury_accrued`, and pays the recorded
+amount to the destination. If the destination can no longer be credited
+(closed, frozen, reassigned) the payout is parked: it is added to
+`deferred_payouts`, the pending account is kept, and `EscapeWithdrawalFinalized`
+reports `payout_deferred: true`. The browser keeps finalization in a separate
+durable journal. Exits never remove the leaf, so no instruction re-inserts one
+and no challenged note status exists.
+
+## Parked payouts and rent
+
+`release_escape_payout(note_id)` is permissionless and retryable forever, with
+no expiry or sweep. It pays a parked payout only to the proof-bound destination
+once it is creditable, emits `EscapePayoutReleased` and closes the pending
+account. A closed associated token account can be re-created by anyone; a
+closed non-ATA keypair account only by that keypair's holder; a destination
+frozen by USDC's freeze authority stays parked until unfrozen.
+
+The pending account's rent, paid by the escaper, is refunded only to the
+escaper, never to the caller or the destination. If the escaper's address has
+become executable, the rent stays parked and the permissionless
+`refund_pending_rent(note_id)` returns it to the escaper later.
 
 ## Closed leaves
 
@@ -127,8 +168,8 @@ into an expiry sweep.
 User close and finalize never touch the treasury account: the operator share
 (`D` minus the final balance) accrues to `vault.treasury_accrued`. The
 permissionless `withdraw_treasury()` flushes the accrued amount to the pinned
-treasury in a separate transaction, so a bad treasury account cannot block user
-exits.
+treasury token account in a separate transaction, so a bad treasury account
+cannot block user exits.
 
 ## Concession rule
 
@@ -143,8 +184,9 @@ new linkage appears only at exit (G3).
 ## Arithmetic and rejections
 
 Every credit-changing instruction uses checked integer arithmetic and reasserts
-vault lamport solvency: lamports cover active `total_credits` plus
-`treasury_accrued` plus rent. The program rejects exits while the pause is effective,
+solvency: `vault_token.amount >= total_credits + treasury_accrued +
+deferred_payouts`. USDC sent to the vault token account outside a deposit is
+permanent surplus. The program rejects exits while the pause is effective,
 stale roots/note IDs on deposits and retirements, replayed or superseded
 nullifiers, expired `valid_until`, malformed field elements, wrong PDAs/owners
 and mismatched staged payloads.

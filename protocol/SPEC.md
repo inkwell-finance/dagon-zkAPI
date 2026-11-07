@@ -135,33 +135,50 @@ The browser wallet receives storage and transport from its caller.
 ## Solana settlement
 
 The [Anchor vault program](../solana/programs/dagon-zkapi-vault/src/lib.rs)
-accounts in lamports. Every shared deployment parameter (program id, vault
-version, request charge cap, note TTL, challenge period, pause bounds, Pyth
-feed) comes from `solana/profile/shared.json`; only the network identity
-(genesis hash, vault authority and state, treasury, Pyth price account)
-differs between clusters.
+accounts in USDC base units (micro-USDC) of Circle USDC
+(`EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`, 6 decimals, classic SPL
+Token; Token-2022 is rejected). The server bills one base unit per metered
+micro-USD, so no price oracle exists. Every shared deployment parameter
+(program id, USDC asset, vault version, request charge cap of 1,000,000 base
+units, note TTL, challenge period, pause bounds) comes from
+`solana/profile/shared.json`; only the network identity (genesis hash, vault
+authority and state, treasury token account) differs between clusters.
 
-`initialize` creates the vault-state PDA `["vault", authority]`, derives
-`chain_id` and the deployment binding from the configured genesis hash, starts
-from the empty Poseidon root, and pins the treasury and the state and
-clearance signing keys. A deposit is staged in an operation buffer
-(`initialize_operation`, `write_operation`) and executed by `execute_deposit`.
-It must have positive amount within `2^53 - 1` lamports and the expiry
-`now + note_ttl` rounded up to a whole day. Because SBF cannot afford a
+`initialize` creates the vault-state PDA `["vault", authority]` and its USDC
+token account, the PDA `["vault-token", vault_state]` with the vault state as
+token authority, derives `chain_id` and the deployment binding from the
+configured genesis hash, starts from the empty Poseidon root, and pins the
+mint, the treasury token account and the state and clearance signing keys. A
+deposit is staged in an operation buffer (`initialize_operation`,
+`write_operation`) and executed by `execute_deposit`, which transfers exactly
+the amount from a USDC source account whose token authority (`depositor`) may
+be any signer, including a CPI PDA. It must have positive amount within
+`2^53 - 1` base units and the expiry `now + note_ttl` rounded up to a whole
+day. Because SBF cannot afford a
 Poseidon tree update, the deposit carries a Groth16 proof of the auxiliary
 Merkle-transition statement (`dagon-zkapi-solana-transition-v1`, 10 public
 inputs: protocol version, chain ID, deployment binding, old root, new root,
 note ID, registration, amount, expiry, inserting flag), which authenticates
 the new root for inserting the note leaf.
 
+Every mutation reasserts solvency:
+`vault_token.amount >= total_credits + treasury_accrued + deferred_payouts`.
+Tokens donated to the vault token account are permanent surplus.
+
 Treasury shares are pulled, not pushed: mutual close, finalize and
 `execute_claim_expired` add the operator share (or the swept deposit) to
 `treasury_accrued`, and the permissionless `withdraw_treasury` sends the
-accrued total to the pinned treasury (`TreasuryWithdrawn`). A treasury that
-cannot receive lamports therefore cannot block any user payout.
+accrued total to the pinned treasury token account (`TreasuryWithdrawn`). A
+treasury that cannot receive USDC therefore cannot block any user payout.
+
+The withdrawal destination bound by the proof is the payout USDC token account
+(any owner). Clients default it to the wallet's canonical associated token
+account and create that account first (caller pays rent); the program never
+derives one.
 
 Mutual close (`execute_close`) pays the user's final balance to the chosen
-destination and accrues the spent amount for the treasury, consumes the
+destination token account (failing if it cannot be credited; zero skips the
+transfer) and accrues the spent amount for the treasury, consumes the
 withdrawal nullifier, and marks the note `Closed`; the leaf stays in the tree
 until `retire_closed_leaf` (permissionless, `Closed`-only, with a removal
 transition proof) removes it. Exits never remove a leaf and never take a
@@ -174,8 +191,8 @@ nullifier `N+` (each a `["nullifier", vault, N]` PDA), records a
 pending withdrawal pays `final = state_balance - conceded` to the destination,
 where the proof reveals the concession `c` and requires `final + c <= D`.
 `valid_until` bounds how long a prepared exit proof can be submitted. The
-destination must be writable and neither the vault nor the pending account, so
-the later payout cannot fail.
+destination must be a creditable USDC token account (initialized, not frozen,
+not the vault token account) at initiation.
 
 Challenge (the leaf stays in the tree; there is no second phase and no restore):
 
@@ -191,8 +208,16 @@ Challenge (the leaf stays in the tree; there is no second phase and no restore):
   The payout becomes `state_balance - c'` (`EscapeConcessionRaised`). The
   deadline does not change and a later defeat is still possible.
 - Finalize (`finalize_escape(note_id)`) is permissionless after the deadline;
-  it pays the pending final balance to the destination and accrues the
-  remainder of the deposit for the treasury.
+  it closes the note, accrues the remainder of the deposit for the treasury and
+  pays the pending final balance to the destination. If the destination cannot
+  be credited then (closed, frozen, reassigned), the payout is parked in
+  `deferred_payouts` and the pending record kept; the permissionless
+  `release_escape_payout(note_id)` pays it, retryable forever and only to that
+  bound account. A closed non-associated keypair account can be re-created
+  only by its keypair holder; an account frozen by the USDC freeze authority
+  stays parked until unfrozen. Pending rent goes only to the escaper; if the
+  escaper's address became executable, `refund_pending_rent(note_id)` returns
+  it later.
 
 After a defeat the note sets `claimable_after` so an expiry sweep cannot occur
 before the user can exit again.

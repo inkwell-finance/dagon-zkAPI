@@ -14,7 +14,7 @@ Groth16 proofs on BN254 and Schnorr signatures on Baby-JubJub.
 |---|---|
 | `s` | User secret |
 | `R` | Registration commitment `Poseidon("zkapi.v2.reg", s, 0)` |
-| `D` | Native SOL deposit in integer lamports |
+| `D` | USDC deposit in integer base units (micro-USDC) |
 | `L` | Active note leaf `Poseidon("zkapi.v2.leaf", note_id, R, D, expiry)` |
 | `B` | Current private available balance |
 | `C(B, r, L)` | Note-bound commitment `B·G + r·H + L·J` |
@@ -35,8 +35,9 @@ See [Cryptography](/docs/cryptography) for the exact primitives and public input
 4. The wallet initializes `B = D`, `τ = 1`, and a random blinding `r`. Genesis
    requires no server signature; the circuit enforces the initial balance and anchor.
 
-The vault uses integer lamports and requires exactly `D` lamports. The proof
-statement treats credits as integers and does not embed an asset conversion.
+The vault uses integer USDC base units and requires that exactly `D` arrive in
+its token account. The proof statement treats credits as integers and does not
+embed an asset conversion; the server bills one base unit per metered micro-USD.
 
 ## Why the commitment includes the note
 
@@ -88,24 +89,25 @@ update before saving its next private state and clearing the pending journal.
 The browser sends a prompt-free lease authorization to
 `POST /v2/openrouter/leases`, uses the leased key directly with OpenRouter, and
 obtains its next signed state after retirement and usage settlement. The
-accepted native-SOL Pyth quote is part of the proof-bound authorization and
-stays fixed through recovery and settlement. The billing server does not proxy
+authorization carries no price: a $1 minimum `solvency_bound` is the lease's
+micro-USD spend limit. The billing server does not proxy
 inference requests.
 
 ## Refunds
 
 No funds move on-chain per request. Only the actual charge reduces the private
 balance; unused capacity under the solvency bound stays available. On close,
-the vault settles native SOL:
+the vault settles USDC:
 
 ```text
 payout_to_destination = B_final
 payout_to_treasury    = D − B_final
 ```
 
-These ledger amounts are lamports in the Solana backend.
-The withdrawal destination is proof-bound and may differ from the funding
-address.
+These ledger amounts are USDC base units. The withdrawal destination is the
+proof-bound payout USDC token account (any owner) and may differ from the
+funding address. An escape payout that cannot be credited at finalization is
+parked and later released, permissionlessly, only to that account.
 
 ## Withdrawal
 
@@ -186,8 +188,8 @@ with `execute_claim_expired` (no transition proof) after `claimable_at`.
 
 Use matching note-bound circuits, proving/verifying keys, browser WASM, and
 deployed verifiers. The vault's proof adapter and signing keys are immutable;
-client configuration must pin their deployed values. The SDK supports native
-SOL and rejects incompatible wallet formats without relabeling them.
+client configuration must pin their deployed values. The SDK supports USDC
+notes and rejects incompatible wallet formats without relabeling them.
 
 The current elliptic-curve construction is **not post-quantum**. The checked-in
 setup is single-party; no multiparty ceremony has been conducted.

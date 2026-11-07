@@ -2,8 +2,8 @@
 
 This note describes the active zkAPI v2 usage-credit protocol as deployed by
 Dagon on Solana. The implementation uses BN254 Groth16 proofs, BN254 Poseidon
-hashing, Baby-JubJub Schnorr signatures, and native SOL settlement in lamports
-by the Anchor vault program. The protocol is chain-neutral and descends from
+hashing, Baby-JubJub Schnorr signatures, and USDC settlement (classic SPL
+Token, one credit per micro-USDC) by the Anchor vault program. The protocol is chain-neutral and descends from
 upstream [ethereum/zkapi](https://github.com/ethereum/zkapi), whose EVM vault
 remains the Ethereum deployment. See [SPEC.md](SPEC.md) for exact public
 statements and [setup compatibility](setup/v2/README.md) for the current circuit
