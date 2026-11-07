@@ -37,7 +37,11 @@ function publicKeyBytes(value, label) {
     return result;
 }
 
-/** Decode enough of a legacy Solana message to enforce the pinned signer and program. */
+/**
+ * Decode enough of a legacy Solana message to enforce the pinned signer and
+ * program. The final (non-compute-budget) instruction is returned with its
+ * account metas and data for instruction-specific checks.
+ */
 export function inspectPreparedSolanaMessage(value) {
     const message = bytes(value, 'prepared Solana message');
     if (message.length < 3 + 1 + 32 + 32 + 1 || message.length + 65 > PACKET_LIMIT) {
@@ -47,6 +51,8 @@ export function inspectPreparedSolanaMessage(value) {
     if (requiredSignatures !== 1) {
         throw new Error('Dagon Solana wallet operations must require exactly one signature.');
     }
+    const readonlySigned = message[1];
+    const readonlyUnsigned = message[2];
     let cursor = 3;
     const accountCount = readShortVec(message, cursor, 'Solana account list');
     cursor = accountCount.offset;
@@ -55,9 +61,19 @@ export function inspectPreparedSolanaMessage(value) {
     }
     const accountsEnd = cursor + accountCount.value * 32;
     if (accountsEnd + 32 > message.length) throw new Error('Prepared Solana account list is truncated.');
+    if (readonlySigned >= requiredSignatures || readonlyUnsigned > accountCount.value - requiredSignatures) {
+        throw new Error('Prepared Solana message header is invalid.');
+    }
     const accounts = Array.from({ length: accountCount.value }, (_, index) => (
         message.slice(cursor + index * 32, cursor + (index + 1) * 32)
     ));
+    const meta = index => Object.freeze({
+        pubkey: accounts[index],
+        isSigner: index < requiredSignatures,
+        isWritable: index < requiredSignatures
+            ? index < requiredSignatures - readonlySigned
+            : index < accounts.length - readonlyUnsigned
+    });
     cursor = accountsEnd + 32; // Skip recent blockhash.
     const instructionCount = readShortVec(message, cursor, 'Solana instruction list');
     cursor = instructionCount.offset;
@@ -66,6 +82,8 @@ export function inspectPreparedSolanaMessage(value) {
     }
     let program;
     let vaultAccounts;
+    let finalAccounts;
+    let finalData;
     const budgets = new Set();
     for (let index = 0; index < instructionCount.value; index += 1) {
         if (cursor >= message.length) throw new Error('Prepared Solana instruction is truncated.');
@@ -85,6 +103,8 @@ export function inspectPreparedSolanaMessage(value) {
         program = accounts[programIndex];
         if (index === instructionCount.value - 1) {
             vaultAccounts = Array.from(indices, accountIndex => accounts[accountIndex]);
+            finalAccounts = Array.from(indices, meta);
+            finalData = message.slice(data.offset, data.offset + data.value);
             continue;
         }
         // Only the ledger's bounded heap/CU requests may precede the vault.
@@ -103,7 +123,8 @@ export function inspectPreparedSolanaMessage(value) {
         budgets.add(kind);
     }
     if (cursor !== message.length) throw new Error('Prepared Solana instruction data is malformed.');
-    return Object.freeze({ message, accounts, payer: accounts[0], program, vaultAccounts });
+    return Object.freeze({ message, accounts, payer: accounts[0], program, vaultAccounts,
+        instructionAccounts: finalAccounts, instructionData: finalData });
 }
 
 export function unsignedSolanaTransaction(message) {
@@ -181,7 +202,30 @@ export function base58Decode(value, expectedLength = null, label = 'base58 value
     return decoded;
 }
 
-function validatedTransaction(prepared, account, programId, vaultState) {
+// A message merges the privileges of a key used twice (the wallet is fee
+// payer and ATA owner), so a key may carry more privilege than its
+// instruction meta asks for, never less.
+function sameInstruction(inspected, expected) {
+    const program = publicKeyBytes(expected?.programId, 'expected instruction program');
+    const data = bytes(expected?.data, 'expected instruction data');
+    const keys = expected?.keys;
+    return Array.isArray(keys) && equalBytes(inspected.program, program)
+        && equalBytes(inspected.instructionData, data)
+        && inspected.instructionAccounts.length === keys.length
+        && keys.every((key, index) => {
+            const actual = inspected.instructionAccounts[index];
+            return equalBytes(actual.pubkey, publicKeyBytes(key.pubkey, 'expected instruction account'))
+                && (!key.isSigner || actual.isSigner) && (!key.isWritable || actual.isWritable);
+        });
+}
+
+/**
+ * Every wallet transaction targets the pinned vault program with the vault as
+ * account zero, unless the caller pins one exact non-vault instruction (the
+ * USDC account creation that precedes a payout), which must then match its
+ * program, data and ordered accounts exactly.
+ */
+function validatedTransaction(prepared, account, { programId, vaultState, expectedInstruction = null }) {
     if (!prepared || prepared.format !== MESSAGE_FORMAT) {
         throw new Error(`Prepared wallet transaction must use ${MESSAGE_FORMAT}.`);
     }
@@ -190,19 +234,25 @@ function validatedTransaction(prepared, account, programId, vaultState) {
     }
     const accountKey = publicKeyBytes(account?.publicKey, 'wallet account public key');
     const requiredSigner = publicKeyBytes(prepared.required_signers[0], 'required signer');
-    const pinnedProgram = publicKeyBytes(programId, 'pinned Dagon program ID');
-    const pinnedVault = publicKeyBytes(vaultState, 'pinned Dagon vault state');
     const inspected = inspectPreparedSolanaMessage(prepared.bytes);
     if (!equalBytes(requiredSigner, accountKey) || !equalBytes(inspected.payer, accountKey)) {
         throw new Error('Prepared Solana transaction requires a different wallet account.');
     }
-    if (!equalBytes(inspected.program, pinnedProgram)) {
-        throw new Error('Prepared Solana transaction targets a different program.');
-    }
-    // Every vault-program wallet instruction takes the vault as account zero.
-    // An unused key or trailing Anchor remaining-account is not a deployment pin.
-    if (!inspected.vaultAccounts.length || !equalBytes(inspected.vaultAccounts[0], pinnedVault)) {
-        throw new Error('Prepared Solana transaction does not use the pinned vault state.');
+    if (expectedInstruction) {
+        if (!sameInstruction(inspected, expectedInstruction)) {
+            throw new Error('Prepared Solana transaction is not the expected instruction.');
+        }
+    } else {
+        const pinnedProgram = publicKeyBytes(programId, 'pinned Dagon program ID');
+        const pinnedVault = publicKeyBytes(vaultState, 'pinned Dagon vault state');
+        if (!equalBytes(inspected.program, pinnedProgram)) {
+            throw new Error('Prepared Solana transaction targets a different program.');
+        }
+        // Every vault-program wallet instruction takes the vault as account zero.
+        // An unused key or trailing Anchor remaining-account is not a deployment pin.
+        if (!inspected.vaultAccounts.length || !equalBytes(inspected.vaultAccounts[0], pinnedVault)) {
+            throw new Error('Prepared Solana transaction does not use the pinned vault state.');
+        }
     }
     if (!Number.isSafeInteger(prepared.last_valid_height) || prepared.last_valid_height <= 0) {
         throw new Error('Prepared Solana transaction omitted its last valid block height.');
@@ -216,7 +266,7 @@ function validatedTransaction(prepared, account, programId, vaultState) {
  * Keeping this as a public, side-effect-free gate lets the durable journal
  * reject a foreign or malformed operation before it stores recovery bytes.
  */
-export function validatePreparedSolanaOperation({ operation, payer, programId, vaultState }) {
+export function validatePreparedSolanaOperation({ operation, payer, programId, vaultState, expectedInstruction = null }) {
     const transactions = operation?.transactions;
     if (!Array.isArray(transactions) || transactions.length === 0) {
         throw new Error('Prepared Solana operation contains no transactions.');
@@ -225,8 +275,7 @@ export function validatePreparedSolanaOperation({ operation, payer, programId, v
     return Object.freeze(transactions.map(prepared => validatedTransaction(
         prepared,
         account,
-        programId,
-        vaultState
+        { programId, vaultState, expectedInstruction }
     )));
 }
 
@@ -244,6 +293,7 @@ export async function submitPreparedSolanaOperation({
     operation,
     programId,
     vaultState,
+    expectedInstruction = null,
     signedTransactions = [],
     startIndex = 0,
     onSigned = async () => {},
@@ -276,7 +326,7 @@ export async function submitPreparedSolanaOperation({
     const results = [];
     for (let index = startIndex; index < transactions.length; index += 1) {
         const prepared = transactions[index];
-        const message = validatedTransaction(prepared, account, programId, vaultState);
+        const message = validatedTransaction(prepared, account, { programId, vaultState, expectedInstruction });
         let signed;
         const saved = signedTransactions[index];
         if (saved) {

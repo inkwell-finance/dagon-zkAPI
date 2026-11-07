@@ -1,4 +1,4 @@
-import { nativeFunding } from './helpers/native-fixtures.mjs';
+import { usdcFunding } from './helpers/usdc-fixtures.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -140,8 +140,8 @@ function seedRuntime(value) {
 }
 function makeRuntime() {
     const runtime = new singleton.constructor();
-    runtime.manifest = { deployment_id: DEPLOYMENT, billing_asset: 'native_sol' };
-    runtime.config = { wallet_core: {}, funding: nativeFunding() };
+    runtime.manifest = { deployment_id: DEPLOYMENT, billing_asset: 'usdc' };
+    runtime.config = { wallet_core: {}, funding: usdcFunding() };
     runtime.init = async () => runtime.snapshot();
     runtime.walletStatus = async () => ({ has_note: Boolean(runtime.runtime.state) });
     runtime.worker = { call: async (method, payload) => {
@@ -263,7 +263,7 @@ test('unsigned preparations are omitted and a journaled deposit stays pending un
     const pending = reloaded.snapshot().config.pending_deposit;
     assert.equal(pending.operation_id, 'deposit-operation');
     assert.equal(pending.phase, 'submitting');
-    assert.equal(pending.funding_quote_available, false, 'a journaled deposit is never re-quoted');
+    assert.equal(pending.replannable, false, 'a journaled deposit is never re-planned');
     assertSanitized(rows);
     assert.equal(indexedDB.stores.get('deposits').size, 0);
 });
@@ -313,39 +313,33 @@ test('withdrawal finality preserves deposit metadata before sanitizing the last 
     await assert.rejects(updateBrowserWithdrawal('old-return', { phase: 'pending' }), /cannot return to an earlier phase/);
 });
 
-test('prefunding drafts persist and rebase across reload without pending deposits or secret regeneration', async () => {
+test('a deposit plan is fixed per amount, replaceable only before any Solana journal exists', async () => {
     seedRuntime({});
     const runtime = makeRuntime();
     let generated = 0;
-    let root = '0x1';
     runtime.worker = { call: async method => {
         assert.equal(method, 'generateDeposit');
         generated += 1;
         return { secret: `secret-${generated}`, registration_commitment: `0x${generated}` };
     } };
-    runtime.nextDepositPath = async expected => ({ note_id: 3, active_root: expected ?? root, siblings: [root] });
-    const draft = await runtime.prepareDepositQuote(2_000_000, '0x1');
-    assert.equal(draft.secret, 'secret-1');
-    assert.equal((await readBrowserWalletSnapshot(DEPLOYMENT)).runtime.pendingDeposit, null);
-    assert.equal((await readBrowserWalletSnapshot(DEPLOYMENT)).deposits.length, 0);
-    root = '0x2';
+    runtime.nextDepositPath = async () => ({ note_id: 3, active_root: '0x1', siblings: ['0x1'] });
+    const prepared = await runtime.prepareDeposit(2_000_000);
+    assert.equal(prepared.secret, 'secret-1');
+    assert.equal(prepared.phase, 'prepared');
+    assert.equal((await readBrowserWalletSnapshot(DEPLOYMENT)).runtime.pendingDeposit.operationId, prepared.operationId);
     const reloaded = makeRuntime();
     reloaded.worker = runtime.worker;
     reloaded.nextDepositPath = runtime.nextDepositPath;
     await reloaded.reload();
-    const rebased = await reloaded.prepareDepositQuote(2_000_000, '0x2');
-    assert.equal(rebased.operationId, draft.operationId);
-    assert.equal(rebased.secret, draft.secret);
-    assert.equal(rebased.active_root, '0x2');
+    assert.equal(reloaded.snapshot().config.pending_deposit.replannable, true);
+    const same = await reloaded.prepareDeposit(2_000_000);
+    assert.equal(same.operationId, prepared.operationId);
     assert.equal(generated, 1, 'the same amount keeps its secret');
-    const promoted = await reloaded.prepareDeposit(2_000_000, { preparedOperationId: draft.operationId });
-    assert.equal(promoted.operationId, draft.operationId);
-    assert.equal(promoted.phase, 'prepared');
-    await assert.rejects(reloaded.prepareDeposit(2_000_000, { preparedOperationId: 'other-tab-quote' }),
-        /quote changed in another tab/);
-    // Once a Solana journal exists the plan can never change amount or re-quote.
-    await writeBrowserWallet({ deploymentId: DEPLOYMENT, pendingDeposit: { ...promoted, solanaJournal: { stages: [] } } });
+    const replaced = await reloaded.prepareDeposit(3_000_000);
+    assert.notEqual(replaced.operationId, prepared.operationId);
+    assert.equal(replaced.secret, 'secret-2');
+    // Once a Solana journal exists the plan can never change amount.
+    await writeBrowserWallet({ deploymentId: DEPLOYMENT, pendingDeposit: { ...replaced, solanaJournal: { stages: [] } } });
     await reloaded.reload();
-    await assert.rejects(reloaded.prepareDeposit(3_000_000), /previous Solana deposit is unfinished/);
-    await assert.rejects(reloaded.prepareDepositQuote(2_000_000, '0x2'), /Recover the existing private balance or deposit/);
+    await assert.rejects(reloaded.prepareDeposit(2_000_000), /previous Solana deposit is unfinished/);
 });

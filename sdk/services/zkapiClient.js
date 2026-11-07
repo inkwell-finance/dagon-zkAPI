@@ -1,8 +1,8 @@
 import { beginBrowserSdkInitialization } from '../configure.js';
 import browserWalletRuntime from './browserWalletRuntime.js';
-import { assertSolanaDepositsOpen, assertSolanaVault, formatUnits, parseUnits, readSolanaQuote,
-    solanaRpc, solanaUnitsForUsd, solanaUsdMicros, validateSolanaFunding, validateSolanaQuote }
-    from './zkapiNativeSol.mjs';
+import { assertSolanaDepositsOpen, assertSolanaVault, formatUnits, MICRO_USDC_PER_USDC, readUsdcTokenAccount,
+    solanaRpc, usdcAssociatedTokenAddress, usdcBaseUnits, USDC_DECIMALS, validateSolanaFunding,
+    vaultTokenAddress } from './zkapiUsdc.mjs';
 import { base58Decode, base58Encode } from './zkapiSolanaTransport.mjs';
 import { walletErrorMessage } from './zkapiWalletError.mjs';
 import { deriveExpiryRecords } from './zkapiExpiryHistory.mjs';
@@ -28,11 +28,14 @@ function readStoredWithdrawal() {
     }
 }
 
+// A withdrawal pays a USDC token account (any owner), never a wallet
+// address: the proof binds this exact account.
 function normalizeWithdrawalDestination(destination, funding) {
     if (destination === undefined) return null;
-    const normalized = base58Encode(base58Decode(destination, 32, 'Solana withdrawal address'));
-    if (normalized === funding?.vault_state) {
-        throw new TypeError('The withdrawal address cannot be the vault state account.');
+    const normalized = base58Encode(base58Decode(destination, 32, 'USDC payout token account'));
+    if (normalized === funding?.vault_state
+        || (funding && normalized === vaultTokenAddress(funding.program_id, funding.vault_state))) {
+        throw new TypeError('The withdrawal destination cannot be a Dagon vault account.');
     }
     return normalized;
 }
@@ -109,12 +112,12 @@ class ZkapiClient extends EventTarget {
         this.withdrawPromiseKey = null;
         this.finalizePromise = null;
         this.finalizePromiseKey = null;
+        this.releasePromise = null;
+        this.releasePromiseKey = null;
         this.depositPromise = null;
         this.depositPromiseKey = null;
         this.backgroundRefreshPromise = null;
         this.visibilityHandler = null;
-        this.solUsdQuote = null;
-        this.solUsdCheckedAt = 0;
     }
 
     async init() {
@@ -183,7 +186,7 @@ class ZkapiClient extends EventTarget {
     }
 
     get walletProviderBusy() {
-        return Boolean(this.depositPromise || this.withdrawPromise || this.finalizePromise);
+        return Boolean(this.depositPromise || this.withdrawPromise || this.finalizePromise || this.releasePromise);
     }
 
     setSolanaWallet(wallet = null, account = null) {
@@ -352,10 +355,6 @@ class ZkapiClient extends EventTarget {
                 this.challengePeriodSeconds = challengePeriod;
             }
             this.lastError = null;
-            if (!this.solUsdCheckedAt || Date.now() - this.solUsdCheckedAt > 60_000) {
-                this.solUsdCheckedAt = Date.now();
-                void this.refreshNativePrice().catch(() => {});
-            }
 
             const prepared = this.config?.prepared_withdrawal;
             if (prepared) {
@@ -391,71 +390,9 @@ class ZkapiClient extends EventTarget {
         return this.snapshot();
     }
 
-    get nativePriceQuote() {
-        for (const quote of [this.solUsdQuote, browserWalletRuntime.solUsdQuote]) {
-            try { return validateSolanaQuote(quote, this.config?.funding); }
-            catch { /* Only a current quote from this deployment may value SOL. */ }
-        }
-        return null;
-    }
-
-    async refreshNativePrice({ signal } = {}) {
-        const funding = this.config.funding;
-        const quote = await readSolanaQuote(funding, { signal });
-        if (funding !== this.config.funding
-            && funding.contract_address !== this.config.funding.contract_address) {
-            throw new Error('The payment deployment changed while checking the SOL price.');
-        }
-        this.solUsdQuote = quote;
-        this.solUsdCheckedAt = Date.now();
-        this.emitChange('price');
-        return quote;
-    }
-
-    async quoteDepositUsd(usd, { signal } = {}) {
-        const price = await this.refreshNativePrice({ signal });
-        const amount = solanaUnitsForUsd(usd, price);
-        return Object.freeze({
-            amount: String(amount),
-            depositLamports: String(amount),
-            solAmount: formatUnits(amount, 9),
-            usdAmount: formatUnits(parseUnits(usd, 6), 6),
-            priceUpdatedAt: price.publish_time,
-            price,
-            chainId: this.config.funding.chain_id,
-            contractAddress: this.config.funding.contract_address
-        });
-    }
-
-    /**
-     * Fix a private note's secret and vault slot for an exact amount before
-     * the user funds a wallet. Nothing is signed or submitted.
-     */
-    async prepareDepositQuote(amountInput, { from } = {}) {
-        if (!this.initialized) await this.init();
-        base58Decode(from, 32, 'Solana funding address');
-        const funding = this.config.funding;
-        const amount = parseUnits(amountInput, 9);
-        if (amount <= 0n || amount > BigInt(Number.MAX_SAFE_INTEGER)) {
-            throw new Error('Choose a smaller positive deposit amount.');
-        }
-        const vault = assertSolanaDepositsOpen(await assertSolanaVault(funding));
-        const plan = await browserWalletRuntime.prepareDepositQuote(Number(amount), vault.root);
-        // Never return the durable secret, note witness, or runtime object.
-        return Object.freeze({
-            operationId: plan.operationId,
-            commitment: plan.commitment,
-            amount: String(amount),
-            depositLamports: String(amount),
-            chainId: funding.chain_id,
-            contractAddress: funding.contract_address,
-            payer: from
-        });
-    }
-
+    /** Billing is exact: one USDC base unit is one micro-USD. */
     get creditsPerUsd() {
-        const quote = this.nativePriceQuote;
-        return quote ? Number(solanaUnitsForUsd('1', quote)) : Number.NaN;
+        return Number(MICRO_USDC_PER_USDC);
     }
 
     get hasNote() {
@@ -556,7 +493,7 @@ class ZkapiClient extends EventTarget {
     }
 
     get billingTokenSymbol() {
-        return 'SOL';
+        return 'USDC';
     }
 
     get isMainnetFunding() {
@@ -587,8 +524,7 @@ class ZkapiClient extends EventTarget {
 
     formatMoney(credits) {
         if (credits == null) return '—';
-        if (!this.nativePriceQuote) return '—';
-        const value = Number(solanaUsdMicros(credits, this.nativePriceQuote)) / 1_000_000;
+        const value = Number(credits) / Number(MICRO_USDC_PER_USDC);
         const digits = value > 0 && value < 0.01 ? 6 : 2;
         return new Intl.NumberFormat(undefined, {
             style: 'currency',
@@ -599,7 +535,7 @@ class ZkapiClient extends EventTarget {
     }
 
     formatBillingAmount(credits) {
-        return formatUnits(credits || 0, 9);
+        return formatUnits(credits || 0, USDC_DECIMALS);
     }
 
     formatExpiry(timestamp) {
@@ -656,13 +592,13 @@ class ZkapiClient extends EventTarget {
         return { wallet, account: selected, address: selected.address };
     }
 
-    async deposit(amountInput, onStatus = () => {}, { preparedOperationId = null } = {}) {
-        const key = JSON.stringify([String(amountInput).trim(), preparedOperationId]);
+    async deposit(amountInput, onStatus = () => {}) {
+        const key = String(amountInput).trim();
         if (this.depositPromise) {
             if (this.depositPromiseKey === key) return this.depositPromise;
             throw new Error('A different deposit action is already running.');
         }
-        const operation = this.performDeposit(amountInput, onStatus, { preparedOperationId });
+        const operation = this.performDeposit(amountInput, onStatus);
         this.depositPromise = operation;
         this.depositPromiseKey = key;
         try {
@@ -675,33 +611,41 @@ class ZkapiClient extends EventTarget {
         }
     }
 
-    async performDeposit(amountInput, onStatus = () => {}, { preparedOperationId = null } = {}) {
+    /**
+     * A new deposit moves USDC out of the wallet's canonical USDC account; the
+     * wallet also pays network fees and the note/operation rent in SOL.
+     */
+    async assertDepositFunds(address, amount) {
+        const funding = this.config.funding;
+        const source = await readUsdcTokenAccount(funding, usdcAssociatedTokenAddress(address));
+        if (!source) throw new Error('This wallet has no USDC account yet. Fund it with USDC before depositing.');
+        if (!source.creditable) throw new Error('This wallet’s USDC account is frozen and cannot fund a deposit.');
+        if (BigInt(source.amount) < amount) {
+            throw new Error('Your wallet’s USDC balance is below this deposit amount.');
+        }
+        const fees = await solanaRpc(funding, 'getBalance', [address, {
+            commitment: 'confirmed'
+        }], AbortSignal.timeout(20_000));
+        if (!Number.isSafeInteger(fees?.value) || fees.value < 0) {
+            throw new Error('The Solana RPC returned an invalid wallet balance.');
+        }
+        if (fees.value === 0) {
+            throw new Error('Your Solana wallet needs a little SOL for network fees and account rent besides the USDC deposit.');
+        }
+    }
+
+    async performDeposit(amountInput, onStatus = () => {}) {
         if (this.hasNote) throw new Error('This client already has an active private note.');
         const funding = this.config?.funding;
         validateSolanaFunding(funding);
-        const amount = parseUnits(amountInput, 9);
-        if (amount <= 0n || amount > BigInt(Number.MAX_SAFE_INTEGER)) {
-            throw new Error('Choose a smaller positive deposit amount.');
-        }
+        const amount = usdcBaseUnits(amountInput);
         onStatus('Checking the finalized Dagon vault…');
         await assertSolanaVault(funding);
         onStatus('Connecting to your Solana wallet…');
         const { wallet, account, address } = await this.connectSolanaWallet();
-        const balance = await solanaRpc(funding, 'getBalance', [address, {
-            commitment: 'finalized'
-        }], AbortSignal.timeout(20_000));
-        if (!Number.isSafeInteger(balance?.value) || balance.value < 0) {
-            throw new Error('The Solana RPC returned an invalid wallet balance.');
-        }
-        if (BigInt(balance.value) < amount) {
-            throw new Error('Your Solana wallet needs more SOL for this deposit and its network fees.');
-        }
 
         let plan = await browserWalletRuntime.pendingDeposit();
         if (plan) {
-            if (preparedOperationId && plan.operationId !== preparedOperationId) {
-                throw new Error('The deposit quote changed in another tab. Check the pending deposit before continuing.');
-            }
             if (Number(plan.amount) !== Number(amount)) {
                 throw new Error('A previous Solana deposit is unfinished. Recover it before changing the amount.');
             }
@@ -713,16 +657,20 @@ class ZkapiClient extends EventTarget {
                 onStatus('Every Solana stage finalized. Verifying the private note…');
                 const confirmed = await browserWalletRuntime.confirmSolanaDeposit();
                 await this.refresh({ quiet: true });
-                onStatus('Private SOL balance is ready.');
+                onStatus('Private USDC balance is ready.');
                 return confirmed;
             }
         }
 
-        if (!plan) {
-            onStatus('Generating the private note commitment locally…');
-            plan = await browserWalletRuntime.prepareDeposit(Number(amount), { preparedOperationId });
-        }
         if (!await browserWalletRuntime.currentSolanaOperationJournal('deposit')) {
+            // Only a deposit with no signed transaction can still spend the
+            // wallet's USDC; a resumed one already moved it.
+            onStatus('Checking your wallet’s USDC balance…');
+            await this.assertDepositFunds(address, amount);
+            if (!plan) {
+                onStatus('Generating the private note commitment locally…');
+                plan = await browserWalletRuntime.prepareDeposit(Number(amount));
+            }
             // Freeze a path against the finalized vault root before asking the
             // server to prepare any transaction bytes.
             const vault = assertSolanaDepositsOpen(await assertSolanaVault(funding));
@@ -742,7 +690,7 @@ class ZkapiClient extends EventTarget {
         onStatus('Verifying the finalized Solana note and Merkle root…');
         const confirmed = await browserWalletRuntime.confirmSolanaDeposit();
         await this.refresh({ quiet: true });
-        onStatus('Private SOL balance is ready.');
+        onStatus('Private USDC balance is ready.');
         return confirmed;
     }
 
@@ -751,8 +699,9 @@ class ZkapiClient extends EventTarget {
      * 'escape' exits unilaterally, conceding what the exit rules choose (0
      * from a fresh state, at most the last request's bound otherwise).
      * `earlyConcession` ('zero' | 'bound') forces an escape while that request
-     * may still be settling. The payout goes to `destination`, or to the
-     * connected Solana account when omitted.
+     * may still be settling. The payout goes to the USDC token account
+     * `destination` (any owner), or to the connected wallet's canonical USDC
+     * account when omitted; that account is created first when missing.
      */
     async withdraw(mode, onStatus = () => {}, { destination, earlyConcession = null } = {}) {
         const requestedDestination = normalizeWithdrawalDestination(destination, this.config?.funding);
@@ -790,7 +739,7 @@ class ZkapiClient extends EventTarget {
             throw new Error('The prepared Solana withdrawal belongs to a different private balance.');
         }
         if (requested && plan?.destination && requested !== plan.destination) {
-            throw new Error('This withdrawal is already bound to a different Solana destination.');
+            throw new Error('This withdrawal is already bound to a different USDC payout account.');
         }
         const savedJournal = await browserWalletRuntime.currentSolanaOperationJournal('withdrawal');
         if (savedJournal && (await browserWalletRuntime.resumeSolanaOperation('withdrawal')).completed) {
@@ -802,8 +751,16 @@ class ZkapiClient extends EventTarget {
 
         onStatus('Connecting to your Solana wallet…');
         const { wallet, account, address } = await this.connectSolanaWallet();
-        const destination = plan?.destination || requested || address;
+        const destination = plan?.destination || requested || usdcAssociatedTokenAddress(address);
         if (!savedJournal) {
+            // The proof binds the payout account, and the vault pays only a
+            // creditable USDC account: make it exist before proving.
+            onStatus('Checking the USDC payout account…');
+            await browserWalletRuntime.ensureUsdcPayoutAccount(destination, {
+                wallet,
+                account,
+                onProgress: progress => onStatus(solanaProgressMessage(progress, 'the USDC account creation'))
+            });
             onStatus(mode === 'mutual'
                 ? 'Requesting clearance and generating the withdrawal proof…'
                 : 'Generating the unilateral escape proof locally…');
@@ -819,7 +776,7 @@ class ZkapiClient extends EventTarget {
         const result = await browserWalletRuntime.confirmSolanaWithdrawal();
         await this.refresh({ quiet: true });
         onStatus(result.status === 'closed'
-            ? 'The private SOL balance was returned.'
+            ? 'The private USDC balance was returned.'
             : 'Escape started. The balance is secured for finalization after its challenge window.');
         return result;
     }
@@ -907,7 +864,7 @@ class ZkapiClient extends EventTarget {
         const onStatus = typeof recordIdOrStatus === 'function' ? recordIdOrStatus : maybeStatus;
         let withdrawal = hasRecordId
             ? this.withdrawals.find(record => record.recordId === recordIdOrStatus)
-            : this.withdrawals.find(record => record.mode === 'escape' && record.phase !== 'closed');
+            : this.withdrawals.find(record => record.mode === 'escape' && ['pending', 'finalizing'].includes(record.phase));
         if (withdrawal?.recordId) {
             withdrawal = await browserWalletRuntime.currentWithdrawal(withdrawal.recordId);
         }
@@ -926,7 +883,66 @@ class ZkapiClient extends EventTarget {
         });
         await this.refresh({ quiet: true });
         this.rememberWithdrawal(null);
-        onStatus('Escape finalized. The private SOL balance was returned.');
+        onStatus(result.status === 'payout_parked'
+            ? 'Escape finalized, but its USDC payout account cannot receive funds. The payout is parked in the vault until it is released to that account.'
+            : 'Escape finalized. The private USDC balance was returned.');
+        return result;
+    }
+
+    async releaseEscapePayout(recordIdOrStatus = null, maybeStatus = () => {}) {
+        const key = typeof recordIdOrStatus === 'string' ? recordIdOrStatus : 'selected';
+        if (this.releasePromise) {
+            if (this.releasePromiseKey === key) return this.releasePromise;
+            throw new Error('A different escape payout release is already running.');
+        }
+        const operation = this.performReleaseEscapePayout(recordIdOrStatus, maybeStatus);
+        this.releasePromise = operation;
+        this.releasePromiseKey = key;
+        try {
+            return await operation;
+        } finally {
+            if (this.releasePromise === operation) {
+                this.releasePromise = null;
+                this.releasePromiseKey = null;
+            }
+        }
+    }
+
+    /**
+     * Pay a parked escape payout to its proof-bound USDC account. The wallet's
+     * own canonical USDC account is recreated first when it was closed; any
+     * other payout account must be made creditable by its owner.
+     */
+    async performReleaseEscapePayout(recordIdOrStatus = null, maybeStatus = () => {}) {
+        const hasRecordId = typeof recordIdOrStatus === 'string';
+        const onStatus = typeof recordIdOrStatus === 'function' ? recordIdOrStatus : maybeStatus;
+        let withdrawal = hasRecordId
+            ? this.withdrawals.find(record => record.recordId === recordIdOrStatus)
+            : this.withdrawals.find(record => record.mode === 'escape'
+                && ['payout_parked', 'releasing'].includes(record.phase));
+        if (withdrawal?.recordId) {
+            withdrawal = await browserWalletRuntime.currentWithdrawal(withdrawal.recordId);
+        }
+        if (!['payout_parked', 'releasing'].includes(withdrawal?.phase)) {
+            throw new Error('There is no parked escape payout.');
+        }
+        onStatus('Connecting to your Solana wallet to release the payout…');
+        const { wallet, account } = await this.connectSolanaWallet();
+        if (withdrawal.phase === 'payout_parked') {
+            onStatus('Checking the USDC payout account…');
+            await browserWalletRuntime.ensureUsdcPayoutAccount(withdrawal.destination, {
+                wallet,
+                account,
+                onProgress: progress => onStatus(solanaProgressMessage(progress, 'the USDC account creation'))
+            });
+        }
+        const result = await browserWalletRuntime.submitSolanaEscapePayoutRelease(withdrawal.recordId, {
+            wallet,
+            account,
+            onProgress: progress => onStatus(solanaProgressMessage(progress, 'the Solana payout release'))
+        });
+        await this.refresh({ quiet: true });
+        onStatus('The parked USDC payout was released.');
         return result;
     }
 

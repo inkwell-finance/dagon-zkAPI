@@ -15,7 +15,6 @@ const EMPTY_RUNTIME = Object.freeze({
     state: null,
     journal: null,
     pendingDeposit: null,
-    depositQuote: null,
     preparedWithdrawal: null,
     lease: null,
     updatedAt: 0

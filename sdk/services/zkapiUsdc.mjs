@@ -1,7 +1,9 @@
 import { PublicKey, SystemProgram, TransactionInstruction } from '@solana/web3.js';
+import { sha256 } from '@noble/hashes/sha256';
+import { keccak_256 } from '@noble/hashes/sha3';
 import { browserSdkTransport } from '../configure.js';
 import { canonicalChainId } from './zkapiLedgerIdentity.mjs';
-import { base58Decode, base58Encode, inspectPreparedSolanaMessage }
+import { base58Decode, base58Encode, inspectPreparedSolanaMessage, validatePreparedSolanaOperation }
     from './zkapiSolanaTransport.mjs';
 
 export function parseUnits(value, decimals) {
@@ -36,6 +38,9 @@ const NOTE_DISCRIMINATOR = Uint8Array.from([148, 41, 201, 122, 175, 58, 113, 83]
 const PENDING_DISCRIMINATOR = Uint8Array.from([61, 103, 179, 177, 148, 199, 63, 171]);
 // sha256("global:execute_deposit")[..8], the Anchor instruction discriminator.
 const EXECUTE_DEPOSIT_DISCRIMINATOR = Uint8Array.from([247, 103, 46, 184, 88, 188, 56, 46]);
+const instructionDiscriminator = name => sha256(new TextEncoder().encode(`global:${name}`)).slice(0, 8);
+const INITIALIZE_OPERATION_DISCRIMINATOR = instructionDiscriminator('initialize_operation');
+const WRITE_OPERATION_DISCRIMINATOR = instructionDiscriminator('write_operation');
 const VAULT_STATE_LENGTH = 448;
 const NOTE_STATE_LENGTH = 110;
 const PENDING_STATE_LENGTH = 206;
@@ -541,11 +546,11 @@ export function assertSolanaDepositsOpen(state) {
  * the wallet as operation owner, rent payer and token authority, the pinned
  * USDC mint and the classic Token program (never Token-2022).
  */
-export function validatePreparedSolanaDeposit(operation, { funding, payer }) {
+export function validatePreparedSolanaDeposit(operation, { funding, payer, deposit }) {
     validateSolanaFunding(funding);
     const transactions = operation?.transactions;
-    if (!Array.isArray(transactions) || transactions.length === 0) {
-        throw new Error('The prepared Solana deposit has no transactions.');
+    if (!Array.isArray(transactions) || transactions.length !== 3) {
+        throw new Error('The prepared deposit must contain exactly three transactions: initialize, write and execute.');
     }
     const inspected = inspectPreparedSolanaMessage(transactions.at(-1).bytes);
     const metas = inspected.instructionAccounts;
@@ -578,6 +583,73 @@ export function validatePreparedSolanaDeposit(operation, { funding, payer }) {
         if (key(index) !== address || (writable && !meta.isWritable) || (signer && !meta.isSigner)) {
             throw new Error('The prepared Solana deposit does not move USDC from this wallet into the pinned vault.');
         }
+    }
+    // A pinned transfer destination is not enough: the operator supplies the
+    // staged bytes, including the note commitment and amount. Authorize the
+    // entire sequence against the wallet's private deposit plan before signing.
+    if (!deposit || !Number.isSafeInteger(deposit.expected_note_id)
+        || deposit.expected_note_id < 0 || deposit.expected_note_id > 0xffff_ffff
+        || !/^0x[0-9a-f]{1,64}$/i.test(deposit.commitment || '') || BigInt(deposit.commitment) === 0n
+        || BigInt(deposit.amount) <= 0n || BigInt(deposit.amount) > MAX_SAFE) {
+        throw new Error('A valid local deposit intent is required.');
+    }
+    validatePreparedSolanaOperation({ operation, payer: account(payer, 'deposit payer'),
+        programId: account(funding.program_id, 'vault program'), vaultState: account(funding.vault_state, 'vault') });
+    const initialize = inspectPreparedSolanaMessage(transactions[0].bytes);
+    const initData = initialize.instructionData;
+    if (initData.length !== 83 || !equalBytes(initData.slice(0, 8), INITIALIZE_OPERATION_DISCRIMINATOR)
+        || initData[40] !== 1) {
+        throw new Error('The prepared deposit must initialize a deposit operation.');
+    }
+    const operationAddress = PublicKey.findProgramAddressSync([
+        utf8('operation'), account(funding.vault_state, 'vault'), account(payer, 'payer'), initData.slice(8, 40)
+    ], new PublicKey(funding.program_id))[0].toBase58();
+    const checkAccounts = (instruction, expectedKeys) => {
+        if (instruction.instructionAccounts.length !== expectedKeys.length
+            || expectedKeys.some(([address, writable, signer], index) => {
+                const meta = instruction.instructionAccounts[index];
+                return base58Encode(meta.pubkey) !== address
+                    || (writable && !meta.isWritable) || (signer && !meta.isSigner);
+            })) throw new Error('The prepared deposit has substituted staging accounts.');
+    };
+    checkAccounts(initialize, [[funding.vault_state, false, false], [operationAddress, true, false],
+        [payer, true, true], [SYSTEM_PROGRAM_ID, false, false]]);
+    const total = initData[41] | initData[42] << 8;
+    // This deployment has one fixed 256-byte Groth16 transition proof. A
+    // larger buffer or fragmented writes only inflate wallet-paid rent/fees.
+    if (total !== 88 + 256) throw new Error('The staged deposit must have the canonical 344-byte payload.');
+    const payload = new Uint8Array(total);
+    let written = 0;
+    for (const transaction of transactions.slice(1, -1)) {
+        const write = inspectPreparedSolanaMessage(transaction.bytes);
+        const data = write.instructionData;
+        if (data.length < 15 || !equalBytes(data.slice(0, 8), WRITE_OPERATION_DISCRIMINATOR)) {
+            throw new Error('Only ordered deposit writes may precede execution.');
+        }
+        checkAccounts(write, [[funding.vault_state, false, false], [operationAddress, true, false], [payer, false, true]]);
+        const offset = data[8] | data[9] << 8;
+        const length = littleU32(data, 10);
+        if (offset !== written || length === 0 || length > 800
+            || data.length !== 14 + length || written + length > total) {
+            throw new Error('The staged deposit writes are incomplete or out of order.');
+        }
+        payload.set(data.subarray(14), written);
+        written += length;
+    }
+    const noteId = deposit.expected_note_id;
+    const noteSeed = new Uint8Array(4);
+    new DataView(noteSeed.buffer).setUint32(0, noteId, true);
+    const noteAddress = PublicKey.findProgramAddressSync([
+        utf8('note'), account(funding.vault_state, 'vault'), noteSeed
+    ], new PublicKey(funding.program_id))[0].toBase58();
+    if (key(1) !== operationAddress || key(2) !== noteAddress
+        || littleU32(inspected.instructionData, 8) !== noteId
+        || written !== total || !equalBytes(keccak_256(payload), initData.slice(43, 75))
+        || littleU32(payload, 0) !== noteId
+        || BigInt(felt(payload.slice(4, 36))) !== BigInt(deposit.commitment)
+        || littleU64(payload, 36) !== BigInt(deposit.amount)
+        || littleU32(payload, 84) !== total - 88) {
+        throw new Error('The staged deposit does not match the local note, amount and commitment.');
     }
     return operation;
 }

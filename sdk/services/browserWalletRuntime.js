@@ -4,13 +4,13 @@ import { sameFelt, waitForExpectedActiveRoot } from './zkapiActiveRoot.mjs';
 import { chooseEscapeConcession, exitProofLive, exitProofLiveUntil, exitProofValidUntil, reusableExitProof }
     from './zkapiExitPolicy.mjs';
 import { canonicalChainId, sameChainId } from './zkapiLedgerIdentity.mjs';
-import { assertSolanaVault, confirmFinalizedSolanaTransaction, isNativeSolFunding,
-    readFinalizedSolanaOperationState, readFinalizedSolanaTime, requestBillingQuote, sameSolanaQuote,
-    sendSignedSolanaTransaction, solanaUnitsForUsd, solanaUsdMicros, validateSolanaFunding,
-    validateSolanaQuote } from './zkapiNativeSol.mjs';
+import { assertSolanaVault, confirmFinalizedSolanaTransaction, isUsdcFunding, leaseLimitUsd,
+    readFinalizedSolanaOperationState, readFinalizedSolanaTime, readUsdcTokenAccount,
+    sendSignedSolanaTransaction, usdcAccountCreationKeys, usdcAssociatedTokenAddress, usdcBaseUnits,
+    validatePreparedSolanaDeposit, validateSolanaFunding, ASSOCIATED_TOKEN_PROGRAM_ID } from './zkapiUsdc.mjs';
 import { base58Decode, base58Encode, submitPreparedSolanaOperation }
     from './zkapiSolanaTransport.mjs';
-import { prepareLocalSolanaExit } from './zkapiSolanaExit.mjs';
+import { prepareLocalSolanaExit, prepareLocalUsdcAccountCreation } from './zkapiSolanaExit.mjs';
 import {
     assertSolanaOperationJournal,
     createSolanaOperationJournal,
@@ -130,7 +130,7 @@ function isExplicitlyRetriableLeaseError(error) {
     // These responses require a new proof or local lost-key reconciliation;
     // repeatedly sending the same lease request cannot resolve either state.
     return explicitlyRetriable
-        && !['stale_root', 'native_quote_expired', 'native_quote_superseded', 'lease_pending', 'lease_settlement_pending'].includes(error?.code);
+        && !['stale_root', 'lease_pending', 'lease_settlement_pending'].includes(error?.code);
 }
 
 function isExplicitlyRetriableLeaseRetirementError(error) {
@@ -520,12 +520,10 @@ class BrowserWalletRuntime extends EventTarget {
             ['vault_state', 'Solana vault state', String],
             ['genesis_hash', 'Solana genesis hash', String],
             ['wallet_standard_chain', 'wallet-standard chain', String],
-            ['base_units_per_asset', 'SOL asset scale', String],
-            ['pyth_receiver_program', 'Pyth receiver program', String],
-            ['pyth_price_account', 'Pyth price account', String],
-            ['pyth_feed_id', 'Pyth feed', lowercase],
-            ['pyth_max_age_seconds', 'Pyth freshness', Number],
-            ['pyth_max_confidence_bps', 'Pyth confidence bound', Number]
+            ['base_units_per_asset', 'USDC asset scale', String],
+            ['usdc_mint', 'USDC mint', String],
+            ['token_program', 'token program', String],
+            ['associated_token_program', 'associated token program', String]
         ]) requireEqual(manifest[field], trusted[field], label, normalize);
         requireEqual(manifest.rpc_url, trusted.rpc_url, 'Solana RPC', normalizedUrl);
         requireEqual(manifest.protocol_server_url, trusted.protocol_server_url, 'protocol server', normalizedUrl);
@@ -533,12 +531,12 @@ class BrowserWalletRuntime extends EventTarget {
         requireEqual(manifest.request_charge_cap, trusted.request_charge_cap, 'request charge cap', Number);
         for (const keyName of ['state_signing_key', 'clearance_signing_key']) {
             for (const coordinate of ['x', 'y']) {
-                requireEqual(
-                    manifest[keyName]?.[coordinate],
-                    trusted[keyName]?.[coordinate],
-                    `${keyName}.${coordinate}`,
-                    lowercase
-                );
+                const actual = manifest[keyName]?.[coordinate];
+                if (trusted[keyName]?.[coordinate] == null
+                    || !/^0x[0-9a-f]{1,64}$/i.test(actual || '')
+                    || !sameFelt(actual, trusted[keyName][coordinate])) {
+                    throw new Error(`The deployment manifest changed its pinned ${keyName}.${coordinate}.`);
+                }
             }
         }
         requireEqual(
@@ -628,8 +626,8 @@ class BrowserWalletRuntime extends EventTarget {
                 models: manifest.models || [],
                 suggested_deposit_amount: Number(browserConfig.suggested_deposit_amount || requestCap * 100),
                 rpc_url: manifest.rpc_url,
-                billing_token_symbol: 'SOL',
-                billing_token_decimals: 9,
+                billing_token_symbol: 'USDC',
+                billing_token_decimals: 6,
                 billing_asset: manifest.billing_asset,
                 billing_unit: manifest.billing_unit,
                 base_units_per_asset: manifest.base_units_per_asset,
@@ -638,11 +636,9 @@ class BrowserWalletRuntime extends EventTarget {
                 vault_state: manifest.vault_state,
                 genesis_hash: manifest.genesis_hash,
                 wallet_standard_chain: manifest.wallet_standard_chain,
-                pyth_receiver_program: manifest.pyth_receiver_program,
-                pyth_price_account: manifest.pyth_price_account,
-                pyth_feed_id: manifest.pyth_feed_id,
-                pyth_max_age_seconds: manifest.pyth_max_age_seconds,
-                pyth_max_confidence_bps: manifest.pyth_max_confidence_bps,
+                usdc_mint: manifest.usdc_mint,
+                token_program: manifest.token_program,
+                associated_token_program: manifest.associated_token_program,
                 note_ttl_seconds: Number(manifest.note_ttl_seconds || 0) || null
             }
         };
@@ -668,11 +664,11 @@ class BrowserWalletRuntime extends EventTarget {
             pending_deposit: pendingDeposit ? {
                 operation_id: pendingDeposit.operationId || null,
                 // A saved Solana journal means signed transactions may exist:
-                // the deposit can only be resumed, never re-quoted.
+                // the deposit can only be resumed, never re-planned.
                 phase: pendingDeposit.solanaJournal ? 'submitting' : (pendingDeposit.phase || 'prepared'),
                 amount: Number(pendingDeposit.amount),
-                funding_quote_available: Boolean(this.config?.funding)
-                    && this.canQuotePendingDeposit(pendingDeposit),
+                replannable: Boolean(this.config?.funding)
+                    && this.canReplanPendingDeposit(pendingDeposit),
                 next_note_id: Number(pendingDeposit.next_note_id)
             } : null,
             prepared_withdrawal: prepared ? {
@@ -719,7 +715,6 @@ class BrowserWalletRuntime extends EventTarget {
             storedRuntime.state
             || storedRuntime.journal
             || storedRuntime.pendingDeposit
-            || storedRuntime.depositQuote
             || storedRuntime.preparedWithdrawal
             || storedRuntime.lease
         );
@@ -864,8 +859,8 @@ class BrowserWalletRuntime extends EventTarget {
     async prepareSolanaLedgerOperation(kind, body) {
         await this.init();
         const funding = this.config?.funding;
-        if (!isNativeSolFunding(funding)) {
-            throw new Error('Prepared Solana operations require a Dagon native-SOL deployment.');
+        if (!isUsdcFunding(funding)) {
+            throw new Error('Prepared Solana operations require a Dagon USDC deployment.');
         }
         if (kind !== 'deposit') return prepareLocalSolanaExit(funding, kind, body);
         this.requireOnlineDeployment();
@@ -882,7 +877,9 @@ class BrowserWalletRuntime extends EventTarget {
             || prepared.operation.transactions.length === 0) {
             throw new Error('The prepared Solana operation belongs to a different deployment.');
         }
-        return prepared.operation;
+        // Authorize all staging bytes, not just the final USDC transfer:
+        // the operator must not replace the wallet's commitment or amount.
+        return validatePreparedSolanaDeposit(prepared.operation, { funding, payer: body.payer, deposit: body });
     }
 
     async prepareSolanaDepositOperation(payer, plan = this.runtime?.pendingDeposit) {
@@ -921,6 +918,58 @@ class BrowserWalletRuntime extends EventTarget {
         return this.prepareSolanaLedgerOperation('finalize', { payer, note_id: Number(noteId) });
     }
 
+    async prepareSolanaReleaseEscapePayoutOperation(payer, noteId) {
+        if (!Number.isSafeInteger(Number(noteId)) || Number(noteId) < 0) {
+            throw new Error('A valid note ID is required to release an escape payout.');
+        }
+        return this.prepareSolanaLedgerOperation('release', { payer, note_id: Number(noteId) });
+    }
+
+    /**
+     * Make sure a USDC payout account can be credited before an exit or a
+     * parked-payout release. The wallet's own canonical USDC account is
+     * created when missing (`CreateIdempotent`, rent paid by the wallet) in a
+     * separate, preceding transaction; any other payout account must already
+     * be an initialized, unfrozen classic USDC account.
+     */
+    async ensureUsdcPayoutAccount(destination, { wallet, account, signal = null, onProgress = () => {} } = {}) {
+        await this.init();
+        const funding = this.config.funding;
+        const payer = base58Encode(account?.publicKey);
+        if (account?.address !== payer) {
+            throw new Error('The Wallet Standard account address does not match its public key.');
+        }
+        const options = signal ? { signal } : undefined;
+        const existing = await readUsdcTokenAccount(funding, destination, options);
+        if (existing?.creditable) return existing;
+        if (existing || destination !== usdcAssociatedTokenAddress(payer)) {
+            const error = new Error(existing
+                ? 'The USDC payout account is frozen, uninitialized or holds another token.'
+                : 'The USDC payout account does not exist. Create it first, or withdraw to this wallet’s own USDC account.');
+            error.code = 'usdc_destination_not_creditable';
+            throw error;
+        }
+        const operation = await prepareLocalUsdcAccountCreation(funding, { payer }, options);
+        await submitPreparedSolanaOperation({
+            wallet,
+            account,
+            chain: funding.wallet_standard_chain,
+            operation,
+            expectedInstruction: {
+                programId: base58Decode(ASSOCIATED_TOKEN_PROGRAM_ID, 32, 'associated token program'),
+                keys: usdcAccountCreationKeys({ payer, owner: payer })
+                    .map(key => ({ ...key, pubkey: key.pubkey.toBytes() })),
+                data: [1]
+            },
+            sendSignedTransaction: event => sendSignedSolanaTransaction(funding, event, options),
+            confirmTransaction: event => confirmFinalizedSolanaTransaction(funding, event, options),
+            onProgress
+        });
+        const created = await readUsdcTokenAccount(funding, destination, options);
+        if (!created?.creditable) throw new Error('The wallet’s USDC account was not created.');
+        return created;
+    }
+
     solanaJournalPlan(scope) {
         if (scope === 'deposit') return this.runtime?.pendingDeposit || null;
         if (scope === 'withdrawal') return this.runtime?.preparedWithdrawal || null;
@@ -929,7 +978,7 @@ class BrowserWalletRuntime extends EventTarget {
 
     solanaJournalIdentity(plan, payer = null) {
         const funding = this.config?.funding;
-        if (!isNativeSolFunding(funding) || !plan?.operationId) {
+        if (!isUsdcFunding(funding) || !plan?.operationId) {
             throw new Error('A complete Dagon Solana operation is required.');
         }
         return {
@@ -1086,8 +1135,8 @@ class BrowserWalletRuntime extends EventTarget {
         await this.init();
         if (scope === 'deposit') this.requireOnlineDeployment();
         const funding = this.config?.funding;
-        if (!isNativeSolFunding(funding)) {
-            throw new Error('Solana wallet submission requires a Dagon native-SOL deployment.');
+        if (!isUsdcFunding(funding)) {
+            throw new Error('Solana wallet submission requires a Dagon USDC deployment.');
         }
         const publicKey = account?.publicKey;
         const payer = base58Encode(publicKey);
@@ -1106,6 +1155,12 @@ class BrowserWalletRuntime extends EventTarget {
             ...this.solanaJournalIdentity(this.solanaJournalPlan(scope)),
             payer
         });
+        if (scope === 'deposit') {
+            const plan = this.solanaJournalPlan(scope);
+            validatePreparedSolanaDeposit(journal.operation, { funding, payer,
+                deposit: { expected_note_id: Number(plan.next_note_id), commitment: plan.commitment, amount: plan.amount }
+            });
+        }
         const resume = resumeSolanaOperationJournal(journal);
         if (resume.completed) return [];
         return submitPreparedSolanaOperation({
@@ -1170,7 +1225,7 @@ class BrowserWalletRuntime extends EventTarget {
         );
         const note = operationState.note;
         if (!note || note.status !== 'active'
-            || note.commitment.toLowerCase() !== String(plan.commitment).toLowerCase()
+            || !sameFelt(note.commitment, plan.commitment)
             || BigInt(note.amount) !== BigInt(plan.amount)) {
             throw new Error('The finalized Solana note does not match this browser’s deposit.');
         }
@@ -1248,6 +1303,7 @@ class BrowserWalletRuntime extends EventTarget {
         // A raise may already have lowered the payout; the state balance and
         // the successor nullifier are fixed by the proof.
         if (plan.mode !== 'escape' || !note || note.status !== 'pending_withdrawal' || !pending
+            || pending.stage !== 'open'
             || pending.destination !== plan.destination
             || BigInt(pending.finalBalance) > finalBalance
             || BigInt(pending.stateBalance) !== terms.stateBalance
@@ -1275,6 +1331,10 @@ class BrowserWalletRuntime extends EventTarget {
         return { status: 'pending_withdrawal', record, signature, slot: operationState.slot };
     }
 
+    // An escape's pending record is driven by one durable journal at a time
+    // in the record's solanaFinalizeOperationId/solanaFinalizationJournal slot:
+    // `finalize` after the challenge window, then `release` only when the
+    // finalization parked the payout because the destination was not creditable.
     async currentSolanaFinalizationJournal(recordId) {
         const record = await this.currentWithdrawal(recordId);
         if (!record?.solanaFinalizationJournal) return null;
@@ -1285,25 +1345,30 @@ class BrowserWalletRuntime extends EventTarget {
         return record.solanaFinalizationJournal;
     }
 
-    async beginSolanaFinalizationJournal(recordId, payer, operation) {
+    async beginSolanaFinalizationJournal(recordId, payer, operation, kind = 'finalize') {
         const record = await this.currentWithdrawal(recordId);
-        if (!record || record.mode !== 'escape'
-            || !['pending', 'finalizing', 'awaiting_wallet'].includes(record.phase)) {
-            throw new Error('There is no pending Solana escape to finalize.');
+        const phases = kind === 'release'
+            ? ['payout_parked', 'releasing']
+            : ['pending', 'finalizing', 'awaiting_wallet'];
+        if (!record || record.mode !== 'escape' || !phases.includes(record.phase)) {
+            throw new Error(kind === 'release'
+                ? 'There is no parked Solana escape payout to release.'
+                : 'There is no pending Solana escape to finalize.');
         }
         const operationId = record.solanaFinalizeOperationId || uuid();
         const identity = this.solanaJournalIdentity({ operationId }, payer);
-        const created = createSolanaOperationJournal({ kind: 'finalize', ...identity, operation });
+        const created = createSolanaOperationJournal({ kind, ...identity, operation });
         if (record.solanaFinalizationJournal) {
             assertSolanaOperationJournal(record.solanaFinalizationJournal, identity);
-            if (JSON.stringify(record.solanaFinalizationJournal.operation)
-                !== JSON.stringify(created.operation)) {
-                throw new Error('A different Solana finalization plan is already saved.');
+            if (record.solanaFinalizationJournal.kind !== kind
+                || JSON.stringify(record.solanaFinalizationJournal.operation)
+                    !== JSON.stringify(created.operation)) {
+                throw new Error('A different Solana escape operation is already saved.');
             }
             return record.solanaFinalizationJournal;
         }
         const updated = await this.updateWithdrawal(recordId, {
-            phase: 'finalizing',
+            phase: kind === 'release' ? 'releasing' : 'finalizing',
             solanaFinalizeOperationId: operationId,
             solanaFinalizationJournal: created
         }, { expectedRevision: record.revision });
@@ -1321,13 +1386,23 @@ class BrowserWalletRuntime extends EventTarget {
         const journal = update(record.solanaFinalizationJournal);
         assertSolanaOperationJournal(journal, identity);
         const updated = await this.updateWithdrawal(recordId, {
-            phase: 'finalizing',
+            phase: journal.kind === 'release' ? 'releasing' : 'finalizing',
             solanaFinalizationJournal: journal
         }, { expectedRevision: record.revision });
         return updated.solanaFinalizationJournal;
     }
 
-    async submitSolanaFinalization(recordId, {
+    /** Finalize an unchallenged escape after its window; the payout may be parked. */
+    submitSolanaFinalization(recordId, options = {}) {
+        return this.submitSolanaPendingRecordOperation(recordId, 'finalize', options);
+    }
+
+    /** Pay a parked escape payout to its saved destination once that account is creditable. */
+    submitSolanaEscapePayoutRelease(recordId, options = {}) {
+        return this.submitSolanaPendingRecordOperation(recordId, 'release', options);
+    }
+
+    async submitSolanaPendingRecordOperation(recordId, kind, {
         wallet,
         account,
         signal = null,
@@ -1335,8 +1410,8 @@ class BrowserWalletRuntime extends EventTarget {
     } = {}) {
         await this.init();
         const funding = this.config.funding;
-        if (!isNativeSolFunding(funding)) {
-            throw new Error('Solana finalization requires a Dagon native-SOL deployment.');
+        if (!isUsdcFunding(funding)) {
+            throw new Error('Solana escape finalization requires a Dagon USDC deployment.');
         }
         const payer = base58Encode(account?.publicKey);
         if (account?.address !== payer) {
@@ -1345,9 +1420,14 @@ class BrowserWalletRuntime extends EventTarget {
         let record = await this.currentWithdrawal(recordId);
         if (!record) throw new Error('The saved escape is no longer available.');
         let journal = record.solanaFinalizationJournal || null;
+        if (journal && journal.kind !== kind) {
+            throw new Error('A different Solana escape operation is still saved for this record.');
+        }
         if (!journal) {
-            const operation = await this.prepareSolanaFinalizeEscapeOperation(payer, record.noteId);
-            journal = await this.beginSolanaFinalizationJournal(recordId, payer, operation);
+            const operation = kind === 'release'
+                ? await this.prepareSolanaReleaseEscapePayoutOperation(payer, record.noteId)
+                : await this.prepareSolanaFinalizeEscapeOperation(payer, record.noteId);
+            journal = await this.beginSolanaFinalizationJournal(recordId, payer, operation, kind);
             record = await this.currentWithdrawal(recordId);
         }
         const identity = this.solanaJournalIdentity({ operationId: record.solanaFinalizeOperationId });
@@ -1394,32 +1474,41 @@ class BrowserWalletRuntime extends EventTarget {
         record = await this.currentWithdrawal(recordId);
         journal = record.solanaFinalizationJournal;
         if (!resumeSolanaOperationJournal(journal).completed) {
-            throw new Error('The Solana finalization did not finalize every transaction stage.');
+            throw new Error('The Solana escape operation did not finalize every transaction stage.');
         }
         const operationState = await readFinalizedSolanaOperationState(
             funding,
             journal.operation,
             { noteId: Number(record.noteId) }
         );
-        // Finalization closes the note but keeps its leaf; no root changes.
-        if (operationState.pending || (operationState.note && operationState.note.status !== 'closed')) {
+        // Finalization closes the note but keeps its leaf (a release may
+        // follow its retirement); no root changes.
+        const { note, pending } = operationState;
+        const parked = pending?.stage === 'payout_parked';
+        if ((note && !['closed', 'retired'].includes(note.status))
+            || pending?.stage === 'open' || (parked && kind === 'release')) {
             throw new Error('The finalized Solana escape still has live note state.');
         }
         const slot = Number(operationState.slot);
         if (!Number.isSafeInteger(slot) || slot < 0) {
             throw new Error('The finalized Solana escape has an invalid slot.');
         }
+        const signature = journal.stages.at(-1)?.signature || null;
+        // A parked payout leaves the pending record with the vault; this
+        // record then waits for a release to the same saved destination.
         const finalized = await this.updateWithdrawal(recordId, {
-            phase: 'closed',
-            chainStatus: 'closed',
-            payoutVerified: true,
-            finalizeTransactionHash: journal.stages.at(-1)?.signature || null,
+            phase: parked ? 'payout_parked' : 'closed',
+            chainStatus: parked ? 'payout_parked' : 'closed',
+            payoutVerified: !parked,
+            ...(kind === 'release'
+                ? { releaseTransactionHash: signature }
+                : { finalizeTransactionHash: signature }),
             finalizedBlockNumber: slot,
             finalitySource: 'solana_finalized',
             error: null
         }, { expectedRevision: record.revision, sanitize: true });
-        return { status: 'closed', record: finalized,
-            signature: journal.stages.at(-1)?.signature || null, slot: operationState.slot };
+        return { status: parked ? 'payout_parked' : 'closed', record: finalized, signature,
+            slot: operationState.slot };
     }
 
     async treePath(noteId, requireExisting = true, expectedActiveRoot = null) {
@@ -1440,77 +1529,24 @@ class BrowserWalletRuntime extends EventTarget {
         }, expectedActiveRoot, { sleep: milliseconds => delay(milliseconds) });
     }
 
-    // Only a never-journaled plan can be re-quoted: once a Solana journal is
-    // saved, its signed transactions may already be on the network.
-    canQuotePendingDeposit(pending = this.runtime?.pendingDeposit) {
+    // Only a never-journaled plan can be re-planned (new amount or vault
+    // slot): once a Solana journal is saved, its signed transactions may
+    // already be on the network.
+    canReplanPendingDeposit(pending = this.runtime?.pendingDeposit) {
         return Boolean(pending && typeof pending.operationId === 'string' && pending.operationId
             && !pending.solanaJournal && (pending.phase || 'prepared') === 'prepared');
     }
 
-    async prepareDepositQuote(amount, expectedActiveRoot) {
-        await this.init();
-        this.requireOnlineDeployment();
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            await this.reload();
-            const pending = this.runtime.pendingDeposit;
-            if (this.runtime.state || (pending && !this.canQuotePendingDeposit(pending))) {
-                throw new Error('Recover the existing private balance or deposit before preparing another quote.');
-            }
-            if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('Invalid deposit amount.');
-            if (pending && pending.amount !== amount) {
-                throw new Error('The prepared deposit amount is fixed. Refresh its existing funding quote.');
-            }
-            const previous = pending || this.runtime.depositQuote;
-            const params = previous?.amount === amount ? previous
-                : await this.worker.call('generateDeposit');
-            const path = await this.nextDepositPath(expectedActiveRoot);
-            const draft = {
-                ...(pending || {}),
-                operationId: previous?.amount === amount ? previous.operationId : uuid(),
-                createdAt: previous?.amount === amount ? previous.createdAt : Date.now(),
-                amount,
-                secret: params.secret,
-                commitment: params.commitment || params.registration_commitment,
-                next_note_id: path.note_id,
-                active_root: path.active_root,
-                zero_path: path.siblings
-            };
-            // A new quote is only a draft. A rejected-before-broadcast pending
-            // plan can be requoted, but only for its original amount and identity.
-            // Neither path creates a claim, history entry or transaction.
-            await this.commit(pending
-                ? { ...this.runtime, depositQuote: null, pendingDeposit: draft }
-                : { ...this.runtime, depositQuote: draft });
-            return draft;
-        });
-    }
-
-    async prepareDeposit(amount, { preparedOperationId = null } = {}) {
+    async prepareDeposit(amount) {
         await this.init();
         this.requireOnlineDeployment();
         const plan = await withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             if (this.runtime.state) throw new Error('This browser already has an active private note.');
-            if (preparedOperationId && this.runtime.pendingDeposit?.operationId === preparedOperationId
-                && this.runtime.pendingDeposit.amount !== amount) {
-                throw new Error('The prepared deposit amount does not match the selected quote.');
-            }
-            if (preparedOperationId && this.runtime.pendingDeposit?.operationId !== preparedOperationId) {
-                const draft = this.runtime.depositQuote;
-                if (this.runtime.pendingDeposit || !draft || draft.operationId !== preparedOperationId
-                    || draft.amount !== amount) {
-                    throw new Error('The deposit quote changed in another tab. Refresh the quote before continuing.');
-                }
-                const promoted = { ...draft, phase: 'prepared' };
-                // Promotion is the explicit deposit action, atomic with the
-                // stale-quote check under the same cross-tab wallet lock.
-                await this.commit({ ...this.runtime, depositQuote: null, pendingDeposit: promoted });
-                return promoted;
-            }
             if (this.runtime.pendingDeposit) {
                 const pending = this.runtime.pendingDeposit;
                 if (Number(pending.amount) === Number(amount)) return pending;
-                if (!this.canQuotePendingDeposit(pending)) {
+                if (!this.canReplanPendingDeposit(pending)) {
                     throw new Error('A previous Solana deposit is unfinished. Recover it before changing the amount.');
                 }
                 await this.commit({ ...this.runtime, pendingDeposit: null });
@@ -1532,7 +1568,7 @@ class BrowserWalletRuntime extends EventTarget {
             // Persist the note secret before any wallet prompt. If the tab is
             // closed after the transactions are signed, the deposit can still
             // be resumed from its journal and confirmed from finalized state.
-            await this.commit({ ...this.runtime, depositQuote: null, pendingDeposit: plan });
+            await this.commit({ ...this.runtime, pendingDeposit: plan });
             return plan;
         });
         // Start only after deposit preparation's small WASM calls have left the
@@ -1555,7 +1591,7 @@ class BrowserWalletRuntime extends EventTarget {
             if (Number(pending.amount) !== Number(amount)) {
                 throw new Error('The prepared private note has a different deposit amount.');
             }
-            if (!this.canQuotePendingDeposit(pending)) {
+            if (!this.canReplanPendingDeposit(pending)) {
                 throw new Error('This deposit already has signed Solana transactions. Resume it before refreshing the vault path.');
             }
             const path = await this.nextDepositPath(expectedActiveRoot);
@@ -1629,23 +1665,14 @@ class BrowserWalletRuntime extends EventTarget {
         });
     }
 
-    async nativeBillingQuote(signal) {
-        const funding = this.config.funding;
-        const quote = validateSolanaQuote(
-            await this.remoteJson(`${funding.protocol_server_url}/v2/billing/quote`, { signal }),
-            funding
-        );
-        this.solUsdQuote = quote;
-        return quote;
-    }
-
-    leaseBudget(spendingLimitUsd, quote = null, { checkBalance = false } = {}) {
+    // A lease's budget is its USD tier in USDC base units: one micro-USDC
+    // per micro-USD, so no price conversion exists anywhere.
+    leaseBudget(spendingLimitUsd, { checkBalance = false } = {}) {
         if (!CHAT_SPENDING_TIER_USD.includes(Number(spendingLimitUsd))) throw new Error('Invalid private-balance model budget configuration.');
-        validateSolanaQuote(quote, this.config.funding, { allowExpired: true });
-        const amount = Number(solanaUnitsForUsd(spendingLimitUsd, quote));
+        const amount = Number(usdcBaseUnits(String(spendingLimitUsd)));
         if (checkBalance) {
             const balance = Number(this.runtime.state.current_balance);
-            if (!Number.isSafeInteger(balance) || balance < 0) throw new Error('Invalid private SOL balance.');
+            if (!Number.isSafeInteger(balance) || balance < 0) throw new Error('Invalid private USDC balance.');
             if (amount < Number(this.config.request_charge_cap)) throw new Error('This model budget is below the deployment’s minimum private-chat budget.');
             if (balance < amount) {
                 const error = new Error(`This model requires at least $${Number(spendingLimitUsd).toFixed(2)} in private balance for a new key. Choose a lower-cap model, or fund a larger balance.`);
@@ -1677,8 +1704,6 @@ class BrowserWalletRuntime extends EventTarget {
         const path = await this.treePath(this.runtime.state.note_id, true);
         throwIfAborted(signal);
         const now = Date.now();
-        const quote = await this.nativeBillingQuote(signal);
-        throwIfAborted(signal);
         // C2: one bound per state. A request proof already left the device at
         // this state (then discarded as unaccepted), so any new proof here
         // must carry that same bound: a raise is capped by the largest bound
@@ -1687,7 +1712,7 @@ class BrowserWalletRuntime extends EventTarget {
         const recordedBound = BigInt(this.runtime.state.bound_at_state ?? 0);
         const spendingLimitCredits = recordedBound > 0n
             ? Number(recordedBound)
-            : this.leaseBudget(spendingLimitUsd, quote, { checkBalance: true });
+            : this.leaseBudget(spendingLimitUsd, { checkBalance: true });
         onProgress('proving', 'Proving this chat is funded…');
         const prepared = await this.worker.call('prepareRequest', {
             config: {
@@ -1699,7 +1724,7 @@ class BrowserWalletRuntime extends EventTarget {
             },
             state: this.runtime.state,
             args: {
-                payload: JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1, billing_quote: quote }),
+                payload: JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1 }),
                 active_root: path.active_root,
                 merkle_siblings: path.siblings,
                 client_request_id: uuid(),
@@ -1719,7 +1744,7 @@ class BrowserWalletRuntime extends EventTarget {
         return prepared.request;
     }
 
-    async verifyLease(lease, expectedLimitCredits, expectedRequestId, onProgress = () => {}, signal = null, expectedQuote = null) {
+    async verifyLease(lease, expectedLimitCredits, expectedRequestId, onProgress = () => {}, signal = null) {
         throwIfAborted(signal);
         if (lease.status !== 'active'
             || lease.client_request_id !== expectedRequestId
@@ -1727,10 +1752,8 @@ class BrowserWalletRuntime extends EventTarget {
             || Number(lease.expires_at) <= Math.floor(Date.now() / 1000)) {
             throw new Error('The zkAPI server returned an unusable OpenRouter lease.');
         }
-        validateSolanaQuote(expectedQuote, this.config.funding, { allowExpired: true });
-        if (!sameSolanaQuote(lease.billing_quote, expectedQuote)
-            || Number(lease.spending_limit_usd) !== Number(solanaUsdMicros(expectedLimitCredits, expectedQuote)) / 1_000_000) {
-            throw new Error('The zkAPI server returned a child key with the wrong SOL spending cap or quote.');
+        if (Number(lease.spending_limit_usd) !== leaseLimitUsd(expectedLimitCredits)) {
+            throw new Error('The zkAPI server returned a child key with the wrong USD spending cap.');
         }
         exactTrustedUrl(lease.openrouter_api_base, this.config.openrouter.inference_base, 'OpenRouter inference origin');
         if (this.config.openrouter.require_oa_key_source && lease.key_source !== 'oa_org') {
@@ -1818,17 +1841,6 @@ class BrowserWalletRuntime extends EventTarget {
         }
     }
 
-    async requestLeaseWithQuoteRecovery(request, onProgress, signal) {
-        try {
-            return await this.requestLeaseWithRetry(request, onProgress, signal);
-        } catch (error) {
-            if (['native_quote_expired', 'native_quote_superseded'].includes(error?.code)) {
-                await this.recoverUnacceptedNativeQuote(request, signal);
-            }
-            throw error;
-        }
-    }
-
     async issueLease(sessionId, onProgress = () => {}, signal = null, spendingLimitUsd = 1) {
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             throwIfAborted(signal);
@@ -1847,19 +1859,18 @@ class BrowserWalletRuntime extends EventTarget {
             // spending policy. Finish that byte-identical request safely, but
             // never expose its legacy-cap key to the host application. Settle it
             // unused, install the signed receipt, then prove the selected budget.
-            const desiredLimitCredits = this.leaseBudget(spendingLimitUsd, requestBillingQuote(request));
+            const desiredLimitCredits = this.leaseBudget(spendingLimitUsd);
             if (Number(request.public_inputs.solvency_bound) !== desiredLimitCredits) {
                 try {
                     this.legacyMigrationInProgress = true;
                     reportRecovery('settling', 'Updating an unfinished temporary key…');
-                    const legacyLease = await this.requestLeaseWithQuoteRecovery(request, reportRecovery, signal);
+                    const legacyLease = await this.requestLeaseWithRetry(request, reportRecovery, signal);
                     await this.verifyLease(
                         legacyLease,
                         request.public_inputs.solvency_bound,
                         request.client_request_id,
                         reportRecovery,
-                        signal,
-                        requestBillingQuote(request)
+                        signal
                     );
                     // Persist recovery metadata, but deliberately never assign
                     // this legacy-cap key to activeLease. It cannot be returned
@@ -1897,7 +1908,7 @@ class BrowserWalletRuntime extends EventTarget {
             }
             let lease;
             try {
-                lease = await this.requestLeaseWithQuoteRecovery(request, onProgress, signal);
+                lease = await this.requestLeaseWithRetry(request, onProgress, signal);
             } catch (error) {
                 if (error.code === 'stale_root') {
                     await this.commit({ ...this.runtime, journal: null });
@@ -1909,8 +1920,7 @@ class BrowserWalletRuntime extends EventTarget {
                 request.public_inputs.solvency_bound,
                 request.client_request_id,
                 onProgress,
-                signal,
-                requestBillingQuote(request)
+                signal
             );
             throwIfAborted(signal);
             const activeLease = {
@@ -2302,11 +2312,6 @@ class BrowserWalletRuntime extends EventTarget {
         // is not installed while that proof can still land.
         if (await exitProofStillLive(this.runtime.preparedWithdrawal?.releasedValidUntil ?? null,
             () => this.readFinalizedChainTime())) return false;
-        const quote = requestBillingQuote(this.runtime.journal?.prepared_request);
-        validateSolanaQuote(quote, this.config.funding, { allowExpired: true });
-        let payload;
-        try { payload = JSON.parse(recovery.request_response.response_payload); } catch { /* Reject below. */ }
-        if (!sameSolanaQuote(payload?.billing_quote, quote)) throw new Error('The settlement receipt changed the authorized SOL/USD quote.');
         let state;
         try {
             state = await this.worker.call('completeResponse', {
@@ -2352,39 +2357,6 @@ class BrowserWalletRuntime extends EventTarget {
         });
     }
 
-    async recoverUnacceptedNativeQuote(request, signal = null) {
-        const journal = this.runtime?.journal;
-        const body = JSON.stringify(request);
-        if (!request?.client_request_id || request.payload_hash == null
-            || request.public_inputs?.request_nullifier == null
-            || !sameFelt(journal?.nullifier, request.public_inputs.request_nullifier)
-            || body !== JSON.stringify(journal?.prepared_request)) return false;
-        validateSolanaQuote(requestBillingQuote(request), this.config.funding, { allowExpired: true });
-        // This endpoint only observes quote validity and acceptance under the server's
-        // issuance lock. Neither local time nor an unknown nullifier proves an
-        // older in-flight request can no longer reserve the note.
-        let recovery;
-        try {
-            recovery = await this.remoteJson(`${this.config.funding.protocol_server_url}/v2/openrouter/leases/${encodeURIComponent(request.client_request_id)}/expire`, {
-                method: 'POST', headers: { 'content-type': 'application/json' }, signal, body
-            });
-        } catch (error) {
-            if (error?.code === 'lease_pending') return false;
-            throw error;
-        }
-        if (!['expired_unaccepted', 'superseded_unaccepted'].includes(recovery?.status)) return false;
-        if (recovery.client_request_id !== request.client_request_id
-            || recovery.request_nullifier == null || recovery.payload_hash == null
-            || !sameFelt(recovery.request_nullifier, request.public_inputs.request_nullifier)
-            || !sameFelt(recovery.payload_hash, request.payload_hash)) {
-            throw new Error('The quote recovery response does not match the saved private request.');
-        }
-        if (body !== JSON.stringify(this.runtime?.journal?.prepared_request)
-            || !sameFelt(this.runtime.journal.nullifier, request.public_inputs.request_nullifier)) return false;
-        await this.commit({ ...this.runtime, journal: null, lease: null });
-        return true;
-    }
-
     async recoverPendingLocked({ quiet = false, ...options } = {}) {
         try {
             return await this.recoverPendingRequest(options);
@@ -2422,7 +2394,9 @@ class BrowserWalletRuntime extends EventTarget {
                 if (recovery.request_response) return this.installRecoveredResponse(request.client_request_id, onProgress, { signal });
                 if (recovery.status === 'not_found'
                     && recovery.nullifier_status === 'unknown' && !recovery.request_response) {
-                    return this.recoverUnacceptedNativeQuote(request, signal);
+                    // Never accepted: the journal's byte-identical request is
+                    // simply sent again by the next lease attempt.
+                    return false;
                 }
                 if (recovery.nullifier_status === 'clearance_reserved') {
                     // Mutual-close preparation owns this deterministic state

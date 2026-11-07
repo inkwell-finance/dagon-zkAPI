@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { BrowserWalletRuntime } from '../services/browserWalletRuntime.js';
-import { nativeFunding } from './helpers/native-fixtures.mjs';
+import { usdcFunding } from './helpers/usdc-fixtures.mjs';
 
 const CIRCUIT_ID = 'zkapi-v2-concession-v1';
 
 function manifest() {
     return {
-        ...nativeFunding(),
+        ...usdcFunding(),
         protocol_version: 2,
         proof_backend: 'groth16_bn254',
         deployment_id: 'dagon-localnet-test',
@@ -62,19 +62,44 @@ test('browser requires its trusted configuration to pin the same circuit', () =>
     assert.throws(() => runtime.validateManifestTrust(deployment), /pinned proof circuit/);
 });
 
-test('every Solana identity, Pyth and RPC pin must match the trusted configuration', () => {
+test('every Solana identity, USDC asset and RPC pin must match the trusted configuration', () => {
     const deployment = manifest();
     for (const [field, changed] of [
         ['network', 'devnet'], ['program_id', deployment.vault_state], ['vault_state', deployment.program_id],
         ['genesis_hash', deployment.program_id], ['wallet_standard_chain', 'solana:devnet'],
-        ['pyth_receiver_program', deployment.program_id], ['pyth_price_account', deployment.program_id],
-        ['pyth_feed_id', `0x${'01'.repeat(32)}`], ['pyth_max_age_seconds', 60], ['pyth_max_confidence_bps', 50],
+        ['usdc_mint', deployment.program_id], ['token_program', 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'],
+        ['associated_token_program', deployment.program_id], ['base_units_per_asset', '1000000000'],
         ['rpc_url', 'https://other-rpc.example'], ['chain_id', '1'], ['contract_address', `0x${'22'.repeat(32)}`],
         ['request_charge_cap', 2000]
     ]) {
         const runtime = new BrowserWalletRuntime();
         runtime.browserConfig = { trusted_deployment: trustedPins(deployment) };
-        assert.throws(() => runtime.validateManifestTrust({ ...deployment, [field]: changed }), /changed its pinned/, field);
+        assert.throws(() => runtime.validateManifestTrust({ ...deployment, [field]: changed }),
+            /changed its pinned|Circle USDC|invalid protocol or billing/, field);
+    }
+});
+
+test('signing-key pins compare field values across padded, shortened and uppercase hex encodings', () => {
+    const deployment = manifest();
+    const runtime = new BrowserWalletRuntime();
+    runtime.browserConfig = { trusted_deployment: trustedPins(deployment) };
+    for (const keyName of ['state_signing_key', 'clearance_signing_key']) {
+        for (const coordinate of ['x', 'y']) {
+            const value = BigInt(deployment[keyName][coordinate]);
+            for (const encoded of [`0x${value.toString(16).padStart(64, '0')}`, `0X${value.toString(16).toUpperCase()}`]) {
+                const changed = structuredClone(deployment);
+                changed[keyName][coordinate] = encoded;
+                assert.doesNotThrow(() => runtime.validateManifestTrust(changed));
+                runtime.browserConfig = { trusted_deployment: trustedPins(changed) };
+                assert.doesNotThrow(() => runtime.validateManifestTrust(deployment));
+                runtime.browserConfig = { trusted_deployment: trustedPins(deployment) };
+            }
+            for (const invalid of [`0x${(value + 1n).toString(16).padStart(64, '0')}`, '', null, true]) {
+                const changed = structuredClone(deployment);
+                changed[keyName][coordinate] = invalid;
+                assert.throws(() => runtime.validateManifestTrust(changed), /changed its pinned/);
+            }
+        }
     }
 });
 
@@ -124,7 +149,7 @@ test('non-Solana deployments are rejected before deployment selection, worker cr
         removeItem: () => assert.fail('no stored selection to remove')
     };
     for (const changes of [{ billing_asset: 'erc20' }, { billing_asset: undefined },
-        { ledger_backend: 'other.groth16.v1' }, { billing_unit: 'microlamports' }]) {
+        { ledger_backend: 'other.groth16.v1' }, { billing_unit: 'micro_usd' }, { base_units_per_asset: '1000000000' }]) {
         const runtime = new BrowserWalletRuntime();
         runtime.loadBrowserConfig = async () => ({ deployment_manifest_url: 'https://server.example/config.json' });
         runtime.directJson = async () => ({ ...manifest(), ...changes });
@@ -152,7 +177,6 @@ test('operator manifest loss or replacement leaves a pin-validated exit-only wal
         runtime.init = async () => {};
         await assert.rejects(runtime.prepareDeposit(1000), { code: 'deployment_exit_only' });
         await assert.rejects(runtime.prepareLeaseRequest(), { code: 'deployment_exit_only' });
-        await assert.rejects(runtime.prepareDepositQuote(1000), { code: 'deployment_exit_only' });
         runtime.directJson = async () => deployment;
         await runtime.loadDeploymentManifest('https://server.example/config.json');
         assert.equal(runtime.exitOnly, false);

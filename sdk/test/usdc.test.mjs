@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
-import { Message, PublicKey, SystemProgram, Transaction, TransactionInstruction } from '@solana/web3.js';
+import { keccak_256 } from '@noble/hashes/sha3';
+import { AddressLookupTableAccount, ComputeBudgetProgram, Message, PublicKey, SystemProgram, Transaction,
+    TransactionInstruction, TransactionMessage } from '@solana/web3.js';
 
 import { configureBrowserSdk } from '../configure.js';
 import { base58Decode, base58Encode, inspectPreparedSolanaMessage } from '../services/zkapiSolanaTransport.mjs';
@@ -293,40 +295,179 @@ test('CreateIdempotent for the wallet USDC account is hand-rolled to the ATA pro
     assert.equal(inspected.instructionAccounts[3].isWritable, false);
 });
 
-const DEPOSIT_DISCRIMINATOR = createHash('sha256').update('global:execute_deposit').digest().subarray(0, 8);
+const discriminator = name => createHash('sha256').update(`global:${name}`).digest().subarray(0, 8);
+const depositIntent = { expected_note_id: 3, amount: '25000000', commitment: `0x${'11'.repeat(32)}` };
 
 function depositOperation({ tokenProgram = TOKEN_PROGRAM_ID, mint = USDC_MINT,
-    source = usdcAssociatedTokenAddress(PAYER), vaultToken = vaultTokenAddress(funding.program_id, funding.vault_state) } = {}) {
+    source = usdcAssociatedTokenAddress(PAYER), vaultToken = vaultTokenAddress(funding.program_id, funding.vault_state),
+    intent = depositIntent, chunkSize = 344, proofBytes = 256 } = {}) {
     const payer = new PublicKey(PAYER);
+    const program = new PublicKey(funding.program_id);
+    const operationId = Buffer.alloc(32, 0x41);
+    const operation = PublicKey.findProgramAddressSync([Buffer.from('operation'),
+        new PublicKey(funding.vault_state).toBuffer(), payer.toBuffer(), operationId], program)[0];
+    const noteId = Buffer.alloc(4);
+    noteId.writeUInt32LE(intent.expected_note_id);
+    const note = PublicKey.findProgramAddressSync([Buffer.from('note'),
+        new PublicKey(funding.vault_state).toBuffer(), noteId], program)[0];
+    // The transition proof is opaque here; the program verifies it. All
+    // amount/commitment authorization happens before any proof reaches chain.
+    const payload = Buffer.alloc(88 + proofBytes);
+    payload.writeUInt32LE(intent.expected_note_id, 0);
+    Buffer.from(intent.commitment.slice(2).padStart(64, '0'), 'hex').copy(payload, 4);
+    payload.writeBigUInt64LE(BigInt(intent.amount), 36);
+    payload.writeBigUInt64LE(1_900_086_400n, 44);
+    payload.writeUInt32LE(proofBytes, 84);
+    const init = Buffer.alloc(83);
+    discriminator('initialize_operation').copy(init);
+    operationId.copy(init, 8);
+    init[40] = 1;
+    init.writeUInt16LE(payload.length, 41);
+    Buffer.from(keccak_256(payload)).copy(init, 43);
+    init.writeBigUInt64LE(2000n, 75);
     const meta = (pubkey, isWritable, isSigner = false) => ({ pubkey: new PublicKey(pubkey), isWritable, isSigner });
-    const instruction = new TransactionInstruction({
-        programId: new PublicKey(funding.program_id),
-        keys: [meta(funding.vault_state, true), meta(key(0x41), true), meta(key(0x42), true),
-            meta(PAYER, true, true), meta(PAYER, false, true), meta(source, true), meta(vaultToken, true),
-            meta(mint, false), meta(tokenProgram, false), meta(SystemProgram.programId.toBase58(), false)],
-        data: Buffer.from([...DEPOSIT_DISCRIMINATOR, 3, 0, 0, 0])
-    });
-    const transaction = new Transaction({ feePayer: payer, recentBlockhash: key(8) }).add(instruction);
-    return { transactions: [{ format: 'solana-legacy-message-v1', bytes: [...transaction.serializeMessage()],
-        required_signers: [[...payer.toBytes()]], last_valid_height: 500 }] };
+    const prepared = (keys, data) => {
+        const transaction = new Transaction({ feePayer: payer, recentBlockhash: key(8) })
+            .add(new TransactionInstruction({ programId: program, keys, data }));
+        return { format: 'solana-legacy-message-v1', bytes: [...transaction.serializeMessage()],
+            required_signers: [[...payer.toBytes()]], last_valid_height: 500 };
+    };
+    const transactions = [prepared([meta(funding.vault_state, false), meta(operation, true),
+        meta(PAYER, true, true), meta(SystemProgram.programId, false)], init)];
+    for (let offset = 0; offset < payload.length; offset += chunkSize) {
+        const chunk = payload.subarray(offset, offset + chunkSize);
+        const data = Buffer.alloc(14 + chunk.length);
+        discriminator('write_operation').copy(data);
+        data.writeUInt16LE(offset, 8);
+        data.writeUInt32LE(chunk.length, 10);
+        chunk.copy(data, 14);
+        transactions.push(prepared([meta(funding.vault_state, false), meta(operation, true), meta(PAYER, false, true)], data));
+    }
+    transactions.push(prepared([meta(funding.vault_state, true), meta(operation, true), meta(note, true),
+        meta(PAYER, true, true), meta(PAYER, false, true), meta(source, true), meta(vaultToken, true),
+        meta(mint, false), meta(tokenProgram, false), meta(SystemProgram.programId, false)],
+    Buffer.concat([discriminator('execute_deposit'), noteId])));
+    return { transactions };
 }
+
+const authorizeDeposit = (operation, payer = PAYER) =>
+    validatePreparedSolanaDeposit(operation, { funding, payer, deposit: depositIntent });
 
 test('a prepared deposit must move USDC from the wallet ATA into the vault under classic SPL Token', () => {
     const operation = depositOperation();
-    assert.equal(validatePreparedSolanaDeposit(operation, { funding, payer: PAYER }), operation);
-    assert.throws(() => validatePreparedSolanaDeposit(depositOperation({ tokenProgram: TOKEN_2022_PROGRAM_ID }),
-        { funding, payer: PAYER }), /Token-2022/);
-    assert.throws(() => validatePreparedSolanaDeposit(depositOperation({ tokenProgram: key(0x43) }),
-        { funding, payer: PAYER }), /unknown token program/);
-    assert.throws(() => validatePreparedSolanaDeposit(depositOperation({ mint: key(0x44) }),
-        { funding, payer: PAYER }), /token other than Circle USDC/);
-    assert.throws(() => validatePreparedSolanaDeposit(depositOperation({ source: usdcAssociatedTokenAddress(key(0x45)) }),
-        { funding, payer: PAYER }), /from this wallet into the pinned vault/);
-    assert.throws(() => validatePreparedSolanaDeposit(depositOperation({ vaultToken: key(0x46) }),
-        { funding, payer: PAYER }), /from this wallet into the pinned vault/);
-    assert.throws(() => validatePreparedSolanaDeposit(operation, { funding, payer: key(0x47) }),
-        /from this wallet into the pinned vault/);
+    assert.equal(authorizeDeposit(operation), operation);
+    // Rust Felt252 JSON omits leading zeroes; compare the value, not its text.
+    const shortIntent = { ...depositIntent, commitment: '0x123' };
+    const shortOperation = depositOperation({ intent: shortIntent });
+    assert.equal(validatePreparedSolanaDeposit(shortOperation, {
+        funding, payer: PAYER, deposit: shortIntent
+    }), shortOperation);
+    for (const [options, error] of [
+        [{ tokenProgram: TOKEN_2022_PROGRAM_ID }, /Token-2022/],
+        [{ tokenProgram: key(0x43) }, /unknown token program/],
+        [{ mint: key(0x44) }, /token other than Circle USDC/],
+        [{ source: usdcAssociatedTokenAddress(key(0x45)) }, /from this wallet into the pinned vault/],
+        [{ vaultToken: key(0x46) }, /from this wallet into the pinned vault/]
+    ]) assert.throws(() => authorizeDeposit(depositOperation(options)), error);
+    assert.throws(() => authorizeDeposit(operation, key(0x47)), /from this wallet into the pinned vault/);
 });
+
+test('an operator cannot replace the deposit commitment, amount, note ID or staging sequence', () => {
+    for (const intent of [
+        { ...depositIntent, commitment: `0x${'22'.repeat(32)}` },
+        { ...depositIntent, amount: '25000001' },
+        { ...depositIntent, amount: '1' },
+        { ...depositIntent, expected_note_id: 4 }
+    ]) assert.throws(() => authorizeDeposit(depositOperation({ intent })), /local note, amount and commitment/);
+    const extraDeposit = depositOperation();
+    extraDeposit.transactions.splice(1, 0, extraDeposit.transactions.at(-1));
+    assert.throws(() => authorizeDeposit(extraDeposit), /exactly three transactions/);
+    const repeatedWrite = depositOperation();
+    repeatedWrite.transactions.splice(2, 0, repeatedWrite.transactions[1]);
+    assert.throws(() => authorizeDeposit(repeatedWrite), /exactly three transactions/);
+    const missingWrite = depositOperation();
+    missingWrite.transactions.splice(1, 1);
+    assert.throws(() => authorizeDeposit(missingWrite), /exactly three transactions/);
+    const wrongBuffer = depositOperation();
+    const parsed = inspectPreparedSolanaMessage(wrongBuffer.transactions[1].bytes);
+    const message = Message.from(Uint8Array.from(wrongBuffer.transactions[1].bytes));
+    const bufferIndex = message.accountKeys.findIndex(k => k.toBase58() === base58Encode(parsed.instructionAccounts[1].pubkey));
+    message.accountKeys[bufferIndex] = new PublicKey(key(0x61));
+    wrongBuffer.transactions[1].bytes = [...message.serialize()];
+    assert.throws(() => authorizeDeposit(wrongBuffer), /substituted staging accounts/);
+    const wrongDigest = depositOperation();
+    const initMessage = Message.from(Uint8Array.from(wrongDigest.transactions[0].bytes));
+    const initData = base58Decode(initMessage.instructions[0].data);
+    initData[43] ^= 1;
+    initMessage.instructions[0].data = base58Encode(initData);
+    wrongDigest.transactions[0].bytes = [...initMessage.serialize()];
+    assert.throws(() => authorizeDeposit(wrongDigest), /local note, amount and commitment/);
+    assert.throws(() => validatePreparedSolanaDeposit(depositOperation(), { funding, payer: PAYER }), /local deposit intent/);
+});
+
+test('an operator cannot inflate deposit fees with fragmented writes or buffer rent with an oversized proof', () => {
+    assert.equal(authorizeDeposit(depositOperation()).transactions.length, 3);
+    // Both plans have the right local intent, contiguous writes and digest.
+    // The old validator accepted 346 wallet-paid stages for a 344-byte payload.
+    for (const chunkSize of [1, 200]) {
+        assert.throws(() => authorizeDeposit(depositOperation({ chunkSize })), /exactly three transactions/);
+    }
+    // This still fits one legacy write message, but rents a larger operation
+    // buffer and can never pass the deployed verifier's 256-byte proof check.
+    assert.throws(() => authorizeDeposit(depositOperation({ proofBytes: 512, chunkSize: 600 })),
+        /canonical 344-byte payload/);
+});
+
+// Threat: an operator keeps every authorized byte but reshapes a stage: an
+// address lookup table (v0) hiding a substituted account, a priority fee
+// charged to the wallet, or an extra instruction (here a Token approve to the
+// operator) ahead of the vault instruction in any stage.
+test('deposit stages are single-signer legacy messages with only bounded heap/CU prefixes', () => {
+    const stage = (operation, index, rebuild) => {
+        const message = Message.from(Uint8Array.from(operation.transactions[index].bytes));
+        const instructions = message.instructions.map(compiled => new TransactionInstruction({
+            programId: message.accountKeys[compiled.programIdIndex],
+            keys: compiled.accounts.map(account => ({ pubkey: message.accountKeys[account],
+                isSigner: message.isAccountSigner(account), isWritable: message.isAccountWritable(account) })),
+            data: Buffer.from(base58Decode(compiled.data))
+        }));
+        operation.transactions[index].bytes = rebuild(instructions);
+        return operation;
+    };
+    const payer = new PublicKey(PAYER);
+    const legacy = instructions => [...new Transaction({ feePayer: payer, recentBlockhash: key(8) })
+        .add(...instructions).serializeMessage()];
+    for (const index of [0, 1, 2]) {
+        assert.equal(authorizeDeposit(stage(depositOperation(), index, legacy)).transactions.length, 3);
+        const budget = [ComputeBudgetProgram.requestHeapFrame({ bytes: 128 * 1024 }),
+            ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })];
+        authorizeDeposit(stage(depositOperation(), index, instructions => legacy([...budget, ...instructions])));
+        assert.throws(() => authorizeDeposit(stage(depositOperation(), index, instructions => legacy([
+            ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1_000_000 }), ...instructions]))),
+        /compute budget is not authorized/);
+        const approve = new TransactionInstruction({ programId: new PublicKey(TOKEN_PROGRAM_ID),
+            keys: [{ pubkey: new PublicKey(usdcAssociatedTokenAddress(PAYER)), isSigner: false, isWritable: true },
+                { pubkey: new PublicKey(key(0x62)), isSigner: false, isWritable: false },
+                { pubkey: payer, isSigner: true, isWritable: false }],
+            data: Buffer.from([4, ...new Uint8Array(8).fill(0xff)]) });
+        assert.throws(() => authorizeDeposit(stage(depositOperation(), index,
+            instructions => legacy([approve, ...instructions]))), /compute budget is not authorized/);
+        assert.throws(() => authorizeDeposit(stage(depositOperation(), index,
+            instructions => legacy([...instructions, approve]))));
+        const table = new AddressLookupTableAccount({ key: new PublicKey(key(0x63)), state: {
+            deactivationSlot: BigInt('18446744073709551615'), lastExtendedSlot: 0, lastExtendedSlotStartIndex: 0,
+            addresses: lookupAddresses(depositOperation(), index) } });
+        assert.throws(() => authorizeDeposit(stage(depositOperation(), index, instructions => [
+            ...new TransactionMessage({ payerKey: payer, recentBlockhash: key(8), instructions })
+                .compileToV0Message([table]).serialize()])), /exactly one signature/);
+    }
+});
+
+function lookupAddresses(operation, index) {
+    const message = Message.from(Uint8Array.from(operation.transactions[index].bytes));
+    return message.accountKeys.filter((_, position) => !message.isAccountSigner(position)
+        && position !== message.instructions.at(-1).programIdIndex);
+}
 
 test('USDC token accounts decode; Token-2022 and foreign owners are refused', async () => {
     const owner = key(0x55);

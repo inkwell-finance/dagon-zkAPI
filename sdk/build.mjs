@@ -4,6 +4,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { keccak_256 } from '@noble/hashes/sha3';
 import { PublicKey } from '@solana/web3.js';
+import { ASSOCIATED_TOKEN_PROGRAM_ID, MICRO_USDC_PER_USDC, TOKEN_PROGRAM_ID, USDC_DECIMALS, USDC_MINT }
+    from './services/zkapiUsdc.mjs';
 
 const sdkRoot = path.dirname(fileURLToPath(import.meta.url));
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -11,8 +13,8 @@ const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 export const PROFILE_SCHEMA = 'dagon-zkapi.solana-profile.v1';
 export const IDENTITY_SCHEMA = 'dagon-zkapi.solana-identity.v1';
 export const DEPLOYMENT_SCHEMA = 'dagon-zkapi.sdk-deployment.v1';
-const IDENTITY_KEYS = ['schema', 'network', 'genesis_hash', 'vault_authority', 'vault_state', 'treasury',
-    'pyth_price_account'];
+const IDENTITY_KEYS = ['schema', 'network', 'genesis_hash', 'vault_authority', 'vault_state',
+    'treasury_token_account'];
 const DEPLOYMENT_KEYS = ['schema', 'deployment_manifest_url', 'protocol_server_url', 'indexer_url', 'rpc_url',
     'openrouter_inference_base', 'oa_verifier_url', 'state_signing_key', 'clearance_signing_key'];
 const MAINNET_BETA = 'mainnet-beta';
@@ -113,6 +115,11 @@ export function solanaDeploymentBinding(programId, vaultState, genesisHash) {
 export async function readPackagedSolanaProfile() {
     const profile = JSON.parse(await fs.readFile(path.join(sdkRoot, 'assets/config/profile.json'), 'utf8'));
     if (profile.schema !== PROFILE_SCHEMA) throw new Error('The packaged Solana profile has an unsupported schema.');
+    const asset = profile.asset;
+    if (asset?.symbol !== 'USDC' || asset.mint !== USDC_MINT || asset.decimals !== USDC_DECIMALS
+        || asset.token_program !== TOKEN_PROGRAM_ID || asset.associated_token_program !== ASSOCIATED_TOKEN_PROGRAM_ID) {
+        throw new Error('The packaged Solana profile must settle in Circle USDC under the classic SPL Token program.');
+    }
     return profile;
 }
 
@@ -160,26 +167,16 @@ export function resolveSolanaIdentity(identity, profile) {
     };
     const authority = required('vault_authority');
     const vault = required('vault_state');
-    required('treasury');
-    const priceAccount = required('pyth_price_account');
+    required('treasury_token_account');
     const program = base58Account(profile.program.program_id, 'program_id');
     const [expectedVault] = PublicKey.findProgramAddressSync([utf8('vault'), authority.toBytes()], program);
     if (!expectedVault.equals(vault)) {
         throw new Error('vault_state is not the vault PDA of vault_authority under the profile program.');
     }
-    const shard = new Uint8Array(2);
-    new DataView(shard.buffer).setUint16(0, profile.pyth.push_shard_id, true);
-    const feed = Uint8Array.from(Buffer.from(profile.pyth.feed_id.slice(2), 'hex'));
-    const [pushAccount] = PublicKey.findProgramAddressSync([shard, feed],
-        base58Account(profile.pyth.push_oracle_program, 'push_oracle_program'));
-    if (!pushAccount.equals(priceAccount)) {
-        throw new Error('pyth_price_account is not the push-oracle account of the profile feed and shard.');
-    }
     return {
         network: identity.network,
         genesisHash: genesis,
         vaultState: vault,
-        pythPriceAccount: priceAccount,
         walletStandardChain,
         programId: program
     };
@@ -209,20 +206,18 @@ export async function solanaBrowserConfig({ identity, deployment, deploymentApiP
         chain_id: solanaChainId(resolved.genesisHash.toBytes()),
         contract_address: solanaDeploymentBinding(resolved.programId.toBytes(), resolved.vaultState.toBytes(),
             resolved.genesisHash.toBytes()),
-        billing_asset: 'native_sol',
-        billing_unit: 'lamports',
+        billing_asset: 'usdc',
+        billing_unit: 'micro_usdc',
         ledger_backend: 'dagon.solana.groth16.v1',
-        base_units_per_asset: '1000000000',
+        base_units_per_asset: String(MICRO_USDC_PER_USDC),
         network: resolved.network,
         genesis_hash: identity.genesis_hash,
         program_id: profile.program.program_id,
         vault_state: identity.vault_state,
         wallet_standard_chain: resolved.walletStandardChain,
-        pyth_receiver_program: profile.pyth.receiver_program,
-        pyth_price_account: identity.pyth_price_account,
-        pyth_feed_id: profile.pyth.feed_id.toLowerCase(),
-        pyth_max_age_seconds: profile.pyth.max_age_seconds,
-        pyth_max_confidence_bps: profile.pyth.max_confidence_bps,
+        usdc_mint: profile.asset.mint,
+        token_program: profile.asset.token_program,
+        associated_token_program: profile.asset.associated_token_program,
         request_charge_cap: profile.vault.request_charge_cap,
         note_ttl_seconds: profile.vault.note_ttl_seconds,
         rpc_url: secureUrl(deployment.rpc_url, 'rpc_url'),

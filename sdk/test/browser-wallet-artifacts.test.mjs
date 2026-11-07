@@ -91,7 +91,7 @@ test('browser worker retains the decoded request prover and retries failed initi
     assert.match(runtime, /prewarmRequestProver\(\)/);
     assert.match(runtime, /this\.worker\.call\('preloadRequestProver'/);
     assert.match(runtime, /if \(this\.runtime\.state \|\| this\.runtime\.pendingDeposit\)/);
-    const prepareDeposit = sourceMethodAt(runtime, 'async prepareDeposit(amount,');
+    const prepareDeposit = sourceMethodAt(runtime, 'async prepareDeposit(amount)');
     const walletStatus = sourceMethodAt(runtime, 'async walletStatus()');
     assert.match(prepareDeposit, /void this\.prewarmRequestProver\(\)/);
     assert.ok(
@@ -215,18 +215,18 @@ test('active root synchronization waits for the indexer and fails closed', async
     );
 });
 
-test('only a never-journaled prepared deposit can be re-quoted or replaced', async () => {
+test('only a never-journaled prepared deposit can be re-planned or replaced', async () => {
     const { BrowserWalletRuntime } = await import(pathToFileURL(path.join(__dirname, 'services/browserWalletRuntime.js')));
     const runtime = new BrowserWalletRuntime();
-    assert.equal(runtime.canQuotePendingDeposit({ operationId: 'deposit-1', phase: 'prepared' }), true);
-    assert.equal(runtime.canQuotePendingDeposit({ operationId: 'deposit-1' }), true);
-    assert.equal(runtime.canQuotePendingDeposit({ operationId: 'deposit-1', phase: 'prepared',
+    assert.equal(runtime.canReplanPendingDeposit({ operationId: 'deposit-1', phase: 'prepared' }), true);
+    assert.equal(runtime.canReplanPendingDeposit({ operationId: 'deposit-1' }), true);
+    assert.equal(runtime.canReplanPendingDeposit({ operationId: 'deposit-1', phase: 'prepared',
         solanaJournal: { stages: [] } }), false);
-    assert.equal(runtime.canQuotePendingDeposit({ phase: 'prepared' }), false);
-    assert.equal(runtime.canQuotePendingDeposit(null), false);
+    assert.equal(runtime.canReplanPendingDeposit({ phase: 'prepared' }), false);
+    assert.equal(runtime.canReplanPendingDeposit(null), false);
     const source = fs.readFileSync(path.join(__dirname, 'services/browserWalletRuntime.js'), 'utf8');
-    assert.match(sourceMethodAt(source, 'async prepareDeposit(amount,'),
-        /if \(!this\.canQuotePendingDeposit\(pending\)\)[\s\S]*A previous Solana deposit is unfinished/);
+    assert.match(sourceMethodAt(source, 'async prepareDeposit(amount)'),
+        /if \(!this\.canReplanPendingDeposit\(pending\)\)[\s\S]*A previous Solana deposit is unfinished/);
 });
 
 test('browser deposits refresh an unsigned Merkle path against the finalized vault root before submission', () => {
@@ -234,7 +234,7 @@ test('browser deposits refresh an unsigned Merkle path against the finalized vau
     const client = fs.readFileSync(path.join(__dirname, 'services/zkapiClient.js'), 'utf8');
     const refresh = sourceMethodAt(runtime, 'async refreshPendingDeposit(');
     assert.match(refresh, /async refreshPendingDeposit\(amount, expectedActiveRoot = null,/);
-    assert.match(refresh, /if \(!this\.canQuotePendingDeposit\(pending\)\)/);
+    assert.match(refresh, /if \(!this\.canReplanPendingDeposit\(pending\)\)/);
     assert.match(refresh, /const refreshed = \{[\s\S]*\.\.\.pending,[\s\S]*next_note_id: path\.note_id,[\s\S]*active_root: path\.active_root,[\s\S]*zero_path: path\.siblings/);
     assert.doesNotMatch(refresh, /secret:/);
     const deposit = sourceMethodAt(client, 'async performDeposit(');

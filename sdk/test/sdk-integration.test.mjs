@@ -96,8 +96,8 @@ test('packaged proof assets and host-built worker are independent of source subm
         assert.equal(result.configUrl, '/chat/zkapi/browser-config.json');
         assert.equal(result.workerUrl, '/chat/zkapi/assets/zkapiWasmWorker.js');
         const trusted = result.config.trusted_deployment;
-        assert.equal(trusted.billing_asset, 'native_sol');
-        assert.equal(trusted.billing_unit, 'lamports');
+        assert.equal(trusted.billing_asset, 'usdc');
+        assert.equal(trusted.billing_unit, 'micro_usdc');
         assert.equal(trusted.network, 'localnet');
         assert.equal(trusted.wallet_standard_chain, 'solana:localnet');
         assert.equal(result.config.deployment_api_proxy_path, undefined);

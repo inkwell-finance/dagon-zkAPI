@@ -1,4 +1,4 @@
-import { nativeFunding, nativeQuote } from './helpers/native-fixtures.mjs';
+import { usdcFunding } from './helpers/usdc-fixtures.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -23,11 +23,10 @@ function retryableError(message = 'internal error: OA returned 429 Too Many Requ
 function runtimeForLeaseRequests() {
     const runtime = new BrowserWalletRuntime();
     runtime.config = {
-        funding: nativeFunding(),
+        funding: usdcFunding(),
         request_charge_cap: 50_000,
         credits_per_usd: 1_000_000
     };
-    runtime.nativeBillingQuote = async () => nativeQuote(runtime.config.funding);
     return runtime;
 }
 
@@ -308,7 +307,7 @@ test('lease retries reuse the byte-identical prepared request and report rate-li
     const request = {
         client_request_id: 'fixed-idempotency-id',
         proof: { a: ['proof-created-once'] },
-        payload: JSON.stringify({ billing_quote: nativeQuote(runtime.config.funding) }),
+        payload: JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1 }),
         public_inputs: { solvency_bound: 1_000_000 }
     };
     const attempts = [];
@@ -503,7 +502,7 @@ test('issueLease prepares one proof before delegating all transport attempts', a
     const prepared = {
         client_request_id: 'single-prepared-request',
         proof: { a: ['single-proof'] },
-        payload: JSON.stringify({ billing_quote: nativeQuote(runtime.config.funding) }),
+        payload: JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1 }),
         public_inputs: { solvency_bound: 1_000_000 }
     };
     runtime.prepareLeaseRequest = async () => {
@@ -549,12 +548,12 @@ for (const selectedCap of [1, 4.5, 6]) test(`issueLease settles the original jou
     runtime.recoverPendingLocked = async () => {};
     const legacyRequest = {
         client_request_id: 'legacy-request',
-        payload: JSON.stringify({ billing_quote: nativeQuote(runtime.config.funding) }),
+        payload: JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1 }),
         public_inputs: { solvency_bound: 5_000_000 }
     };
     const currentRequest = {
         client_request_id: 'fixed-request',
-        payload: JSON.stringify({ billing_quote: nativeQuote(runtime.config.funding) }),
+        payload: JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1 }),
         public_inputs: { solvency_bound: selectedCap * 1_000_000 }
     };
     const prepared = [legacyRequest, currentRequest];
@@ -613,7 +612,7 @@ test('a failed legacy-cap migration can never return the legacy key on retry', a
         journal: {
             prepared_request: {
                 client_request_id: 'legacy-request',
-                payload: JSON.stringify({ billing_quote: nativeQuote(runtime.config.funding) }),
+                payload: JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1 }),
                 public_inputs: { solvency_bound: 5_000_000 }
             }
         }
@@ -655,7 +654,7 @@ test('a failed legacy-cap migration can never return the legacy key on retry', a
     assert.equal(retried.api_key, 'fixed-one-dollar-key');
 });
 
-test('lease verification requires active status and the submitted request identity', async () => {
+test('lease verification requires active status, the submitted request identity and a limit of exactly bound / 1e6 USD', async () => {
     const runtime = runtimeForLeaseRequests();
     runtime.config.openrouter = {
         inference_base: 'https://openrouter.ai/api/v1',
@@ -668,11 +667,17 @@ test('lease verification requires active status and the submitted request identi
         expires_at: 2_000_000_000,
         spending_limit_usd: 1,
         openrouter_api_base: 'https://openrouter.ai/api/v1',
-        key_source: 'direct',
-        billing_quote: nativeQuote(runtime.config.funding)
+        key_source: 'direct'
     };
 
-    await runtime.verifyLease(lease, 1_000_000, 'expected-request', undefined, null, lease.billing_quote);
+    await runtime.verifyLease(lease, 1_000_000, 'expected-request');
+    await runtime.verifyLease({ ...lease, spending_limit_usd: 4.5 }, 4_500_000, 'expected-request');
+    for (const spendingLimit of [1.000001, 0.999999, 1_000_000, null]) {
+        await assert.rejects(
+            runtime.verifyLease({ ...lease, spending_limit_usd: spendingLimit }, 1_000_000, 'expected-request'),
+            /wrong USD spending cap/
+        );
+    }
     await assert.rejects(
         runtime.verifyLease({ ...lease, status: 'provisioning' }, 1_000_000, 'expected-request'),
         /unusable OpenRouter lease/
@@ -890,7 +895,7 @@ test('lease retirement honors Retry-After without changing the settlement reques
     const request = {
         client_request_id: 'settlement-request',
         proof: { a: ['original-proof'] },
-        payload: JSON.stringify({ billing_quote: nativeQuote(runtime.config.funding) }),
+        payload: JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1 }),
         public_inputs: { solvency_bound: 5_000_000 }
     };
     const error = new BrowserWalletHttpError(
@@ -931,7 +936,7 @@ test('lease retirement crosses the OA finalization boundary with the exact origi
     const request = {
         client_request_id: 'settlement-boundary-request',
         proof: { a: ['proof-must-not-change'] },
-        payload: JSON.stringify({ billing_quote: nativeQuote(runtime.config.funding) }),
+        payload: JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1 }),
         public_inputs: { solvency_bound: 25_000_000 }
     };
     const pending = [
@@ -975,7 +980,7 @@ test('lease retirement crosses the OA finalization boundary with the exact origi
     assert.deepEqual(JSON.parse(bodies[0]), request);
 });
 
-for (const code of ['lease_pending', 'lease_settlement_pending', 'native_quote_expired', 'native_quote_superseded']) {
+for (const code of ['lease_pending', 'lease_settlement_pending']) {
     test(`lease issuance never retries a proof requiring reconciliation: ${code}`, async () => {
         const runtime = runtimeForLeaseRequests();
         const error = new BrowserWalletHttpError(
@@ -1078,7 +1083,7 @@ test('selected cap reaches proof inputs and insufficient funds never start provi
     const prepared = await runtime.prepareLeaseRequest(undefined, null, 4.5);
     assert.equal(prepared.public_inputs.solvency_bound, 4_500_000);
     assert.equal(proofInputs[0].config.policy_charge_cap, 4_500_000);
-    assert.deepEqual(JSON.parse(proofInputs[0].args.payload), { mode: 'openrouter_ephemeral_lease', version: 1, billing_quote: nativeQuote(runtime.config.funding) });
+    assert.deepEqual(JSON.parse(proofInputs[0].args.payload), { mode: 'openrouter_ephemeral_lease', version: 1 });
     const original = runtime.runtime.journal.prepared_request;
     assert.equal(await runtime.prepareLeaseRequest(undefined, null, 1), original,
         'durable proof must stay identical across a changed selection until recovery settles it');

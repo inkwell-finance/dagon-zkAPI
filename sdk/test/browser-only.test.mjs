@@ -15,7 +15,7 @@ test('initialization starts the browser wallet without probing a local daemon or
     assert.deepEqual(calls, ['browser', 'refresh']);
     assert.equal(client.browserMode, true);
     assert.equal(client.requestMode, 'direct_openrouter');
-    assert.equal(client.billingTokenSymbol, 'SOL');
+    assert.equal(client.billingTokenSymbol, 'USDC');
 });
 
 test('background refresh never opens a wallet and coalesces concurrent ticks', async t => {

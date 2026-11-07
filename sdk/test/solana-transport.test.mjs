@@ -278,3 +278,33 @@ test('transport rejects signer, program, vault, and wallet message substitution'
     await assert.rejects(invoke({ account: { ...account, publicKey: new Uint8Array(32).fill(9) } }), /different wallet/);
     await assert.rejects(invoke({ mutate: true }), /changed the prepared/);
 });
+
+// The USDC payout-account creation is the one non-vault wallet transaction:
+// it passes only when its program, data and ordered accounts match exactly.
+test('an exact pinned instruction replaces the vault pin for USDC account creation only', () => {
+    const expectedInstruction = {
+        programId: PROGRAM,
+        keys: [{ pubkey: PAYER, isSigner: true, isWritable: true }, { pubkey: VAULT, isSigner: false, isWritable: true }],
+        data: [1]
+    };
+    const build = (accountIndices, data, readonlyUnsigned = 1) => ({ transactions: [{
+        format: 'solana-legacy-message-v1',
+        bytes: [1, 0, readonlyUnsigned, 3, ...PAYER, ...VAULT, ...PROGRAM, ...new Uint8Array(32).fill(44),
+            1, 2, accountIndices.length, ...accountIndices, data.length, ...data],
+        required_signers: [[...PAYER]], last_valid_height: 500
+    }] });
+    const validate = (operation, pins = { expectedInstruction }) => validatePreparedSolanaOperation({
+        operation, payer: PAYER, ...pins
+    });
+    assert.equal(validate(build([0, 1], [1])).length, 1);
+    const inspected = inspectPreparedSolanaMessage(build([0, 1], [1]).transactions[0].bytes);
+    assert.deepEqual(inspected.instructionAccounts.map(meta => [meta.isSigner, meta.isWritable]), [[true, true], [false, true]]);
+    assert.throws(() => validate(build([0, 1], [0])), /not the expected instruction/);
+    assert.throws(() => validate(build([1, 0], [1])), /not the expected instruction/);
+    assert.throws(() => validate(build([0], [1])), /not the expected instruction/);
+    // The expected writable account may not be demoted to read-only.
+    assert.throws(() => validate(build([0, 1], [1], 2)), /not the expected instruction/);
+    // Without the pin, the same transaction is not a vault transaction.
+    assert.throws(() => validate(build([0, 1], [1]), { programId: new Uint8Array(32).fill(9), vaultState: VAULT }),
+        /different program/);
+});

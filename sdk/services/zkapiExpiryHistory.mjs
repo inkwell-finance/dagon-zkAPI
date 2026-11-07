@@ -14,7 +14,7 @@ export function deriveExpiryRecords(deposits = [], withdrawals = [], nowMs = Dat
         if (!Number.isFinite(nowMs) || deposit.expiryTs * 1000 > nowMs || withdrawals.some(record =>
             record.deploymentId === deposit.deploymentId && record.noteId === deposit.noteId
             && ((record.payoutVerified === true && record.phase === 'closed')
-                || (record.mode === 'escape' && record.chainStatus === 'pending_withdrawal'
+                || (record.mode === 'escape' && ['pending_withdrawal', 'payout_parked'].includes(record.chainStatus)
                     && integer(record.startBlockNumber) && record.startBlockNumber > 0)))) return [];
         return [{
             recordId: `${deposit.recordId}:expiry`, type: 'expiry',

@@ -35,7 +35,7 @@ function cloneOperation(operation) {
 
 function journalIdentity(value) {
     if (!value || value.version !== SOLANA_JOURNAL_VERSION
-        || !['deposit', 'mutual', 'escape', 'finalize'].includes(value.kind)
+        || !['deposit', 'mutual', 'escape', 'finalize', 'release'].includes(value.kind)
         || typeof value.operationId !== 'string' || !value.operationId
         || typeof value.deploymentId !== 'string' || !value.deploymentId
         || value.backend !== 'dagon.solana.groth16.v1'

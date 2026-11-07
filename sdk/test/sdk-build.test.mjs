@@ -28,11 +28,13 @@ test('the browser trust anchor takes every shared value from the profile and ide
     assert.equal(trusted.circuit_id, profile.protocol.circuit_id);
     assert.equal(trusted.request_charge_cap, profile.vault.request_charge_cap);
     assert.equal(trusted.note_ttl_seconds, profile.vault.note_ttl_seconds);
-    assert.equal(trusted.pyth_receiver_program, profile.pyth.receiver_program);
-    assert.equal(trusted.pyth_feed_id, profile.pyth.feed_id);
-    assert.equal(trusted.pyth_max_age_seconds, profile.pyth.max_age_seconds);
-    assert.equal(trusted.pyth_max_confidence_bps, profile.pyth.max_confidence_bps);
-    for (const field of ['network', 'genesis_hash', 'vault_state', 'pyth_price_account']) {
+    assert.equal(trusted.billing_asset, 'usdc');
+    assert.equal(trusted.billing_unit, 'micro_usdc');
+    assert.equal(trusted.base_units_per_asset, '1000000');
+    assert.equal(trusted.usdc_mint, profile.asset.mint);
+    assert.equal(trusted.token_program, profile.asset.token_program);
+    assert.equal(trusted.associated_token_program, profile.asset.associated_token_program);
+    for (const field of ['network', 'genesis_hash', 'vault_state']) {
         assert.equal(trusted[field], identity[field], field);
     }
     const genesis = new PublicKey(identity.genesis_hash).toBytes();
@@ -60,11 +62,13 @@ test('identities are validated exactly like the operator binaries and undeployed
     assert.throws(() => resolveSolanaIdentity({ ...identity, network: 'mainnet-beta' }, profile), /must go together/);
     assert.throws(() => resolveSolanaIdentity({ ...mainnet, network: 'localnet' }, profile), /must go together/);
     assert.throws(() => resolveSolanaIdentity({ ...identity, network: 'staging' }, profile), /No Wallet Standard chain/);
-    assert.throws(() => resolveSolanaIdentity({ ...identity, treasury: null }, profile), /no treasury \(undeployed\)/);
-    assert.throws(() => resolveSolanaIdentity({ ...identity, vault_state: identity.treasury }, profile), /not the vault PDA/);
-    assert.throws(() => resolveSolanaIdentity({ ...identity, pyth_price_account: '0x00' }, profile), /base58/);
-    assert.throws(() => resolveSolanaIdentity({ ...identity, pyth_price_account: identity.treasury }, profile),
-        /not the push-oracle account/);
+    assert.throws(() => resolveSolanaIdentity({ ...identity, treasury_token_account: null }, profile),
+        /no treasury_token_account \(undeployed\)/);
+    assert.throws(() => resolveSolanaIdentity({ ...identity, vault_state: identity.treasury_token_account }, profile),
+        /not the vault PDA/);
+    assert.throws(() => resolveSolanaIdentity({ ...identity, treasury_token_account: '0x00' }, profile), /base58/);
+    assert.throws(() => resolveSolanaIdentity({ ...identity, treasury: identity.treasury_token_account }, profile),
+        /unknown fields treasury/);
 });
 
 test('deployment inputs are strict: known fields, secure URLs and signing-key field elements only', async () => {

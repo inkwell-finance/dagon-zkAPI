@@ -3,16 +3,17 @@ import test from 'node:test';
 import { BrowserWalletRuntime } from '../services/browserWalletRuntime.js';
 import { ZkapiClient } from '../services/zkapiClient.js';
 import { walletErrorMessage } from '../services/zkapiWalletError.mjs';
-import { base58Encode } from '../services/zkapiSolanaTransport.mjs';
-import { nativeFunding, nativeQuote } from './helpers/native-fixtures.mjs';
+import { base58Encode, inspectPreparedSolanaMessage } from '../services/zkapiSolanaTransport.mjs';
+import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID, usdcAssociatedTokenAddress, vaultTokenAddress }
+    from '../services/zkapiUsdc.mjs';
+import { rpcAccount, tokenAccountData, usdcFunding } from './helpers/usdc-fixtures.mjs';
 
-const funding = nativeFunding();
+const funding = usdcFunding();
 const DESTINATION = base58Encode(new Uint8Array(32).fill(12));
 
 function successorHarness({ response = null, worker = null, preparedWithdrawal = null } = {}) {
     const runtime = new BrowserWalletRuntime();
-    const q = nativeQuote(funding);
-    const request = { client_request_id: 'withheld-request', payload: JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1, billing_quote: q }),
+    const request = { client_request_id: 'withheld-request', payload: JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1 }),
         public_inputs: { request_nullifier: '0x42', solvency_bound: 50_000 } };
     runtime.config = { funding, wallet_core: {}, proving_keys: { request: {} } };
     runtime.runtime = { state: { note_id: 1, current_balance: 2_000_000, current_anchor: '0x7', bound_at_state: 50_000 },
@@ -21,7 +22,7 @@ function successorHarness({ response = null, worker = null, preparedWithdrawal =
     runtime.remoteJson = async url => {
         assert.match(url, /\/v2\/requests\/withheld-request$/);
         return { nullifier_status: 'reserved', request_response: response
-            && { ...response, response_payload: JSON.stringify({ billing_quote: q }) } };
+            && { ...response, response_payload: '{}' } };
     };
     runtime.worker = { call: worker || (async () => assert.fail('a withheld successor is never installed')) };
     return runtime;
@@ -61,18 +62,59 @@ test('a signed successor failing S3-S5 is treated as withheld and records the re
     assert.equal(forged.runtime.journal.invalidSuccessor, undefined);
 });
 
-test('a settlement receipt must carry the exact SOL/USD quote the request proved', async () => {
-    const runtime = successorHarness({ response: { charge_applied: 1 },
-        worker: async () => assert.fail('a receipt with another quote is never installed') });
-    const original = runtime.remoteJson;
-    runtime.remoteJson = async url => {
-        const recovery = await original(url);
-        const payload = JSON.parse(recovery.request_response.response_payload);
-        payload.billing_quote = { ...payload.billing_quote, price: '100000000001' };
-        recovery.request_response.response_payload = JSON.stringify(payload);
-        return recovery;
-    };
-    await assert.rejects(runtime.installRecoveredResponse('withheld-request'), /authorized SOL\/USD quote/);
+test('a missing wallet USDC payout account is created first; foreign or frozen payout accounts are refused', async t => {
+    const runtime = new BrowserWalletRuntime();
+    runtime.init = async () => {};
+    runtime.config = { funding };
+    const ata = usdcAssociatedTokenAddress(DESTINATION);
+    let ataAccount = null;
+    const methods = [];
+    let sentMessage = null;
+    t.mock.method(globalThis, 'fetch', async (url, init) => {
+        assert.equal(url, funding.rpc_url);
+        const { method, params } = JSON.parse(init.body);
+        methods.push(method);
+        let result;
+        if (method === 'getAccountInfo') {
+            result = { context: { slot: 1 }, value: params[0] === ata && ataAccount
+                ? rpcAccount(TOKEN_PROGRAM_ID, ataAccount) : null };
+        } else if (method === 'getGenesisHash') result = funding.genesis_hash;
+        else if (method === 'getLatestBlockhash') result = { value: { blockhash: funding.genesis_hash, lastValidBlockHeight: 99 } };
+        else if (method === 'sendTransaction') {
+            const bytes = Buffer.from(params[0], 'base64');
+            sentMessage = bytes.subarray(65);
+            ataAccount = tokenAccountData({ owner: DESTINATION });
+            result = base58Encode(bytes.subarray(1, 65));
+        } else {
+            assert.equal(method, 'getSignatureStatuses');
+            result = { value: [{ slot: 5, confirmationStatus: 'finalized', err: null }] };
+        }
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result }));
+    });
+    const account = { address: DESTINATION, publicKey: new Uint8Array(32).fill(12),
+        chains: [funding.wallet_standard_chain], features: ['solana:signTransaction'] };
+    const wallet = { features: { 'solana:signTransaction': { signTransaction: async ({ transaction }) => {
+        const signed = Uint8Array.from(transaction);
+        signed.fill(7, 1, 65);
+        return [{ signedTransaction: signed }];
+    } } } };
+    const created = await runtime.ensureUsdcPayoutAccount(ata, { wallet, account });
+    assert.equal(created.creditable, true);
+    const inspected = inspectPreparedSolanaMessage(sentMessage);
+    assert.equal(base58Encode(inspected.program), ASSOCIATED_TOKEN_PROGRAM_ID);
+    assert.deepEqual([...inspected.instructionData], [1]);
+    assert.equal(base58Encode(inspected.instructionAccounts[1].pubkey), ata);
+    // An existing creditable account needs no transaction.
+    methods.length = 0;
+    await runtime.ensureUsdcPayoutAccount(ata, { wallet, account });
+    assert.deepEqual(methods, ['getAccountInfo']);
+    // Only the wallet's own canonical account is ever created.
+    const foreign = usdcAssociatedTokenAddress(base58Encode(new Uint8Array(32).fill(13)));
+    await assert.rejects(runtime.ensureUsdcPayoutAccount(foreign, { wallet, account }),
+        error => error.code === 'usdc_destination_not_creditable');
+    ataAccount = tokenAccountData({ owner: DESTINATION, state: 2 });
+    await assert.rejects(runtime.ensureUsdcPayoutAccount(ata, { wallet, account }), /frozen/);
+    assert.equal(methods.includes('sendTransaction'), false);
 });
 
 test('a successor arriving after an exit proof left the device is not installed while that proof can land (E4.6)', async () => {
@@ -247,15 +289,17 @@ test('a canceled escape keeps its released proof frozen until the proof is dead 
     await assert.rejects(runtime.clearPreparedWithdrawal(), /mutual-close authorization/);
 });
 
-test('withdrawal destinations are canonical Solana accounts and never the vault state', async () => {
+test('withdrawal destinations are canonical USDC token accounts and never a vault account', async () => {
     const client = new ZkapiClient();
     client.config = { funding };
     client.performWithdrawal = async (mode, _status, options) => ({ mode, ...options });
     assert.deepEqual(await client.withdraw('escape', () => {}, { destination: DESTINATION }),
         { mode: 'escape', destination: DESTINATION, earlyConcession: null });
     assert.deepEqual(await client.withdraw('mutual'), { mode: 'mutual', destination: null, earlyConcession: null });
-    await assert.rejects(client.withdraw('escape', () => {}, { destination: `0x${'12'.repeat(20)}` }), /base58|Solana/);
-    await assert.rejects(client.withdraw('escape', () => {}, { destination: funding.vault_state }), /vault state account/);
+    await assert.rejects(client.withdraw('escape', () => {}, { destination: `0x${'12'.repeat(20)}` }), /base58|USDC/);
+    await assert.rejects(client.withdraw('escape', () => {}, { destination: funding.vault_state }), /Dagon vault account/);
+    await assert.rejects(client.withdraw('escape', () => {},
+        { destination: vaultTokenAddress(funding.program_id, funding.vault_state) }), /Dagon vault account/);
 });
 
 test('deposits and withdrawals require a Wallet Standard Solana account on the pinned cluster', async () => {
