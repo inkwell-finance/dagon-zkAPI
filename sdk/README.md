@@ -249,6 +249,254 @@ blocked by the freeze. `client.cancelPreparedWithdrawal()` cancels an escape
 that never finalized once its proof is dead; a mutual close, whose clearance
 the server already reserved, is finished or escaped instead.
 
+## Cross-chain USDC through CCTP (program-free)
+
+The SDK can fund a note from an EVM chain and pay a note out to an EVM address
+through Circle CCTP V2 without new on-chain code. Each note has its own
+**emergency key** `ek`: an ed25519 key derived from the note secret
+(HKDF-SHA256, info `dagon-zkapi/cctp-ek/v1`). Minted transit USDC sits in
+`ATA(ek)`, controlled by that key. A relayer (`zkapi-serverd`, `/v2/relay/*`)
+pays SOL and rent, collecting capped USDC fees atomically. A relayed escape
+requires USDC prefunding of `ATA(ek)`; self-funded recovery requires SOL.
+CCTP does not improve privacy: Circle and the relayer can link the EVM
+address, note and destination. The SDK must run in a trusted wallet origin:
+malicious same-origin JavaScript can read its secrets and change its checks.
+
+```js
+// EVM → private note. The plan is persisted and its backup is mandatory before the burn.
+let result = await client.cctpDeposit({ sourceChain: 'base', amount: '25', finality: 'fast', evmProvider: window.ethereum });
+if (result.status === 'backup_required') {
+  await saveBackupFile(result.backup);               // secret, emergency key, intent, authorized CCTP fee
+  await client.cctpAcknowledgeBackup(result.backup.operationId);
+  result = await client.cctpDeposit({ evmProvider: window.ethereum });   // or pass onBackup to do both at once
+}
+// Private note → EVM address (mutual close, or escape and finalize later).
+await client.cctpExit({ kind: 'mutual', destinationChain: 'arbitrum', recipient: '0x…', claim: 'forward' });
+await client.cctpResumeExit(recordId, { waitForChallenge: true }); // after an escape's challenge window
+// Emergency paths.
+await client.cctpSweep({ to: solanaUsdcAccountOrWallet });      // ATA(ek) → any Solana USDC account
+await client.cctpRefund({ force: false });                       // undeposited arrival → the EVM burner
+await client.cctpEmergencyInfo();                                // where the funds are, which key holds them
+```
+
+**Backup scope and browser loss.** The mandatory initial backup recovers the
+emergency key and a **never-used** note, not the current state of a note used
+for private requests. Used notes additionally require the latest private state
+(including balance blinding and signature) and any pending-request journal.
+Losing those can prevent spending and escape; expiry can send the funds to
+the treasury. Persistent browser storage is not an external backup.
+
+In an empty wallet, `await client.cctpImportBackup(backup)` imports emergency
+funds without initiating another EVM burn. Then use `cctpSweep` or `cctpRefund`.
+For a note you have **never used**, pass
+`{ restoreUnspentNote: true, noteId }`; omitting `noteId` scans the pinned vault
+for a unique matching commitment. A reported used/reserved genesis nullifier
+is refused, and existing wallet state is never overwritten. An unavailable
+operator does not block recovery of a genuinely never-used note. Neither an
+unavailable server nor its negative report proves non-use: this option is
+your assertion that the note has never been used.
+To resume an unminted inbound transfer, also supply its source `burnTxHash`;
+the pre-burn backup cannot contain that future hash. Old backups lacking the
+inbound finality still recover the emergency key but cannot resume the burn
+tracking flow. Circle refusal/pause/blacklisting cannot be bypassed by a backup.
+
+**Deposit** (`cctpDeposit`):
+1. Reads the relayer (`GET /v2/relay`), connects the EVM wallet
+   (`eth_requestAccounts`, `wallet_switchEthereumChain`) and checks the USDC
+   balance.
+2. Creates the note secret and stores the plan in IndexedDB. The plan holds an
+   InboundIntent v1 (refund to the burner on the source domain after 72 h,
+   priority relayer = the relay key) and the hook `cctp-forward` (ATA creation
+   for `ek`) ‖ `"DGNZK-IN"` ‖ intent.
+3. Stops in phase `backup_required` and returns `{ status: 'backup_required',
+   backup }`. The backup also reports whether the browser granted persistent
+   storage. The burn is requested only after the acknowledgement is persisted:
+   either an `onBackup` handler resolves (anything but `false`), or the host
+   calls `cctpAcknowledgeBackup()`.
+4. Approves USDC only if the allowance is short, then calls
+   `depositForBurnWithHook(amount, 5, ATA(ek), usdc, 0, maxFee, 1000|2000, hook)`.
+   `maxFee` is Circle's Fast fee + the high forward fee with ATA creation +
+   headroom, within the fee policy (see Fees). Sources where Circle offers no
+   Fast route use Standard. The burn hash is stored as soon as the wallet
+   returns it. If it was lost, resume with `{ burnTxHash }`.
+
+**Arrival.** Iris's message is accepted only after every field is compared
+with the plan: versions, domains, sender (the source TokenMessengerV2),
+recipient (TokenMessengerMinterV2), destination caller 0, burn token (the
+source USDC), mint recipient `ATA(ek)`, amount, message sender (the burner),
+max fee, minimum and executed finality, and hook. Its attestation must also
+verify against the **pinned attesters** (see Configuration). The transfer
+counts as arrived only when its CCTP nonce is used on Solana and `ATA(ek)` holds
+the attested net mint (amount − feeExecuted). Only that amount is deposited:
+dust sent to the public `ATA(ek)` never stands in for the transfer and stays
+sweepable.
+
+**Fallback receive.** If Circle's forwarder is late (`receiveFallbackMs` after
+attestation), the SDK asks `/v2/relay/receives/prepare`. That call only works
+once `ATA(ek)` exists; otherwise the wallet keeps waiting for the forwarder.
+The receive is free and signed by the relayer alone. The SDK reads its address
+lookup table from the RPC (owner, active, contents) and requires exactly
+`[SetComputeUnitLimit(≤ 1.4M), receive_message(payer = caller = relayer,
+recipient ATA(ek))]` of the validated message with a pinned attestation. A
+compute-unit price is refused. It then broadcasts it.
+Subsidized fallback receives require a minimum source burn (default 1 USDC)
+and obey durable SOL/day and source/ek quotas. Refusal does not prevent
+Circle's forwarder or an independently funded receive; the wallet keeps
+watching for that arrival. Arrival requires Circle-owned `UsedNonce` state
+with the correct discriminator and `is_used = true`, not mere PDA existence.
+Expired, unused inbound messages are re-attested through Iris, then checked
+again against the original intent and pinned attesters.
+
+**Relay submission.** Every ek-co-signed relay transaction (deposit, exit,
+burn, sweep) is prepared **unsigned**: every signature slot, the relayer's
+included, is zero, and the prepare returns an opaque `submit_token`. The SDK
+validates the message exactly and checks its actual blockhash in the trusted
+RPC's queue. An RPC head at least as new as that observation supplies a
+conservative expiration bound (`expiryHeight`), independent of the relay's
+unsigned `last_valid_height` metadata. It signs with `ek`, journals the
+ek-signed bytes, token and bound, and POSTs `{ token, transaction }` to
+`/v2/relay/submit`. Older signed journals get a fresh conservative bound
+persisted before retrying; this can add one blockhash lifetime of waiting. The
+relay signs (relayer and, for burns, the MessageSent event key), broadcasts and
+returns the complete transaction. The SDK accepts it only if the message bytes
+are identical, its `ek` signature is unchanged and every signature is valid
+(`cctp_relay_tx_rejected` otherwise; nothing is broadcast). It then journals
+the full bytes and confirms them as before. After a crash the same token and
+bytes are re-submitted (idempotent). No submit error, including
+`relay_transaction_expired`, authorizes replacement until the trusted RPC's
+**finalized** block height passes the journaled RPC-derived `expiryHeight`. A premature
+relay expiry claim returns `cctp_relay_pending`. After finalized expiry any
+submit refusal (including 400 after key rotation or simulation failure) permits
+recovery; the flow first checks chain state (note, burn event account history,
+`ATA(ek)` balance) in case it landed. Within the lifetime other submit refusals
+surface with their original code and retain the journal. Deposit, refund-burn and
+transit-sweep prepares also send `inbound` (the attested inbound transfer:
+`source_domain`, `message`, `attestation`) as the relay's sponsorship
+credential when the plan has it; exits and their burns send none.
+
+**Deposit transaction.** The SDK reads a fresh vault path and calls
+`/v2/relay/deposits/prepare`. Before signing with `ek` it requires:
+- the v0 transaction itself to contain initialization and the complete
+  344-byte payload, with this note ID, commitment, amount and matching digest;
+- the emergency key to own the buffer (so a relayer cannot cancel/recreate it);
+- exactly [SOL rent advance relayer → ek, initialize, write, heap frame,
+  compute-unit limit, execute with owner = depositor = ek, capped USDC fee,
+  buffer-rent refund ek → relayer], with every account and privilege checked;
+- rent amounts to match the pinned RPC and lookup-table contents to match chain;
+- the fee to be at most the cap.
+
+The ek-signed bytes are stored before submission (phase `signed`) and the
+complete bytes before confirmation (phase `submitted`). A transaction that
+expires or fails is rebuilt; one that lands is confirmed from the finalized
+note account (`confirmSolanaDeposit`).
+
+**Exit** (`cctpExit`):
+1. Proves the close or escape with destination `ATA(ek)`. The CCTP fee ceiling
+   of the later burn is fixed now and persisted (status `authorized`). Before
+   proving, a relayed exit whose expected burn is below the relay's
+   `burn_minimum` is refused (`cctp_exit_below_minimum`).
+2. Asks `/v2/relay/exits/prepare` for a v0 transaction. The SDK checks it
+   exactly, signs it with `ek` and submits it through the relay:
+   - close: [heap, CU limit, `CreateIdempotent(ATA(ek))`, `execute_close(owner =
+     relayer, destination ATA(ek))` of this proof, `TransferChecked(fee)`]. The
+     fee is paid from the payout and must not exceed it.
+   - escape: [heap, CU limit, `execute_escape(…)`, `TransferChecked(fee)`]. The
+     fee is prepaid, so `ATA(ek)` must already hold at least the escape quote
+     (`cctp_escape_fee_required` otherwise).
+3. Records the withdrawal from the finalized note and pending accounts. An
+   escape is finalized after its window through `/v2/relay/escapes/finalize`.
+4. Asks `/v2/relay/burns/prepare` for a burn of the whole balance. The amount
+   must be balance − fee, the instruction must equal the SDK's own
+   `deposit_for_burn(_with_hook)` (owner `ek`, recipient, domain, the authorized
+   max CCTP fee, finality, hook), and only the relayer and the fresh event
+   keypair may co-sign. The SDK signs it and submits it through the relay; the
+   event account, target and amount are journaled before submission.
+5. Accepts Iris's attestation only if it matches the burn's on-chain
+   `MessageSent` bytes, except the fields Iris fills (nonce, executed finality,
+   fee executed, expiration block), and verifies against the pinned attesters.
+   If the rent payer has already reclaimed `MessageSent`, the wallet instead
+   reconstructs every source-controlled field from the validated finalized
+   burn and trusted chain deployment; the pinned attestation is still required.
+
+With `claim: 'forward'` Circle's Forwarding Service mints on the destination.
+With `claim: 'self'`, call `client.cctpClaim({ recordId, evmProvider })`. Zero,
+burn and CCTP/USDC contract addresses are refused as recipients.
+
+**Fees.**
+- **Relay fees.** Every relay call carries `max_fee` = the SDK cap for that
+  transaction kind (`CCTP_FEE_CAPS`, USDC base units: deposit 400 000, receive
+  0 (receives are free), close 750 000, escape 750 000, burn and sweep
+  **50 000 each**). Burn fees cover three burn signatures plus one reclaim
+  signature and margin, not rent.
+  The relay floats MessageSent rent and reclaims it after five days. At SOL
+  $150/$180 with 20% margin, burns cost 0.003600/0.004320 USDC and sweeps
+  0.001800/0.002160 USDC, independent of the burn hook length.
+  A higher fee is refused before signing; host overrides may only lower caps.
+  **CCTP exits under $5 are not relayed by default** (net burn after the relay
+  fee; operator-configurable, published as `burn_minimum`). A relayed
+  `cctpExit` whose note plus emergency-account balance, less the worst-case
+  exit and burn quotes, is below it fails with `cctp_exit_below_minimum`
+  before any clearance or proof, so the payout is never stranded in ATA(ek).
+  Exit on Solana, sweep, or burn with your own SOL.
+  The durable 0.5 SOL outstanding-rent backstop refuses new sponsored burns
+  until rent returns. Durable failed-fee and per-address limits also apply.
+- **CCTP fees.** The CCTP `maxFee` a burn authorizes is capped by
+  `CCTP_FEE_POLICY`, max(minimum, bps × amount):
+  - inbound ≤ max(0.50 USDC, 0.5 %);
+  - outbound with forwarding ≤ max(1.50 USDC, 0.5 %), which covers the
+    Ethereum forward fee of about $0.7–1.2;
+  - outbound self-claim ≤ max(0.10 USDC, 0.1 %).
+
+  An Iris quote above the policy is refused (`cctp_fee_above_policy`), and
+  headroom never lifts `maxFee` above it. A persisted ceiling (the intent's
+  refund fee, an exit's fee fixed at proving) is never raised automatically.
+  If Circle's quote rises above it, the burn stops with
+  `cctp_fee_above_authorized`. The user re-authorizes within policy with
+  `cctpRefund({ maxCctpFee })` or `cctpResumeExit(recordId, { maxCctpFee })`.
+
+**No relayer.** If the relay is disabled or unreachable, flows fail with
+`code: 'relay_unavailable'`. The error carries `emergencyKey`,
+`emergencyAccount` and `balance` and says that the funds are safe in `ATA(ek)`.
+Fund `ek` with about 0.005 SOL and pass `{ selfFunded: true }`: the same
+transactions are then built with `ek` as fee payer. Deposits and exits use the
+existing single-signer journaled paths with `ek` as the wallet; burns and
+sweeps are built locally. A relay transaction whose complete bytes were
+returned by `/v2/relay/submit` is still rebroadcast without the relayer; one
+that was only ek-signed waits for the relayer until its blockhash expires, then
+the self-funded path takes over.
+
+**Resume and refunds.** Every phase is persisted, and calling the same method
+again resumes it:
+- the deposit plan is in `pending_deposit.cctp`;
+- the exit plan is in the withdrawal record's `cctpExit`;
+- the key seed never appears in snapshots.
+
+`cctpCancelDeposit()` is allowed only before the burn was requested.
+`cctpRefund()` is refused before the intent's `refund_after` unless
+`{ force: true }`. Refunded, swept and canceled deposit plans are archived with
+their secret, never deleted.
+
+**Configuration.**
+```js
+configureBrowserSdk({ cctp: {
+  irisUrl, relayUrl, attesters, attestationThreshold, feeRecipientTokenAccount,
+  evmChains: { base: { chainId, domain, usdc, tokenMessenger, messageTransmitter } },
+  feeCaps: { deposit: 400000n }, feePolicy: { inbound: { minimum: 500000n, bps: 50 } },
+  receiveFallbackMs, pollIntervalMs, /* … */
+} });
+```
+These options override `CCTP_DEFAULTS`, e.g. for a local iris-sim and anvil
+fork:
+- **Attesters.** Mainnet pins Circle's two attesters (`CIRCLE_ATTESTERS`,
+  threshold 2). Other networks must configure `attesters`, e.g. the iris-sim
+  test keys; without them no CCTP flow starts (`cctp_attesters_unconfigured`).
+  A configured Iris URL cannot vouch for a message by itself.
+  Rotation fails closed: old SDK pins reject new signatures until a reviewed
+  SDK/configuration update. Never learn replacement pins from Iris itself.
+  Already minted emergency-key funds remain sweepable without attestation.
+- **Iris URL.** Without `irisUrl`, mainnet uses `iris-api.circle.com`, devnet
+  and testnet use the sandbox, and localnet uses the relayer's `iris_url`.
+
 ## Deposits and inference
 
 `client.deposit(amount, onStatus)` deposits an exact USDC amount (a decimal

@@ -1,6 +1,6 @@
 // Host integration is explicit: importing the SDK does not create a worker,
 // connect a wallet, fetch configuration, or enable an application proxy.
-let options = Object.freeze({ transport: null, configUrl: null, workerUrl: null, mode: 'browser' });
+let options = Object.freeze({ transport: null, configUrl: null, workerUrl: null, mode: 'browser', cctp: null });
 let initializing = false;
 
 function absoluteUrl(value, label) {
@@ -14,13 +14,18 @@ function absoluteUrl(value, label) {
     return url.href;
 }
 
-/** Configure the page's single wallet before calling client.init(). */
+/**
+ * Configure the page's single wallet before calling client.init(). `cctp`
+ * overrides the CCTP flow defaults (fee caps, Iris URL, relay URL, EVM chain
+ * table, timeouts; see zkapiCctpWallet.mjs CCTP_DEFAULTS), e.g. for a local
+ * iris-sim and anvil fork.
+ */
 export function configureBrowserSdk(next = {}) {
     if (initializing) throw new Error('Configure the zkAPI browser SDK before initializing its wallet.');
     if (!next || typeof next !== 'object' || Array.isArray(next)) {
         throw new TypeError('zkAPI browser SDK configuration must be an object.');
     }
-    const unknown = Object.keys(next).filter(key => !['transport', 'configUrl', 'workerUrl', 'mode'].includes(key));
+    const unknown = Object.keys(next).filter(key => !['transport', 'configUrl', 'workerUrl', 'mode', 'cctp'].includes(key));
     if (unknown.length) throw new TypeError(`Unknown zkAPI browser SDK option: ${unknown.join(', ')}.`);
     const merged = { ...options, ...next };
     if (merged.transport !== null && typeof merged.transport !== 'function') {
@@ -29,8 +34,12 @@ export function configureBrowserSdk(next = {}) {
     if (merged.mode !== 'browser') {
         throw new TypeError('Only browser mode is supported; local daemon and automatic probing modes have been removed.');
     }
+    if (merged.cctp !== null && (typeof merged.cctp !== 'object' || Array.isArray(merged.cctp))) {
+        throw new TypeError('zkAPI cctp options must be an object.');
+    }
     merged.configUrl = absoluteUrl(merged.configUrl, 'configUrl');
     merged.workerUrl = absoluteUrl(merged.workerUrl, 'workerUrl');
+    merged.cctp = merged.cctp ? Object.freeze({ ...merged.cctp }) : null;
     options = Object.freeze(merged);
     return options;
 }

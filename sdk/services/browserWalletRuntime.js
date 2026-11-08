@@ -11,6 +11,7 @@ import { assertSolanaVault, confirmFinalizedSolanaTransaction, isUsdcFunding, le
 import { base58Decode, base58Encode, submitPreparedSolanaOperation }
     from './zkapiSolanaTransport.mjs';
 import { prepareLocalSolanaExit, prepareLocalUsdcAccountCreation } from './zkapiSolanaExit.mjs';
+import { readFinalizedNoteState } from './zkapiCctpWallet.mjs';
 import {
     assertSolanaOperationJournal,
     createSolanaOperationJournal,
@@ -669,7 +670,17 @@ class BrowserWalletRuntime extends EventTarget {
                 amount: Number(pendingDeposit.amount),
                 replannable: Boolean(this.config?.funding)
                     && this.canReplanPendingDeposit(pendingDeposit),
-                next_note_id: Number(pendingDeposit.next_note_id)
+                next_note_id: Number(pendingDeposit.next_note_id),
+                // Public CCTP progress only; the plan's secret never leaves the runtime.
+                cctp: pendingDeposit.cctp ? {
+                    phase: pendingDeposit.cctp.phase,
+                    source_chain: pendingDeposit.cctp.sourceChain,
+                    burn_amount: pendingDeposit.cctp.burnAmount,
+                    burn_tx_hash: pendingDeposit.cctp.burnTxHash || null,
+                    emergency_key: pendingDeposit.cctp.ekPublicKey,
+                    emergency_account: pendingDeposit.cctp.ata,
+                    refund_after: pendingDeposit.cctp.refundAfter
+                } : null
             } : null,
             prepared_withdrawal: prepared ? {
                 mode: prepared.mode,
@@ -700,8 +711,13 @@ class BrowserWalletRuntime extends EventTarget {
                     withdrawalNullifier: _nullifier,
                     inFlightJournal: _journal,
                     solanaFinalizationJournal: _finalization,
-                    ...summary
+                    ...rest
                 } = record;
+                const summary = { ...rest };
+                if (rest.cctpExit) {
+                    const { ekSeed: _seed, ...cctpExit } = rest.cctpExit;
+                    summary.cctpExit = cctpExit;
+                }
                 return summary;
             })
         };
@@ -886,11 +902,15 @@ class BrowserWalletRuntime extends EventTarget {
         if (!plan || !Array.isArray(plan.zero_path) || plan.zero_path.length !== 32) {
             throw new Error('A complete durable deposit plan is required.');
         }
+        // The server's body takes `amount` as a JSON integer (u128); vault
+        // amounts are bounded by MAX_CREDIT_UNITS = 2^53 − 1, so it is exact.
+        const amount = Number(plan.amount);
+        if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('The deposit plan has an invalid amount.');
         return this.prepareSolanaLedgerOperation('deposit', {
             payer,
             expected_note_id: Number(plan.next_note_id),
             commitment: plan.commitment,
-            amount: String(plan.amount),
+            amount,
             zero_path: plan.zero_path
         });
     }
@@ -1207,22 +1227,34 @@ class BrowserWalletRuntime extends EventTarget {
      * commitment/amount. The operator's tree mirror is deliberately not
      * consulted: exits are leaf-bound and root-free, so withholding the
      * indexer must never keep a landed deposit from becoming exitable.
-     * Requests read and verify the mirror themselves.
+     * Requests read and verify the mirror themselves. A relayed CCTP deposit
+     * (signed by its emergency key, no wallet journal) is read at its note PDA.
      */
     async confirmSolanaDeposit() {
         await this.init();
         const plan = await this.pendingDeposit();
         const journal = await this.currentSolanaOperationJournal('deposit');
-        if (!plan || !journal || plan.operationId !== journal.operationId
-            || !resumeSolanaOperationJournal(journal).completed) {
-            throw new Error('The Solana deposit has not finalized every transaction stage.');
-        }
         const funding = this.config.funding;
-        const operationState = await readFinalizedSolanaOperationState(
-            funding,
-            journal.operation,
-            { noteId: Number(plan.next_note_id) }
-        );
+        let operationState;
+        let transactionHash;
+        if (plan?.cctp && !journal) {
+            if (plan.cctp.phase !== 'deposited') {
+                throw new Error('The CCTP deposit has not finalized its emergency-key transaction.');
+            }
+            operationState = await readFinalizedNoteState(funding, Number(plan.next_note_id));
+            transactionHash = plan.cctp.deposit?.signature || null;
+        } else {
+            if (!plan || !journal || plan.operationId !== journal.operationId
+                || !resumeSolanaOperationJournal(journal).completed) {
+                throw new Error('The Solana deposit has not finalized every transaction stage.');
+            }
+            operationState = await readFinalizedSolanaOperationState(
+                funding,
+                journal.operation,
+                { noteId: Number(plan.next_note_id) }
+            );
+            transactionHash = journal.stages.at(-1)?.signature || null;
+        }
         const note = operationState.note;
         if (!note || note.status !== 'active'
             || !sameFelt(note.commitment, plan.commitment)
@@ -1244,7 +1276,7 @@ class BrowserWalletRuntime extends EventTarget {
             amount: Number(plan.amount),
             commitment: plan.commitment,
             expiry_ts: expiry,
-            transactionHash: journal.stages.at(-1)?.signature || null
+            transactionHash
         });
     }
 
@@ -1256,20 +1288,29 @@ class BrowserWalletRuntime extends EventTarget {
             || !resumeSolanaOperationJournal(journal).completed) {
             throw new Error('The Solana withdrawal has not finalized every transaction stage.');
         }
-        const noteId = Number(plan.noteId ?? plan.public_inputs?.note_id);
-        const funding = this.config.funding;
         const operationState = await readFinalizedSolanaOperationState(
-            funding,
+            this.config.funding,
             journal.operation,
-            { noteId }
+            { noteId: Number(plan.noteId ?? plan.public_inputs?.note_id) }
         );
+        return this.recordSolanaWithdrawalState(plan, operationState, journal.stages.at(-1)?.signature || null);
+    }
+
+    /**
+     * Record a finalized exit observed in `operationState` (note and pending
+     * accounts read at finalized commitment): detach the closed or escaping
+     * note into its withdrawal record. A CCTP exit's plan travels with it.
+     */
+    async recordSolanaWithdrawalState(plan, operationState, signature) {
+        await this.init();
+        const noteId = Number(plan.noteId ?? plan.public_inputs?.note_id);
         const finalBalance = BigInt(plan.public_inputs?.final_balance);
-        const signature = journal.stages.at(-1)?.signature || null;
         const observedSlot = Number(operationState.slot);
         if (!Number.isSafeInteger(observedSlot) || observedSlot < 0
             || finalBalance < 0n || finalBalance > BigInt(Number.MAX_SAFE_INTEGER)) {
             throw new Error('The finalized Solana withdrawal has invalid accounting metadata.');
         }
+        const cctpExit = plan.cctp ? { ...plan.cctp, phase: plan.mode === 'mutual' ? 'exited' : 'escape_pending' } : null;
         if (plan.mode === 'mutual') {
             // A close keeps the note's leaf: the note reads Closed, never pending.
             if (operationState.pending || (operationState.note && operationState.note.status !== 'closed')) {
@@ -1284,7 +1325,8 @@ class BrowserWalletRuntime extends EventTarget {
                 transactionHash: signature,
                 closeBlockNumber: observedSlot,
                 lastObservedBlock: observedSlot,
-                clearanceReserved: true
+                clearanceReserved: true,
+                cctpExit
             });
             const finalized = await this.updateWithdrawal(record.recordId, {
                 phase: 'closed',
@@ -1326,7 +1368,8 @@ class BrowserWalletRuntime extends EventTarget {
             challengeDeadline: deadline,
             transactionHash: signature,
             startBlockNumber: observedSlot,
-            lastObservedBlock: observedSlot
+            lastObservedBlock: observedSlot,
+            cctpExit
         });
         return { status: 'pending_withdrawal', record, signature, slot: operationState.slot };
     }
@@ -1481,6 +1524,17 @@ class BrowserWalletRuntime extends EventTarget {
             journal.operation,
             { noteId: Number(record.noteId) }
         );
+        return this.recordSolanaPendingRecordState(recordId, kind, operationState,
+            journal.stages.at(-1)?.signature || null);
+    }
+
+    /**
+     * Record a finalized escape finalization or payout release observed in
+     * `operationState` (note and pending accounts at finalized commitment).
+     */
+    async recordSolanaPendingRecordState(recordId, kind, operationState, signature) {
+        const record = await this.currentWithdrawal(recordId);
+        if (!record || record.mode !== 'escape') throw new Error('The saved escape is no longer available.');
         // Finalization closes the note but keeps its leaf (a release may
         // follow its retirement); no root changes.
         const { note, pending } = operationState;
@@ -1493,7 +1547,6 @@ class BrowserWalletRuntime extends EventTarget {
         if (!Number.isSafeInteger(slot) || slot < 0) {
             throw new Error('The finalized Solana escape has an invalid slot.');
         }
-        const signature = journal.stages.at(-1)?.signature || null;
         // A parked payout leaves the pending record with the vault; this
         // record then waits for a release to the same saved destination.
         const finalized = await this.updateWithdrawal(recordId, {
@@ -1545,6 +1598,9 @@ class BrowserWalletRuntime extends EventTarget {
             if (this.runtime.state) throw new Error('This browser already has an active private note.');
             if (this.runtime.pendingDeposit) {
                 const pending = this.runtime.pendingDeposit;
+                if (pending.cctp) {
+                    throw new Error('A CCTP deposit is unfinished. Resume, refund or sweep it before a direct deposit.');
+                }
                 if (Number(pending.amount) === Number(amount)) return pending;
                 if (!this.canReplanPendingDeposit(pending)) {
                     throw new Error('A previous Solana deposit is unfinished. Recover it before changing the amount.');
@@ -1613,6 +1669,166 @@ class BrowserWalletRuntime extends EventTarget {
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             return this.runtime.pendingDeposit ? { ...this.runtime.pendingDeposit } : null;
+        });
+    }
+
+    /**
+     * Create and durably persist a CCTP deposit plan (note secret and
+     * commitment first, then `build({ secret, commitment })` adds the CCTP
+     * plan derived from them) before any EVM prompt. An unfinished CCTP plan
+     * is returned instead of a new one.
+     */
+    async beginCctpDeposit(build) {
+        await this.init();
+        this.requireOnlineDeployment();
+        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
+            await this.reload();
+            if (this.runtime.state) throw new Error('This browser already has an active private note.');
+            const pending = this.runtime.pendingDeposit;
+            if (pending?.cctp) return structuredClone(pending);
+            if (pending && !this.canReplanPendingDeposit(pending)) {
+                throw new Error('A previous Solana deposit is unfinished. Recover it before starting a CCTP deposit.');
+            }
+            const params = await this.worker.call('generateDeposit');
+            const plan = {
+                operationId: uuid(),
+                createdAt: Date.now(),
+                phase: 'cctp',
+                amount: null,
+                secret: params.secret,
+                commitment: params.registration_commitment,
+                next_note_id: null,
+                active_root: null,
+                zero_path: null
+            };
+            plan.cctp = build({ secret: plan.secret, commitment: plan.commitment });
+            await this.commit({ ...this.runtime, pendingDeposit: plan });
+            return structuredClone(plan);
+        });
+    }
+
+    /** Import only into an empty wallet; never replace a newer state/journal. */
+    async importCctpBackup(plan, note = null) {
+        await this.init();
+        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
+            await this.reload();
+            if (this.runtime.state || this.runtime.journal || this.runtime.preparedWithdrawal
+                || this.runtime.pendingDeposit || this.runtime.lease) {
+                throw new Error('Backup import requires an empty wallet. Do not overwrite current private state.');
+            }
+            let state = null;
+            if (note) {
+                state = await this.worker.call('confirmDeposit', { config: this.config.wallet_core,
+                    args: { secret: plan.secret, note_id: note.noteId, amount: Number(note.amount),
+                        expiry_ts: Number(note.expiry) } });
+                const nullifier = await this.worker.call('withdrawalNullifier', { state });
+                // Availability cannot depend on the operator for a genuinely
+                // never-used note. This lookup is advisory: a positive record
+                // refuses import, but an unavailable server proves nothing.
+                // The caller explicitly asserts "never used"; chain guards still
+                // reject a spent exit. Initial backups cannot restore used state.
+                const usage = await this.remoteJson(
+                    `${this.config.funding.protocol_server_url}/v2/nullifiers/${encodeURIComponent(nullifier)}`)
+                    .catch(() => null);
+                if (usage && (usage.status !== 'not_found' || usage.nullifier_status !== 'unknown' || usage.request_response)) {
+                    throw Object.assign(new Error('This note has been used or reserved. Its initial backup cannot recover the latest private state and request journal.'),
+                        { code: 'cctp_used_note_backup' });
+                }
+            }
+            await this.commit({ ...this.runtime, state, pendingDeposit: note ? null : structuredClone(plan),
+                cctpArchive: note ? [...(this.runtime.cctpArchive || []), structuredClone(plan)]
+                    : this.runtime.cctpArchive });
+            return state;
+        });
+    }
+
+    /** Replace the CCTP deposit plan with `update(current)` (same operation only). */
+    async updateCctpDeposit(operationId, update) {
+        await this.init();
+        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
+            await this.reload();
+            const current = this.runtime.pendingDeposit;
+            if (!current?.cctp || current.operationId !== operationId) {
+                throw new Error('The CCTP deposit changed in another tab. Check its status before continuing.');
+            }
+            const next = update(structuredClone(current));
+            if (next.operationId !== operationId || next.secret !== current.secret
+                || next.commitment !== current.commitment || next.cctp?.ekPublicKey !== current.cctp.ekPublicKey) {
+                throw new Error('A CCTP deposit update may not change its note identity.');
+            }
+            await this.commit({ ...this.runtime, pendingDeposit: next });
+            return structuredClone(next);
+        });
+    }
+
+    /**
+     * End a CCTP deposit that will not become a note (canceled before its
+     * burn, refunded or swept). Its secret is archived, never deleted: the
+     * emergency key it derives may still receive funds later.
+     */
+    async archiveCctpDeposit(operationId, outcome, details = {}) {
+        await this.init();
+        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
+            await this.reload();
+            const current = this.runtime.pendingDeposit;
+            if (!current?.cctp || current.operationId !== operationId) {
+                throw new Error('The CCTP deposit changed in another tab. Check its status before continuing.');
+            }
+            const archived = { ...current, cctp: { ...current.cctp, ...details, phase: outcome, archivedAt: Date.now() } };
+            await this.commit({
+                ...this.runtime,
+                pendingDeposit: null,
+                cctpArchive: [...(this.runtime.cctpArchive || []), archived]
+            });
+            return structuredClone(archived);
+        });
+    }
+
+    /** The active note's secret (it derives the note's CCTP emergency key), or null without a note. */
+    async cctpNoteSecret() {
+        await this.init();
+        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
+            await this.reload();
+            return this.runtime.state?.secret_s || null;
+        });
+    }
+
+    /** The active note's current private balance (USDC base units), or null without a note. */
+    async cctpNoteBalance() {
+        await this.init();
+        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
+            await this.reload();
+            const balance = this.runtime.state?.current_balance;
+            return balance == null ? null : BigInt(balance);
+        });
+    }
+
+    /** Attach the CCTP exit plan to the prepared withdrawal (same operation only). */
+    async updatePreparedWithdrawalCctp(operationId, cctp) {
+        await this.init();
+        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
+            await this.reload();
+            const prepared = this.runtime.preparedWithdrawal;
+            if (!prepared || prepared.operationId !== operationId) {
+                throw new Error('The prepared withdrawal changed in another tab.');
+            }
+            if (prepared.cctp && prepared.cctp.ekPublicKey !== cctp.ekPublicKey) {
+                throw new Error('A different CCTP exit is already attached to this withdrawal.');
+            }
+            const next = { ...prepared, cctp };
+            await this.commit({ ...this.runtime, preparedWithdrawal: next });
+            return structuredClone(next);
+        });
+    }
+
+    /** Withdrawal records that carry a CCTP exit, oldest first. */
+    async listCctpExitRecords() {
+        await this.init();
+        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
+            await this.reload();
+            return this.withdrawals.filter(record => record.cctpExit)
+                .sort((left, right) => Number(left.createdAt || 0) - Number(right.createdAt || 0))
+                .map(record => structuredClone(record));
         });
     }
 
@@ -2695,7 +2911,8 @@ class BrowserWalletRuntime extends EventTarget {
                 transactionHash: details.transactionHash || null,
                 startBlockNumber: Number(details.startBlockNumber || 0),
                 lastObservedBlock: Number(details.lastObservedBlock || 0),
-                createdAt: Number(details.createdAt || Date.now())
+                createdAt: Number(details.createdAt || Date.now()),
+                ...(details.cctpExit ? { cctpExit: details.cctpExit } : {})
             });
             this.runtime = result.runtime;
             this.withdrawals = await listBrowserWithdrawals(this.manifest.deployment_id);
@@ -2725,6 +2942,7 @@ class BrowserWalletRuntime extends EventTarget {
                 lastObservedBlock: Number(details.lastObservedBlock || 0),
                 clearanceReserved: details.clearanceReserved === true,
                 createdAt: Number(details.createdAt || Date.now()),
+                ...(details.cctpExit ? { cctpExit: details.cctpExit } : {}),
                 closedAt: Date.now()
             });
             this.runtime = result.runtime;

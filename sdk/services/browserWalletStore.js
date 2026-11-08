@@ -305,6 +305,7 @@ export async function detachBrowserEscapeWithdrawal(record) {
     const next = normalizeRuntime({
         deploymentId: current.deploymentId,
         pendingDeposit: current.pendingDeposit,
+        cctpArchive: current.cctpArchive,
         updatedAt: now
     });
     runtimeStore.put(next, RUNTIME_KEY);
@@ -356,6 +357,7 @@ export async function detachBrowserClosedWithdrawal(record) {
     const next = normalizeRuntime({
         deploymentId: current.deploymentId,
         pendingDeposit: current.pendingDeposit,
+        cctpArchive: current.cctpArchive,
         updatedAt: now
     });
     runtimeStore.put(next, RUNTIME_KEY);

@@ -1,7 +1,7 @@
 import { PublicKey, Transaction, TransactionInstruction, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
 import { assertVaultUsdcAccounts, createUsdcAccountIdempotentInstruction, decodeSolanaNoteState,
     decodeSolanaPendingWithdrawal, decodeSolanaVaultState, readUsdcTokenAccount, solanaRpc,
-    validateSolanaFunding } from './zkapiUsdc.mjs';
+    validateSolanaFunding, vaultTokenAddress } from './zkapiUsdc.mjs';
 import { sameChainId } from './zkapiLedgerIdentity.mjs';
 import { sameFelt } from './zkapiActiveRoot.mjs';
 
@@ -86,6 +86,46 @@ async function assertCreditableDestination(funding, destination, signal) {
 }
 
 /**
+ * The vault's `execute_close` (mutual) or `execute_escape` instruction for
+ * `{ payer, destination, public_inputs, proof }`, built from the deployment
+ * pins alone (no RPC): `payer` is the vault operation owner. Also used to
+ * check a relayer-prepared exit byte for byte.
+ */
+export async function solanaExitInstruction(funding, kind, body) {
+    if (!['mutual', 'escape'].includes(kind)) throw new Error('Invalid Solana exit kind.');
+    const program = new PublicKey(funding.program_id);
+    const vault = new PublicKey(funding.vault_state);
+    const p = body.public_inputs;
+    const close = kind === 'mutual';
+    if (p?.has_clearance !== close
+        || (close ? BigInt(p.next_nullifier) !== 0n || BigInt(p.conceded) !== 0n
+            : BigInt(p.next_nullifier) === 0n || sameFelt(p.next_nullifier, p.withdrawal_nullifier))) {
+        throw new Error('Solana withdrawal does not match its note, mode, or deployment.');
+    }
+    if (body.proof?.backend !== 'groth16_bn254') throw new Error('Invalid Solana exit proof backend.');
+    const proof = decodeBase64(body.proof.proof);
+    if (proof.length !== 256) throw new Error('Invalid Solana exit proof size.');
+    const vaultToken = new PublicKey(vaultTokenAddress(funding.program_id, funding.vault_state));
+    const destination = new PublicKey(body.destination);
+    if (destination.equals(vaultToken)) throw new Error('The vault token account cannot receive a withdrawal.');
+    const noteSeed = integer(p.note_id, 4);
+    const pda = (name, seed) => PublicKey.findProgramAddressSync([utf8(name), vault.toBytes(), seed], program)[0];
+    const meta = (pubkey, isWritable = true, isSigner = false) => ({ pubkey, isWritable, isSigner });
+    const payer = new PublicKey(body.payer);
+    const used = pda('nullifier', felt(p.withdrawal_nullifier));
+    const keys = close
+        ? [meta(vault), meta(pda('note', noteSeed)), meta(used), meta(payer, true, true), meta(destination), meta(vaultToken),
+            meta(new PublicKey(funding.usdc_mint), false), meta(new PublicKey(funding.token_program), false),
+            meta(SystemProgram.programId, false)]
+        : [meta(vault), meta(pda('note', noteSeed)), meta(pda('pending', noteSeed)), meta(used),
+            meta(pda('nullifier', felt(p.next_nullifier))), meta(payer, true, true), meta(destination, false),
+            meta(SystemProgram.programId, false)];
+    return new TransactionInstruction({ programId: program, keys,
+        data: concat(await discriminator(close ? 'execute_close' : 'execute_escape'), noteSeed,
+            withdrawalBytes(p), integer(proof.length, 4), proof) });
+}
+
+/**
  * Build root-free exits using only the user's pinned Solana RPC, never the
  * operator's prepare routes. `mutual`/`escape` take `{ payer, destination,
  * public_inputs, proof }` where `destination` is the proof-bound USDC payout
@@ -144,37 +184,21 @@ export async function prepareLocalSolanaExit(funding, kind, body, { signal = Abo
                 meta(vaultToken), meta(mint, false), meta(tokenProgram, false)],
             data: concat(await discriminator(kind === 'finalize' ? 'finalize_escape' : 'release_escape_payout'), noteSeed) });
     } else {
-        const close = kind === 'mutual';
         if (p.protocol_version !== 2 || !sameChainId(p.chain_id, funding.chain_id)
-            || !sameFelt(p.contract_address, funding.contract_address) || p.has_clearance !== close
+            || !sameFelt(p.contract_address, funding.contract_address)
             || noteState.status !== 'active' || !sameFelt(p.registration, noteState.commitment)
             || BigInt(p.deposit_amount) !== BigInt(noteState.amount) || BigInt(p.expiry_ts) !== BigInt(noteState.expiry)
-            || BigInt(p.final_balance) + BigInt(p.conceded) > BigInt(noteState.amount)
-            || (close ? BigInt(p.next_nullifier) !== 0n || BigInt(p.conceded) !== 0n
-                : BigInt(p.next_nullifier) === 0n || sameFelt(p.next_nullifier, p.withdrawal_nullifier))) {
+            || BigInt(p.final_balance) + BigInt(p.conceded) > BigInt(noteState.amount)) {
             throw new Error('Solana withdrawal does not match its note, mode, or deployment.');
         }
         for (const [wire, stored] of [['state_signing_key_x', 'stateSigningKeyX'], ['state_signing_key_y', 'stateSigningKeyY'],
             ['clearance_signing_key_x', 'clearanceSigningKeyX'], ['clearance_signing_key_y', 'clearanceSigningKeyY']]) {
             if (!sameFelt(p[wire], vaultState[stored])) throw new Error('Solana exit signing key mismatch.');
         }
-        if (body.proof?.backend !== 'groth16_bn254') throw new Error('Invalid Solana exit proof backend.');
-        const proof = decodeBase64(body.proof.proof);
-        if (proof.length !== 256) throw new Error('Invalid Solana exit proof size.');
-        const destination = new PublicKey(body.destination);
-        if (destination.equals(vaultToken)) throw new Error('The vault token account cannot receive a withdrawal.');
-        if (!close || BigInt(p.final_balance) > 0n) {
-            await assertCreditableDestination(funding, destination.toBase58(), signal);
+        instruction = await solanaExitInstruction(funding, kind, body);
+        if (kind === 'escape' || BigInt(p.final_balance) > 0n) {
+            await assertCreditableDestination(funding, body.destination, signal);
         }
-        const used = pda('nullifier', felt(p.withdrawal_nullifier));
-        const keys = close
-            ? [meta(vault), meta(note), meta(used), meta(payer, true, true), meta(destination), meta(vaultToken),
-                meta(mint, false), meta(tokenProgram, false), meta(SystemProgram.programId, false)]
-            : [meta(vault), meta(note), meta(pending), meta(used), meta(pda('nullifier', felt(p.next_nullifier))),
-                meta(payer, true, true), meta(destination, false), meta(SystemProgram.programId, false)];
-        instruction = new TransactionInstruction({ programId: program, keys,
-            data: concat(await discriminator(close ? 'execute_close' : 'execute_escape'), noteSeed,
-                withdrawalBytes(p), integer(proof.length, 4), proof) });
     }
     const { blockhash, lastValidBlockHeight } = await latestBlockhash(funding, signal);
     const transaction = new Transaction({ feePayer: payer, recentBlockhash: blockhash });

@@ -5,6 +5,7 @@ import { assertSolanaDepositsOpen, assertSolanaVault, formatUnits, MICRO_USDC_PE
     vaultTokenAddress } from './zkapiUsdc.mjs';
 import { base58Decode, base58Encode } from './zkapiSolanaTransport.mjs';
 import { walletErrorMessage } from './zkapiWalletError.mjs';
+import { ZkapiCctpWallet } from './zkapiCctpWallet.mjs';
 import { deriveExpiryRecords } from './zkapiExpiryHistory.mjs';
 
 const WITHDRAWAL_STORAGE_KEY = 'zkapi-withdrawal-v2';
@@ -118,6 +119,8 @@ class ZkapiClient extends EventTarget {
         this.depositPromiseKey = null;
         this.backgroundRefreshPromise = null;
         this.visibilityHandler = null;
+        this.cctpPromise = null;
+        this.cctpWalletInstance = null;
     }
 
     async init() {
@@ -186,7 +189,8 @@ class ZkapiClient extends EventTarget {
     }
 
     get walletProviderBusy() {
-        return Boolean(this.depositPromise || this.withdrawPromise || this.finalizePromise || this.releasePromise);
+        return Boolean(this.depositPromise || this.withdrawPromise || this.finalizePromise || this.releasePromise
+            || this.cctpPromise);
     }
 
     setSolanaWallet(wallet = null, account = null) {
@@ -645,6 +649,9 @@ class ZkapiClient extends EventTarget {
         const { wallet, account, address } = await this.connectSolanaWallet();
 
         let plan = await browserWalletRuntime.pendingDeposit();
+        if (plan?.cctp) {
+            throw new Error('A CCTP deposit is unfinished. Resume it with cctpDeposit(), or refund or sweep it.');
+        }
         if (plan) {
             if (Number(plan.amount) !== Number(amount)) {
                 throw new Error('A previous Solana deposit is unfinished. Recover it before changing the amount.');
@@ -956,6 +963,93 @@ class ZkapiClient extends EventTarget {
 
     escapePeriodBadge() {
         return escapePeriodBadge(this.challengePeriodSeconds);
+    }
+
+    // ---------------------------------------------------------------- CCTP (program-free, Phase 1)
+
+    /** The CCTP flows bound to this page's wallet runtime (zkapiCctpWallet.mjs). */
+    get cctp() {
+        if (!this.cctpWalletInstance) this.cctpWalletInstance = new ZkapiCctpWallet({ runtime: browserWalletRuntime });
+        return this.cctpWalletInstance;
+    }
+
+    async runCctp(operation) {
+        if (!this.initialized) await this.init();
+        if (this.walletProviderBusy) {
+            const error = new Error('Wait for the current wallet action to finish.');
+            error.code = 'wallet_provider_busy';
+            throw error;
+        }
+        const running = operation();
+        this.cctpPromise = running;
+        try {
+            return await running;
+        } finally {
+            if (this.cctpPromise === running) this.cctpPromise = null;
+            await this.refresh({ quiet: true });
+        }
+    }
+
+    /**
+     * Deposit USDC from an EVM chain through CCTP into a new private note:
+     * `{ sourceChain, amount, finality: 'fast'|'standard', evmProvider, onBackup, onStatus, selfFunded, burnTxHash }`.
+     * A new plan returns `{ status: 'backup_required', backup }` unless `onBackup` resolves (not `false`);
+     * acknowledge with cctpAcknowledgeBackup() and call again. Call again (no arguments) to resume after a reload.
+     */
+    cctpDeposit(options = {}) {
+        return this.runCctp(() => this.cctp.deposit(options));
+    }
+
+    /** Record that the user saved the CCTP deposit backup; only then may the EVM burn be requested. */
+    cctpAcknowledgeBackup(operationId = null) {
+        return this.runCctp(() => this.cctp.acknowledgeBackup(operationId));
+    }
+
+    /** The current CCTP deposit backup (note secret, emergency key, intent, authorized CCTP fee). */
+    async cctpDepositBackup() {
+        if (!this.initialized) await this.init();
+        return this.cctp.depositBackup();
+    }
+
+    /** Recover transit funds, or explicitly a never-used note; never a used note's private state. */
+    cctpImportBackup(backup, options = {}) {
+        return this.runCctp(() => this.cctp.importBackup(backup, options));
+    }
+
+    /** Withdraw the note to an EVM address through CCTP: `{ kind, destinationChain, recipient, finality, claim }`. */
+    cctpExit(options = {}) {
+        return this.runCctp(() => this.cctp.exit(options));
+    }
+
+    /** Continue a saved CCTP exit (escape finalization, burn, attestation). */
+    cctpResumeExit(recordId, options = {}) {
+        return this.runCctp(() => this.cctp.resumeExit(recordId, options));
+    }
+
+    /** Emergency: move the emergency-key USDC to any Solana USDC account `{ to, recordId? }`. */
+    cctpSweep(options = {}) {
+        return this.runCctp(() => this.cctp.sweep(options));
+    }
+
+    /** Burn an undeposited CCTP arrival back to its EVM burner (after refund_after, or `{ force: true }`). */
+    cctpRefund(options = {}) {
+        return this.runCctp(() => this.cctp.refund(options));
+    }
+
+    /** Abandon a CCTP deposit whose burn was never requested. */
+    cctpCancelDeposit() {
+        return this.runCctp(() => this.cctp.cancelDeposit());
+    }
+
+    /** Self-claim an attested CCTP exit on its EVM destination: `{ recordId, evmProvider }`. */
+    cctpClaim(options = {}) {
+        return this.runCctp(() => this.cctp.claim(options));
+    }
+
+    /** Where CCTP funds wait and which emergency key controls them (no wallet prompt). */
+    async cctpEmergencyInfo(options = {}) {
+        if (!this.initialized) await this.init();
+        return this.cctp.emergencyInfo(options);
     }
 }
 
