@@ -29,6 +29,7 @@ zkapi-types = { path = "../../protocol/rust/crates/zkapi-types" }
 
 [dev-dependencies]
 dagon-zkapi-deploy = { path = "../dagon-zkapi-deploy" }
+sha2 = "0.10"
 solana-keypair = "=2.2.3"
 solana-signer = "=2.2.1"
 tokio = { workspace = true }

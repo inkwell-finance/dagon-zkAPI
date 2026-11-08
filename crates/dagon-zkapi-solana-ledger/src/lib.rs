@@ -41,6 +41,17 @@ use zkapi_types::{
     PROTOCOL_VERSION,
 };
 
+pub mod cctp;
+pub mod relay_audit;
+
+/// Solana primitives used by relay transaction builders, re-exported so
+/// callers build against exactly the versions this ledger serializes.
+pub use solana_hash::Hash as SolanaHash;
+pub use solana_instruction::{AccountMeta, Instruction as SolanaInstruction};
+pub use solana_message::Message as SolanaMessage;
+pub use solana_message::{v0 as solana_v0, AddressLookupTableAccount, VersionedMessage};
+pub use solana_pubkey::Pubkey as SolanaPubkey;
+
 pub const MESSAGE_FORMAT: &str = "solana-legacy-message-v1";
 pub const SIGNED_TRANSACTION_FORMAT: &str = "solana-legacy-transaction-v1";
 const OPERATION_CHUNK_BYTES: usize = 700;
@@ -60,6 +71,19 @@ const TOKEN_ACCOUNT_FROZEN: u8 = 2;
 pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
     anchor_lang::prelude::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 const ATA_CREATE_IDEMPOTENT: u8 = 1;
+const SLOT_HASHES_SYSVAR: Pubkey =
+    anchor_lang::prelude::pubkey!("SysvarS1otHashes111111111111111111111111111");
+
+/// `SlotHashes` is bincode `Vec<(Slot, Hash)>` (u64 LE length, then 40-byte
+/// entries), newest first.
+fn newest_slot_hash(data: &[u8]) -> Option<u64> {
+    let len = u64::from_le_bytes(data.get(..8)?.try_into().ok()?);
+    if len == 0 {
+        return None;
+    }
+    Some(u64::from_le_bytes(data.get(8..16)?.try_into().ok()?))
+}
+
 const TRANSITION_PROVING_KEY: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../protocol/setup/solana-transition-v1/transition.pk"
@@ -151,11 +175,11 @@ struct SolanaAccountSnapshot {
 
 /// The fields of a classic SPL Token account the ledger relies on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TokenAccountView {
-    mint: Pubkey,
-    owner: Pubkey,
-    amount: u64,
-    frozen: bool,
+pub struct TokenAccountView {
+    pub mint: Pubkey,
+    pub owner: Pubkey,
+    pub amount: u64,
+    pub frozen: bool,
 }
 
 impl TokenAccountView {
@@ -188,10 +212,112 @@ impl TokenAccountView {
     /// Whether the vault could pay into this account: initialized, unfrozen
     /// and of the vault's mint (the vault token account itself is excluded
     /// by the caller).
-    fn creditable(&self, mint: &Pubkey) -> bool {
+    pub fn creditable(&self, mint: &Pubkey) -> bool {
         !self.frozen && self.mint == *mint
     }
 }
+
+/// A packet holds the shortvec signature count, every required signature
+/// and the message.
+fn check_packet_size(message_len: usize, signers: usize) -> Result<(), LedgerError> {
+    let signatures = 1usize.saturating_add(signers.saturating_mul(64));
+    if message_len.saturating_add(signatures) > 1_232 {
+        return Err(LedgerError::InvalidData(format!(
+            "prepared Solana transaction exceeds packet limit: {message_len} bytes before \
+             {signers} signature(s)"
+        )));
+    }
+    Ok(())
+}
+
+/// Classic-Token program, USDC mint and decimals pinned by the vault.
+pub use vault_program::token::{
+    TOKEN_PROGRAM_ID as CLASSIC_TOKEN_PROGRAM_ID, USDC_DECIMALS, USDC_MINT,
+};
+
+/// Account sizes whose rent the vault charges its `owner`/payer.
+pub fn note_account_len() -> usize {
+    8 + <vault_program::NoteState as Space>::INIT_SPACE
+}
+
+pub fn used_nullifier_account_len() -> usize {
+    8 + <vault_program::UsedNullifier as Space>::INIT_SPACE
+}
+
+pub fn pending_withdrawal_account_len() -> usize {
+    8 + <vault_program::PendingWithdrawal as Space>::INIT_SPACE
+}
+
+/// Borsh size of a `DepositPayload` with a 256-byte Groth16 transition proof.
+pub const DEPOSIT_PAYLOAD_LEN: usize = 4 + 32 + 8 + 8 + 32 + 4 + 256;
+
+/// Size of a staged deposit's operation buffer (rent refunded at execute or
+/// cancel).
+pub fn deposit_operation_account_len() -> usize {
+    vault_program::OperationBuffer::space(DEPOSIT_PAYLOAD_LEN)
+}
+
+/// Size of a classic SPL Token account (an ATA).
+pub const TOKEN_ACCOUNT_SPACE: usize = TOKEN_ACCOUNT_LEN;
+
+/// A staged operation buffer and the transactions that fill and consume it.
+struct StagedOperation {
+    operation: PreparedLedgerOperation,
+    address: Pubkey,
+    operation_id: [u8; 32],
+    expires_at_slot: u64,
+}
+
+/// A deposit owned and authorized by the emergency key. The relay combines
+/// these unsigned messages atomically with rent funding and its fee.
+#[derive(Debug, Clone)]
+pub struct RelayedDepositRequest {
+    pub depositor: LedgerAccount,
+    pub expected_note_id: u32,
+    pub commitment: Felt252,
+    pub amount: u128,
+    pub zero_path: [Felt252; zkapi_types::MERKLE_DEPTH],
+    /// Minimum balance of `ATA(depositor)` (the amount plus any fee the
+    /// execute transaction also moves out of it).
+    pub required_source_balance: u64,
+    /// Instructions appended after `execute_deposit` in the execute
+    /// transaction (a fee transfer signed by the depositor).
+    pub execute_suffix: Vec<Instruction>,
+}
+
+/// Unsigned `[initialize, write…, execute]` messages owned by the depositor.
+/// The relay must combine them into one transaction, never broadcast staging.
+#[derive(Debug, Clone)]
+pub struct RelayedDeposit {
+    pub operation: PreparedLedgerOperation,
+    pub operation_address: Pubkey,
+    pub operation_id: [u8; 32],
+    pub expires_at_slot: u64,
+    pub note_address: Pubkey,
+    pub source: Pubkey,
+}
+
+/// A raw account read from the pinned cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawAccount {
+    pub owner: Pubkey,
+    pub executable: bool,
+    pub data: Vec<u8>,
+}
+
+/// What a relay needs to know about a pending escape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingEscapeView {
+    pub stage: u8,
+    pub destination: Pubkey,
+    pub rent_payer: Pubkey,
+    pub deadline: u64,
+    pub final_balance: u64,
+}
+
+pub use vault_program::{
+    PENDING_STAGE_OPEN, PENDING_STAGE_PAYOUT_PARKED, PENDING_STAGE_RENT_PARKED,
+};
 
 impl SolanaCreditLedger {
     pub fn new(config: SolanaLedgerConfig) -> Result<Self, LedgerError> {
@@ -432,6 +558,163 @@ impl SolanaCreditLedger {
             data: vault_program::instruction::WithdrawTreasury {}.data(),
         };
         self.direct_operation(payer, instruction).await
+    }
+
+    /// The pinned vault program.
+    pub fn program_id(&self) -> Pubkey {
+        self.program_id
+    }
+
+    /// The pinned vault state account.
+    pub fn vault_address(&self) -> Pubkey {
+        self.vault
+    }
+
+    /// Prepare an emergency-key-owned deposit for atomic relay funding.
+    /// No relayer can cancel or replace this operation buffer.
+    pub async fn prepare_relayed_deposit(
+        &self,
+        request: RelayedDepositRequest,
+    ) -> Result<RelayedDeposit, LedgerError> {
+        let depositor = account_pubkey(request.depositor);
+        let (staged, note_address, source) = self
+            .deposit_operation(
+                depositor,
+                depositor,
+                DepositRequest {
+                    payer: request.depositor,
+                    expected_note_id: request.expected_note_id,
+                    commitment: request.commitment,
+                    amount: request.amount,
+                    zero_path: request.zero_path,
+                },
+                request.required_source_balance,
+                request.execute_suffix,
+            )
+            .await?;
+        Ok(RelayedDeposit {
+            operation: staged.operation,
+            operation_address: staged.address,
+            operation_id: staged.operation_id,
+            expires_at_slot: staged.expires_at_slot,
+            note_address,
+            source,
+        })
+    }
+
+    /// SOL balance at confirmed commitment.
+    pub async fn lamports(&self, address: Pubkey) -> Result<u64, LedgerError> {
+        let result: Value = self
+            .rpc(
+                "getBalance",
+                json!([address.to_string(), {"commitment": "confirmed"}]),
+            )
+            .await?;
+        result["value"]
+            .as_u64()
+            .ok_or_else(|| LedgerError::InvalidData("balance missing".into()))
+    }
+
+    /// The cluster's current rent-exempt minimum for `len` data bytes.
+    pub async fn rent_exempt_minimum(&self, len: usize) -> Result<u64, LedgerError> {
+        self.rpc("getMinimumBalanceForRentExemption", json!([len]))
+            .await
+    }
+
+    /// The classic-Token account at `address` (confirmed), if any.
+    pub async fn token_account_state(
+        &self,
+        address: Pubkey,
+    ) -> Result<Option<TokenAccountView>, LedgerError> {
+        self.token_account(address, LedgerCommitment::Confirmed)
+            .await
+    }
+
+    /// Any account at `address`, if it exists.
+    pub async fn raw_account(
+        &self,
+        address: Pubkey,
+        commitment: LedgerCommitment,
+    ) -> Result<Option<RawAccount>, LedgerError> {
+        Ok(self
+            .account_snapshot(address, commitment)
+            .await?
+            .map(|snapshot| RawAccount {
+                owner: snapshot.owner,
+                executable: snapshot.executable,
+                data: snapshot.data,
+            }))
+    }
+
+    /// A confirmed blockhash and its last valid block height, after checking
+    /// the cluster's genesis hash.
+    pub async fn recent_blockhash(&self) -> Result<(Hash, u64), LedgerError> {
+        self.latest_blockhash().await
+    }
+
+    /// The confirmed slot.
+    pub async fn confirmed_slot(&self) -> Result<u64, LedgerError> {
+        self.current_slot().await
+    }
+
+    /// The newest slot in the confirmed bank's `SlotHashes` sysvar: a real
+    /// (not skipped) ancestor of every later bank, so it is a valid
+    /// lookup-table creation slot. Neither the confirmed nor the finalized
+    /// slot is: on a single local validator both equal the bank's own slot,
+    /// which its `SlotHashes` does not yet list.
+    pub async fn recent_ancestor_slot(&self) -> Result<u64, LedgerError> {
+        let snapshot = self
+            .account_snapshot(SLOT_HASHES_SYSVAR, LedgerCommitment::Confirmed)
+            .await?
+            .ok_or_else(|| LedgerError::InvalidData("SlotHashes sysvar is missing".into()))?;
+        newest_slot_hash(&snapshot.data)
+            .ok_or_else(|| LedgerError::InvalidData("SlotHashes sysvar is empty".into()))
+    }
+
+    /// Simulate transaction bytes; a program or fee failure is a definitive
+    /// [`LedgerError::Rejected`] with the simulation logs. Without
+    /// `sig_verify`, signature slots another party fills later may be zero.
+    pub async fn simulate_transaction(
+        &self,
+        transaction: &[u8],
+        sig_verify: bool,
+    ) -> Result<(), LedgerError> {
+        if transaction.is_empty() || transaction.len() > 1_232 {
+            return Err(LedgerError::InvalidData(
+                "Solana transaction is outside the packet limit".into(),
+            ));
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(transaction);
+        let result: Value = self
+            .rpc(
+                "simulateTransaction",
+                json!([
+                    encoded,
+                    {"encoding": "base64", "sigVerify": sig_verify, "commitment": "confirmed"}
+                ]),
+            )
+            .await?;
+        let value = &result["value"];
+        if value["err"].is_null() {
+            return Ok(());
+        }
+        Err(LedgerError::Rejected(format!(
+            "Solana transaction simulation failed: {} logs: {}",
+            value["err"], value["logs"]
+        )))
+    }
+
+    /// The pending escape of `note_id` (tip), or a rejection if none.
+    pub async fn pending_escape(&self, note_id: u32) -> Result<PendingEscapeView, LedgerError> {
+        self.vault_account(LedgerCommitment::Tip).await?;
+        let (_, pending) = self.pending_account(note_id, LedgerCommitment::Tip).await?;
+        Ok(PendingEscapeView {
+            stage: pending.stage,
+            destination: pending.destination,
+            rent_payer: pending.rent_payer,
+            deadline: pending.deadline,
+            final_balance: pending.final_balance,
+        })
     }
 
     async fn rpc<T: DeserializeOwned>(
@@ -820,16 +1103,25 @@ impl SolanaCreditLedger {
         blockhash: Hash,
         last_valid_height: u64,
     ) -> Result<PreparedLedgerTransaction, LedgerError> {
-        Self::message_with_instructions(
-            &[
-                ComputeBudgetInstruction::request_heap_frame(HASH_HEAP_BYTES),
-                ComputeBudgetInstruction::set_compute_unit_limit(HASH_COMPUTE_UNITS),
-                instruction,
-            ],
-            payer,
-            blockhash,
-            last_valid_height,
-        )
+        Self::compute_intensive_messages(vec![instruction], payer, blockhash, last_valid_height)
+    }
+
+    /// `instructions` after the hash-heavy heap and compute-unit requests.
+    fn compute_intensive_messages(
+        instructions: Vec<Instruction>,
+        payer: Pubkey,
+        blockhash: Hash,
+        last_valid_height: u64,
+    ) -> Result<PreparedLedgerTransaction, LedgerError> {
+        let mut all = Vec::with_capacity(2 + instructions.len());
+        all.push(ComputeBudgetInstruction::request_heap_frame(
+            HASH_HEAP_BYTES,
+        ));
+        all.push(ComputeBudgetInstruction::set_compute_unit_limit(
+            HASH_COMPUTE_UNITS,
+        ));
+        all.extend(instructions);
+        Self::message_with_instructions(&all, payer, blockhash, last_valid_height)
     }
 
     fn message_with_instructions(
@@ -839,19 +1131,19 @@ impl SolanaCreditLedger {
         last_valid_height: u64,
     ) -> Result<PreparedLedgerTransaction, LedgerError> {
         let message = Message::new_with_blockhash(instructions, Some(&payer), &blockhash);
+        let signers = usize::from(message.header.num_required_signatures);
         let bytes = bincode::serialize(&message)
             .map_err(|error| LedgerError::InvalidData(error.to_string()))?;
-        // One payer signature adds 65 bytes (shortvec length + signature).
-        if bytes.len().saturating_add(65) > 1_232 {
-            return Err(LedgerError::InvalidData(format!(
-                "prepared Solana transaction exceeds packet limit: {} bytes before signature",
-                bytes.len()
-            )));
-        }
+        check_packet_size(bytes.len(), signers)?;
         Ok(PreparedLedgerTransaction {
             format: MESSAGE_FORMAT.into(),
             bytes,
-            required_signers: vec![LedgerAccount::new(payer.to_bytes())],
+            // The fee payer first, then any other signer the instructions
+            // name (a relayed deposit's depositor), in message order.
+            required_signers: message.account_keys[..signers]
+                .iter()
+                .map(|key| LedgerAccount::new(key.to_bytes()))
+                .collect(),
             last_valid_height: Some(last_valid_height),
         })
     }
@@ -859,12 +1151,12 @@ impl SolanaCreditLedger {
     async fn staged_operation<F>(
         &self,
         kind: u8,
-        payer: Pubkey,
+        owner: Pubkey,
         payload: Vec<u8>,
         execute: F,
-    ) -> Result<PreparedLedgerOperation, LedgerError>
+    ) -> Result<StagedOperation, LedgerError>
     where
-        F: FnOnce(Pubkey) -> Instruction,
+        F: FnOnce(Pubkey) -> Vec<Instruction>,
     {
         let total_len = u16::try_from(payload.len())
             .map_err(|_| LedgerError::InvalidData("operation payload exceeds uint16".into()))?;
@@ -881,14 +1173,14 @@ impl SolanaCreditLedger {
             .ok_or_else(|| LedgerError::InvalidData("operation expiry overflow".into()))?;
         let mut operation_id = [0; 32];
         rand::rngs::OsRng.fill_bytes(&mut operation_id);
-        let (operation, _) = operation_address(self.vault, payer, operation_id, self.program_id);
+        let (operation, _) = operation_address(self.vault, owner, operation_id, self.program_id);
         let digest: [u8; 32] = Keccak256::digest(&payload).into();
         let initialize = Instruction {
             program_id: self.program_id,
             accounts: vault_program::accounts::InitializeOperation {
                 vault: self.vault,
                 operation,
-                owner: payer,
+                owner,
                 system_program: anchor_lang::system_program::ID,
             }
             .to_account_metas(None),
@@ -905,7 +1197,7 @@ impl SolanaCreditLedger {
         };
         let mut transactions = vec![Self::message(
             initialize,
-            payer,
+            owner,
             blockhash,
             last_valid_height,
         )?];
@@ -917,7 +1209,7 @@ impl SolanaCreditLedger {
                 accounts: vault_program::accounts::WriteOperation {
                     vault: self.vault,
                     operation,
-                    owner: payer,
+                    owner,
                 }
                 .to_account_metas(None),
                 data: vault_program::instruction::WriteOperation {
@@ -926,15 +1218,20 @@ impl SolanaCreditLedger {
                 }
                 .data(),
             };
-            transactions.push(Self::message(write, payer, blockhash, last_valid_height)?);
+            transactions.push(Self::message(write, owner, blockhash, last_valid_height)?);
         }
-        transactions.push(Self::compute_intensive_message(
+        transactions.push(Self::compute_intensive_messages(
             execute(operation),
-            payer,
+            owner,
             blockhash,
             last_valid_height,
         )?);
-        Ok(PreparedLedgerOperation { transactions })
+        Ok(StagedOperation {
+            operation: PreparedLedgerOperation { transactions },
+            address: operation,
+            operation_id,
+            expires_at_slot,
+        })
     }
 
     async fn direct_operation(
@@ -1146,6 +1443,20 @@ fn refund_writable(
         }
     }
     metas
+}
+
+/// The heap and compute-unit requests every proof-verifying vault
+/// instruction needs (128 KiB heap, 1.4M CU), in that order.
+pub fn proof_compute_budget_instructions() -> [Instruction; 2] {
+    [
+        ComputeBudgetInstruction::request_heap_frame(HASH_HEAP_BYTES),
+        ComputeBudgetInstruction::set_compute_unit_limit(HASH_COMPUTE_UNITS),
+    ]
+}
+
+/// `SetComputeUnitLimit(units)` (no compute-unit price is ever set).
+pub fn compute_unit_limit_instruction(units: u32) -> Instruction {
+    ComputeBudgetInstruction::set_compute_unit_limit(units)
 }
 
 /// The ATA program's `CreateIdempotent` for `owner`'s canonical USDC
@@ -1412,103 +1723,12 @@ impl CreditLedger for SolanaCreditLedger {
         request: DepositRequest,
     ) -> LedgerFuture<'_, PreparedLedgerOperation> {
         Box::pin(async move {
+            // The payer is the operation owner, the note-rent payer and the
+            // USDC token authority of its canonical ATA.
             let payer = account_pubkey(request.payer);
-            let amount = u64::try_from(request.amount)
-                .map_err(|_| LedgerError::Rejected("deposit exceeds u64".into()))?;
-            if amount == 0 || request.commitment == Felt252::ZERO {
-                return Err(LedgerError::Rejected(
-                    "deposit amount and commitment must be nonzero".into(),
-                ));
-            }
-            let (vault, observed_slot) = self.vault_account(LedgerCommitment::Tip).await?;
-            if vault.next_note_id != request.expected_note_id {
-                return Err(LedgerError::Rejected("deposit note ID is stale".into()));
-            }
-            // The payer is the note-rent payer and the USDC token authority;
-            // the vault pulls exactly `amount` from its canonical ATA.
-            let source = Pubkey::new_from_array(usdc_associated_token_address(&payer.to_bytes()));
-            let funded = self
-                .token_account(source, LedgerCommitment::Tip)
-                .await?
-                .is_some_and(|account| {
-                    account.creditable(&vault.mint)
-                        && account.owner == payer
-                        && account.amount >= amount
-                });
-            if !funded {
-                return Err(LedgerError::Rejected(format!(
-                    "deposit source {source} is not the payer's unfrozen USDC account holding {amount} base units"
-                )));
-            }
-            let old_root =
-                Felt252::try_from_bytes_be(vault.current_root).map_err(LedgerError::InvalidData)?;
-            let siblings = request.zero_path;
-            if core::merkle_root(request.expected_note_id, &Felt252::ZERO, &siblings) != old_root {
-                return Err(LedgerError::Rejected(
-                    "deposit path does not prove an empty leaf at the current root".into(),
-                ));
-            }
-            let expiry = bucket_expiry(self.block_time(observed_slot).await?, vault.note_ttl)?;
-            let leaf = core::note_leaf(
-                request.expected_note_id,
-                &request.commitment,
-                u128::from(amount),
-                expiry,
-            );
-            let new_root = core::merkle_root(request.expected_note_id, &leaf, &siblings);
-            let transition = SolanaMerkleTransitionInputs {
-                protocol_version: PROTOCOL_VERSION,
-                chain_id: vault.chain_id,
-                protocol_binding: Felt252::try_from_bytes_be(vault.protocol_binding)
-                    .map_err(LedgerError::InvalidData)?,
-                old_root,
-                new_root,
-                note_id: request.expected_note_id,
-                commitment: request.commitment,
-                amount,
-                expiry,
-                inserting: true,
-            };
-            let transition_proof = self.prove_transition(transition, siblings).await?;
-            let payload = vault_program::DepositPayload {
-                expected_note_id: request.expected_note_id,
-                commitment: *request.commitment.as_bytes(),
-                amount,
-                expiry,
-                new_root: *new_root.as_bytes(),
-                transition_proof,
-            }
-            .try_to_vec()
-            .map_err(|error| LedgerError::InvalidData(error.to_string()))?;
-            let (note, _) = Pubkey::find_program_address(
-                &[
-                    b"note",
-                    self.vault.as_ref(),
-                    &request.expected_note_id.to_le_bytes(),
-                ],
-                &self.program_id,
-            );
-            self.staged_operation(KIND_DEPOSIT, payer, payload, |operation| Instruction {
-                program_id: self.program_id,
-                accounts: vault_program::accounts::ExecuteDeposit {
-                    vault: self.vault,
-                    operation,
-                    note,
-                    owner: payer,
-                    depositor: payer,
-                    source_token: source,
-                    vault_token: vault.vault_token,
-                    mint: vault.mint,
-                    token_program: vault_program::token::TOKEN_PROGRAM_ID,
-                    system_program: anchor_lang::system_program::ID,
-                }
-                .to_account_metas(None),
-                data: vault_program::instruction::ExecuteDeposit {
-                    expected_note_id: request.expected_note_id,
-                }
-                .data(),
-            })
-            .await
+            self.deposit_operation(payer, payer, request, 0, Vec::new())
+                .await
+                .map(|(staged, _, _)| staged.operation)
         })
     }
 
@@ -1971,11 +2191,117 @@ impl SolanaCreditLedger {
         Ok((address, pending))
     }
 
-    async fn prepare_withdrawal(
+    /// Prove and stage a deposit of `request.amount` from `ATA(depositor)`.
+    /// `owner` stages and signs the operation and pays the note rent;
+    /// `depositor` authorizes the vault's USDC pull. The source must hold at
+    /// least `max(amount, required_source_balance)`. `execute_suffix` is
+    /// appended to the execute transaction after `execute_deposit`.
+    async fn deposit_operation(
+        &self,
+        owner: Pubkey,
+        depositor: Pubkey,
+        request: DepositRequest,
+        required_source_balance: u64,
+        execute_suffix: Vec<Instruction>,
+    ) -> Result<(StagedOperation, Pubkey, Pubkey), LedgerError> {
+        let amount = u64::try_from(request.amount)
+            .map_err(|_| LedgerError::Rejected("deposit exceeds u64".into()))?;
+        if amount == 0 || request.commitment == Felt252::ZERO {
+            return Err(LedgerError::Rejected(
+                "deposit amount and commitment must be nonzero".into(),
+            ));
+        }
+        let (vault, observed_slot) = self.vault_account(LedgerCommitment::Tip).await?;
+        if vault.next_note_id != request.expected_note_id {
+            return Err(LedgerError::Rejected("deposit note ID is stale".into()));
+        }
+        // The vault pulls exactly `amount` from the depositor's canonical ATA.
+        let source = Pubkey::new_from_array(usdc_associated_token_address(&depositor.to_bytes()));
+        let required = amount.max(required_source_balance);
+        let funded = self
+            .token_account(source, LedgerCommitment::Tip)
+            .await?
+            .is_some_and(|account| {
+                account.creditable(&vault.mint)
+                    && account.owner == depositor
+                    && account.amount >= required
+            });
+        if !funded {
+            let role = if owner == depositor {
+                "payer"
+            } else {
+                "depositor"
+            };
+            return Err(LedgerError::Rejected(format!(
+                "deposit source {source} is not the {role}'s unfrozen USDC account holding {required} base units"
+            )));
+        }
+        let old_root =
+            Felt252::try_from_bytes_be(vault.current_root).map_err(LedgerError::InvalidData)?;
+        let siblings = request.zero_path;
+        if core::merkle_root(request.expected_note_id, &Felt252::ZERO, &siblings) != old_root {
+            return Err(LedgerError::Rejected(
+                "deposit path does not prove an empty leaf at the current root".into(),
+            ));
+        }
+        let expiry = bucket_expiry(self.block_time(observed_slot).await?, vault.note_ttl)?;
+        let leaf = core::note_leaf(
+            request.expected_note_id,
+            &request.commitment,
+            u128::from(amount),
+            expiry,
+        );
+        let new_root = core::merkle_root(request.expected_note_id, &leaf, &siblings);
+        let transition = SolanaMerkleTransitionInputs {
+            protocol_version: PROTOCOL_VERSION,
+            chain_id: vault.chain_id,
+            protocol_binding: Felt252::try_from_bytes_be(vault.protocol_binding)
+                .map_err(LedgerError::InvalidData)?,
+            old_root,
+            new_root,
+            note_id: request.expected_note_id,
+            commitment: request.commitment,
+            amount,
+            expiry,
+            inserting: true,
+        };
+        let transition_proof = self.prove_transition(transition, siblings).await?;
+        let payload = vault_program::DepositPayload {
+            expected_note_id: request.expected_note_id,
+            commitment: *request.commitment.as_bytes(),
+            amount,
+            expiry,
+            new_root: *new_root.as_bytes(),
+            transition_proof,
+        }
+        .try_to_vec()
+        .map_err(|error| LedgerError::InvalidData(error.to_string()))?;
+        let (note, _) = note_address(self.vault, request.expected_note_id, self.program_id);
+        let staged = self
+            .staged_operation(KIND_DEPOSIT, owner, payload, |operation| {
+                let mut instructions = vec![deposit_instruction(
+                    self.program_id,
+                    &vault,
+                    self.vault,
+                    operation,
+                    note,
+                    owner,
+                    depositor,
+                    request.expected_note_id,
+                )];
+                instructions.extend(execute_suffix);
+                instructions
+            })
+            .await?;
+        Ok((staged, note, source))
+    }
+
+    async fn withdrawal_instruction(
         &self,
         request: WithdrawalRequest,
         close: bool,
-    ) -> Result<PreparedLedgerOperation, LedgerError> {
+        check_destination: bool,
+    ) -> Result<Instruction, LedgerError> {
         let payer = account_pubkey(request.payer);
         let destination = account_pubkey(request.destination);
         let public = &request.public_inputs;
@@ -2044,7 +2370,7 @@ impl SolanaCreditLedger {
         }
         // A close pays strictly and an escape is refused unless the bound
         // token account can be credited now (a zero-balance close pays none).
-        if !close || public.final_balance > 0 {
+        if check_destination && (!close || public.final_balance > 0) {
             self.require_creditable_payout(&vault, destination).await?;
         }
         let payload = vault_program::WithdrawalPayload {
@@ -2096,7 +2422,32 @@ impl SolanaCreditLedger {
                 data: vault_program::instruction::ExecuteEscape { note_id, payload }.data(),
             }
         };
+        Ok(instruction)
+    }
+
+    async fn prepare_withdrawal(
+        &self,
+        request: WithdrawalRequest,
+        close: bool,
+    ) -> Result<PreparedLedgerOperation, LedgerError> {
+        let payer = account_pubkey(request.payer);
+        let instruction = self.withdrawal_instruction(request, close, true).await?;
         self.direct_compute_operation(payer, instruction).await
+    }
+
+    /// The validated `execute_close` (`close`) or `execute_escape`
+    /// instruction with `request.payer` as the vault `owner`, for a relay to
+    /// compose into its own transaction. With `destination_created_in_tx`
+    /// the payout account need not exist yet (a preceding instruction of the
+    /// same transaction creates it); otherwise it must be creditable now.
+    pub async fn relayed_withdrawal_instruction(
+        &self,
+        request: WithdrawalRequest,
+        close: bool,
+        destination_created_in_tx: bool,
+    ) -> Result<Instruction, LedgerError> {
+        self.withdrawal_instruction(request, close, !destination_created_in_tx)
+            .await
     }
 }
 
@@ -2218,6 +2569,40 @@ fn operation_address(
 
 fn note_address(vault: Pubkey, note_id: u32, program: Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"note", vault.as_ref(), &note_id.to_le_bytes()], &program)
+}
+
+/// `execute_deposit(expected_note_id)`: `owner` signs and pays the note rent,
+/// `depositor` signs as the USDC authority of its canonical source account.
+#[allow(clippy::too_many_arguments)]
+fn deposit_instruction(
+    program_id: Pubkey,
+    vault_state: &vault_program::VaultState,
+    vault: Pubkey,
+    operation: Pubkey,
+    note: Pubkey,
+    owner: Pubkey,
+    depositor: Pubkey,
+    expected_note_id: u32,
+) -> Instruction {
+    Instruction {
+        program_id,
+        accounts: vault_program::accounts::ExecuteDeposit {
+            vault,
+            operation,
+            note,
+            owner,
+            depositor,
+            source_token: Pubkey::new_from_array(usdc_associated_token_address(
+                &depositor.to_bytes(),
+            )),
+            vault_token: vault_state.vault_token,
+            mint: vault_state.mint,
+            token_program: vault_program::token::TOKEN_PROGRAM_ID,
+            system_program: anchor_lang::system_program::ID,
+        }
+        .to_account_metas(None),
+        data: vault_program::instruction::ExecuteDeposit { expected_note_id }.data(),
+    }
 }
 
 fn pending_address(vault: Pubkey, note_id: u32, program: Pubkey) -> (Pubkey, u8) {
@@ -3615,6 +4000,24 @@ mod tests {
         }
     }
 
+    /// A lookup table's creation slot is the newest `SlotHashes` entry (the
+    /// harness saw slot 14's bank list only 13, 12, … on one validator).
+    #[test]
+    fn lookup_table_slot_is_the_newest_slot_hashes_entry() {
+        let mut data = 2u64.to_le_bytes().to_vec();
+        for slot in [13u64, 12] {
+            data.extend_from_slice(&slot.to_le_bytes());
+            data.extend_from_slice(&[slot as u8; 32]);
+        }
+        assert_eq!(newest_slot_hash(&data), Some(13));
+        assert_eq!(newest_slot_hash(&0u64.to_le_bytes()), None);
+        assert_eq!(newest_slot_hash(&[1, 0]), None);
+        assert_eq!(
+            SLOT_HASHES_SYSVAR,
+            anchor_lang::solana_program::sysvar::slot_hashes::ID
+        );
+    }
+
     #[test]
     fn usdc_ata_creation_is_the_canonical_create_idempotent() {
         let profile = SharedProfile::embedded();
@@ -3716,6 +4119,125 @@ mod tests {
             );
             server.await.unwrap();
         }
+    }
+
+    /// Every relayed deposit stage is owned by the depositor. The relay
+    /// combines them with rent funding/refund in one atomic transaction.
+    #[tokio::test]
+    async fn relayed_deposit_is_owned_by_depositor() {
+        let program_id = vault_program::ID;
+        let genesis_hash = [3; 32];
+        let (vault_address, vault) =
+            test_vault(program_id, genesis_hash, core::EMPTY_MERKLE_ROOT, 0);
+        let depositor = Pubkey::new_unique();
+        let fee_account = Pubkey::new_unique();
+        let usdc = vault_program::token::USDC_MINT;
+        let classic = vault_program::token::TOKEN_PROGRAM_ID;
+        let genesis = json!(Hash::new_from_array(genesis_hash).to_string());
+        let source = Pubkey::new_from_array(usdc_associated_token_address(&depositor.to_bytes()));
+        let request = |required| RelayedDepositRequest {
+            depositor: LedgerAccount::new(depositor.to_bytes()),
+            expected_note_id: 0,
+            commitment: Felt252::from_u64(5),
+            amount: 1_000,
+            zero_path: zkapi_core::merkle::MerkleTree::new().get_siblings(0),
+            required_source_balance: required,
+            execute_suffix: vec![cctp::transfer_checked_instruction(
+                &source,
+                &usdc,
+                &fee_account,
+                &depositor,
+                70,
+                6,
+            )],
+        };
+        let ledger = |rpc_url| {
+            SolanaCreditLedger::new(SolanaLedgerConfig {
+                rpc_url,
+                indexer_url: None,
+                network: "localnet".into(),
+                program_id: program_id.to_bytes(),
+                vault_state: vault_address.to_bytes(),
+                genesis_hash,
+            })
+            .unwrap()
+        };
+
+        // The amount alone is covered, the amount plus the fee is not.
+        let (rpc_url, server) = response_sequence_rpc(vec![
+            genesis.clone(),
+            program_account(&vault, program_id),
+            token_account_reply(classic, usdc, depositor, 1_069, 1),
+        ])
+        .await;
+        let result = ledger(rpc_url)
+            .prepare_relayed_deposit(request(1_070))
+            .await;
+        assert!(
+            matches!(&result, Err(LedgerError::Rejected(message)) if message.contains("payer")),
+            "{result:?}"
+        );
+        server.await.unwrap();
+
+        let blockhash = Hash::new_unique();
+        let (rpc_url, server) = response_sequence_rpc(vec![
+            genesis.clone(),
+            program_account(&vault, program_id),
+            token_account_reply(classic, usdc, depositor, 1_070, 1),
+            json!(1_700_000_000),
+            genesis,
+            json!({"context": {"slot": 50},
+                   "value": {"blockhash": blockhash.to_string(), "lastValidBlockHeight": 99}}),
+            json!(50),
+        ])
+        .await;
+        let staged = ledger(rpc_url)
+            .prepare_relayed_deposit(request(1_070))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(staged.source, source);
+        assert_eq!(staged.expires_at_slot, 50 + OPERATION_LIFETIME_SLOTS);
+        assert_eq!(
+            staged.operation_address,
+            operation_address(vault_address, depositor, staged.operation_id, program_id).0
+        );
+        let transactions = &staged.operation.transactions;
+        assert_eq!(transactions.len(), 3);
+        let only = |keys: &[Pubkey]| -> Vec<LedgerAccount> {
+            keys.iter()
+                .map(|key| LedgerAccount::new(key.to_bytes()))
+                .collect()
+        };
+        for staging in &transactions[..2] {
+            assert_eq!(staging.required_signers, only(&[depositor]));
+        }
+        let execute = &transactions[2];
+        assert_eq!(execute.required_signers, only(&[depositor]));
+        let message: Message = bincode::deserialize(&execute.bytes).unwrap();
+        assert_eq!(message.instructions.len(), 4);
+        let deposit = &message.instructions[2];
+        let keys: Vec<_> = deposit
+            .accounts
+            .iter()
+            .map(|index| message.account_keys[usize::from(*index)])
+            .collect();
+        assert_eq!(
+            keys[..6],
+            [
+                vault_address,
+                staged.operation_address,
+                staged.note_address,
+                depositor,
+                depositor,
+                source
+            ]
+        );
+        assert!(message.is_maybe_writable(usize::from(deposit.accounts[4]), None));
+        assert_eq!(
+            message.account_keys[usize::from(message.instructions[3].program_id_index)],
+            classic
+        );
     }
 
     /// Exits accrue the operator share in the vault; anyone may sweep it to

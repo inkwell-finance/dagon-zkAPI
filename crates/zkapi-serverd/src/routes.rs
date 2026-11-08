@@ -11,6 +11,7 @@
 //!   parked rent refund, canonical USDC account creation)
 //! - GET  /v2/requests/:id          -- recover by client_request_id
 //! - GET  /v2/nullifiers/:nullifier -- recover by nullifier
+//! - GET  /v2/relay, POST /v2/relay/* -- optional CCTP relay ([`crate::relay`])
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -68,6 +69,8 @@ pub async fn run_server(mut config: crate::config::ServerConfig) -> anyhow::Resu
         config.testnet_password = Some(password);
     }
     config.validate()?;
+    // Parsed before any network read or state: a bad relay setting fails closed.
+    let relay_config = crate::relay::RelayConfig::from_env()?;
     let signer = Arc::new(crate::signer::ServerSigner::new(
         &config.state_seed,
         &config.clear_seed,
@@ -77,6 +80,10 @@ pub async fn run_server(mut config: crate::config::ServerConfig) -> anyhow::Resu
     let store = Arc::new(crate::nullifier_store::NullifierStore::new(
         &config.db_path,
     )?);
+    let relay = match relay_config {
+        Some(relay_config) => Some(crate::relay::Relay::start(relay_config, &config).await?),
+        None => None,
+    };
     let dashboard = Arc::new(DashboardHub::new(500));
     let processor = RequestProcessor::try_new(
         config.clone(),
@@ -94,7 +101,10 @@ pub async fn run_server(mut config: crate::config::ServerConfig) -> anyhow::Resu
         processor.clone(),
         Duration::from_secs(config.profile.server.settlement_poll_seconds.max(1)),
     );
-    let router = create_router(processor);
+    if let Some(relay) = &relay {
+        crate::relay::spawn_maintenance(relay.clone());
+    }
+    let router = create_router_with_relay(processor, relay);
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     tracing::info!(
         network = %config.network,
@@ -145,8 +155,17 @@ pub async fn prepare_solana_backends(
     })
 }
 
-/// Create the Axum router with all zkAPI server routes.
+/// Create the Axum router with all zkAPI server routes and no relay.
 pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
+    create_router_with_relay(processor, None)
+}
+
+/// The zkAPI routes plus `/v2/relay*`, which answer `relay_disabled`
+/// without a relay.
+pub fn create_router_with_relay(
+    processor: Arc<RequestProcessor>,
+    relay: Option<Arc<crate::relay::Relay>>,
+) -> Router {
     let password = processor.config().testnet_password.clone();
     // Preserve the local dashboard's existing CORS policy. A password-gated
     // testnet additionally permits explicit credential headers below.
@@ -209,6 +228,7 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
             get(handle_recovery_by_nullifier),
         )
         .merge(dashboard)
+        .merge(crate::relay::router(relay))
         .layer(DefaultBodyLimit::max(PROTOCOL_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn_with_state(
             password.clone(),

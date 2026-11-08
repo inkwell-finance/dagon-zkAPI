@@ -19,6 +19,7 @@ pub mod openrouter;
 pub mod pricing;
 #[path = "processor_v2.rs"]
 pub mod processor;
+pub mod relay;
 pub mod routes;
 pub mod settlement;
 #[path = "signer_v2.rs"]
