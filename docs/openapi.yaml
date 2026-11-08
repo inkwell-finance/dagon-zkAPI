@@ -101,6 +101,128 @@ paths:
                 owner: {type: string, description: Base58 token account owner}
       responses:
         "200": {description: Deployment-bound prepared operation and exact legacy messages}
+  /v2/relay:
+    get:
+      summary: Optional CCTP relay configuration and worst-case fee quotes
+      description: >-
+        {relayer, fee_account, margin_bps, sol_usd_micros, usdc_mint,
+        quotes {deposit, receive, close, escape, burn, sweep}, iris_url,
+        burn_minimum}; all amounts are decimal strings of USDC base units
+        (burn_minimum is the smallest relayed CCTP burn after the relay fee).
+        Every /v2/relay route
+        answers 404 relay_disabled when the server has no ZKAPI_RELAYER_KEY.
+        Relay errors use {error: {code, message}} with codes relay_disabled,
+        insufficient_funds, relay_fee_above_cap, relayer_unavailable,
+        cctp_paused, invalid_request and rate_limited.
+      responses:
+        "200": {description: Relay configuration}
+        "404": {description: relay_disabled}
+  /v2/relay/deposits/prepare:
+    post:
+      summary: Prepare an atomic emergency-key-owned deposit with relayer rent funding
+      description: >-
+        Body {depositor, expected_note_id, commitment, amount, zero_path,
+        max_fee, inbound?}. Returns {fee, operation, note, operation_rent,
+        note_rent, transaction {format, bytes, last_valid_height,
+        lookup_tables}, submit_token}. Rents are decimal lamports. The v0
+        transaction advances rent to ek, initializes/writes/executes an
+        ek-owned buffer, pays the capped USDC fee and refunds buffer rent
+        atomically. It is returned with every signature slot zeroed; the
+        emergency key validates the payload, signs and posts it to
+        /v2/relay/submit. inbound {source_domain, message, attestation} is the
+        attested inbound transfer offered as a sponsorship credential.
+      responses:
+        "200": {description: Prepared relayed deposit}
+  /v2/relay/receives/prepare:
+    post:
+      summary: Fallback CCTP receive of a zkAPI inbound burn into an existing ATA(ek)
+      description: >-
+        Body {source_domain, transaction_hash, owner, max_fee}. Returns {fee "0",
+        nonce, recipient_token_account, transaction} where transaction is a v0
+        transaction (format solana-v0-transaction-v1, lookup_tables;
+        [SetComputeUnitLimit(400000), receive_message]) signed
+        by the relayer alone for the client to broadcast, or null if the
+        nonce is already used. 409 insufficient_funds if ATA(ek) is absent.
+        Subsidized receives default to a 1 USDC minimum source burn, a durable
+        0.05 SOL UTC-day allowance (including receive-triggered ALT costs),
+        and durable 6/day limits per source-chain sender and per emergency key.
+        Each attested message reserves allowance once, before any SOL spend or
+        signature; repeated preparations of the same message return the same
+        transaction while it has at least 30 blocks of validity left and spend
+        no further allowance. Restarts and Zoneless top-ups do not reset it.
+        Circle forwarding and independently funded receives are unaffected.
+      responses:
+        "200": {description: Prepared receive or already received}
+        "409": {description: insufficient_funds or receive_below_minimum}
+        "429": {description: rate_limited, receive_budget_exhausted or receive_address_limited}
+  /v2/relay/exits/prepare:
+    post:
+      summary: Prepare a mutual close or escape with the relayer as vault owner and the ek's fee in the same transaction
+      description: >-
+        Body {kind, destination_owner, public_inputs, proof, max_fee}. Returns
+        {fee, destination (ATA(destination_owner)), transaction, submit_token}
+        with an unsigned v0 transaction for the ek to sign and submit. A close
+        creates ATA(ek) and pays the fee from the payout; an escape requires
+        ATA(ek) to hold the fee. Invalid proofs fail simulation and nothing is
+        returned. A valid exit records its note as the ek's sponsorship credential.
+      responses:
+        "200": {description: Prepared exit}
+  /v2/relay/escapes/finalize:
+    post:
+      summary: Finalize or release a relayed escape
+      description: Body {note_id}; returns {signature, action finalize|release}.
+      responses:
+        "200": {description: Finalized or released}
+  /v2/relay/burns/prepare:
+    post:
+      summary: Prepare an unsigned CCTP burn of ATA(owner); the relay holds the event key
+      description: >-
+        Body {owner, destination_domain, mint_recipient, destination_caller,
+        max_cctp_fee, min_finality_threshold, hook_data, max_fee, inbound?};
+        returns {fee, amount, message_sent_event_account, transaction,
+        submit_token}. The capped USDC fee covers three burn signatures plus
+        one reclaim signature and margin, not MessageSent rent.
+        Burn/sweep caps are 50000 base units. The relay floats event rent until
+        reclamation after five days, durably capped at 0.5 SOL outstanding and
+        reserved only at submit. CCTP exits below 5 USDC net after the relay
+        fee are not relayed by default (configurable); Solana exits, sweeps and
+        self-funded burns remain available.
+      responses:
+        "200": {description: Prepared burn}
+        "409": {description: burn_below_minimum, insufficient_funds or relay_fee_above_cap}
+  /v2/relay/sweeps/prepare:
+    post:
+      summary: Prepare an unsigned sweep of ATA(owner) to an existing USDC account
+      description: Body {owner, destination, max_fee, inbound?}; returns {fee, amount, transaction, submit_token}.
+      responses:
+        "200": {description: Prepared sweep}
+  /v2/relay/submit:
+    post:
+      summary: Sign, reserve and broadcast an ek-signed prepared relay transaction
+      description: >-
+        Body {token (the prepare's submit_token), transaction (the prepared
+        bytes with the ek's signature)}. The relay checks the token and that
+        the message is exactly the prepared one, adds its own (and a burn's
+        event-account) signature, simulates with every signature, reserves
+        risk and broadcasts; returns {signature, transaction} complete.
+        Idempotent. Risk is reserved only here: lost network fees plus
+        outstanding reservations against the default 0.02 SOL/day budget
+        (0.002 SOL/day for work without a sponsorship credential), the burn
+        float, at most one unsettled submission per ek, and an unspent
+        sponsorship credential (one attributed failure each: an attested
+        minted inbound transfer or a relayed exit's note). Finalized success
+        or finalized expired full-history Unknown releases the reservation.
+        Only on-chain failures consume losses; only ek-co-signed failures count
+        toward the three-per-24h owner/source ban.
+        The first three deposit StaleNoteId failures per ek or credential in
+        rolling 24 hours are forgiven for credential/ban attribution, not loss
+        accounting. Further contention failures consume the credential and
+        count toward the ban. The allowance survives restarts.
+      responses:
+        "200": {description: Complete broadcast transaction}
+        "400": {description: invalid_request (token, message, signature or simulation)}
+        "409": {description: relay_transaction_expired}
+        "429": {description: relay_submission_pending, relay_backing_spent, relay_loss_budget_exhausted, relay_failure_limited or relay_burn_float_exhausted}
   /v2/openrouter/leases:
     post:
       summary: Open a prompt-private, spending-limited OpenRouter lease

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -100,4 +100,98 @@ test('launcher refuses an unknown role', { skip }, async () => {
     assert.equal(result.status, 2);
     assert.equal(result.stdout, '');
     assert.match(result.stderr, /Usage: dagon-zkapi-run server\|indexer\|challenger/);
+});
+
+// The shipped gateway (docker/aws/nginx.conf) rate-limits CCTP relay routes
+// per client IP; the relay's in-memory per-key/global limits are a backstop.
+const gatewayConfig = resolve('docker/aws/nginx.conf');
+
+async function gatewayDirectives() {
+    return (await readFile(gatewayConfig, 'utf8'))
+        .split(/\r?\n/)
+        .map((line) => line.replace(/^\s*#.*$/, '').trim())
+        .filter(Boolean)
+        .join('\n');
+}
+
+// Body of the first `<opener> {` block, matching braces outside quotes.
+function block(config, opener) {
+    const start = config.indexOf(`${opener} {`);
+    assert.notEqual(start, -1, `missing block: ${opener}`);
+    let depth = 0;
+    let quote = null;
+    for (let i = config.indexOf('{', start); i < config.length; i++) {
+        const c = config[i];
+        if (quote) {
+            if (c === quote) quote = null;
+        } else if (c === "'" || c === '"') {
+            quote = c;
+        } else if (c === '{') {
+            depth++;
+        } else if (c === '}' && --depth === 0) {
+            return config.slice(config.indexOf('{', start) + 1, i);
+        }
+    }
+    assert.fail(`unterminated block: ${opener}`);
+}
+
+test('gateway rate-limits relay routes per client IP', async () => {
+    const config = await gatewayDirectives();
+    const keyMap = block(config, 'map $request_method $relay_client');
+    assert.match(keyMap, /^OPTIONS "";$/m);
+    assert.match(keyMap, /^default \$binary_remote_addr;$/m);
+    assert.match(config, /^limit_req_zone \$relay_client zone=relay_ops:\d+m rate=30r\/m;$/m);
+    assert.match(config, /^limit_req_zone \$relay_client zone=relay_info:\d+m rate=60r\/m;$/m);
+    assert.match(config, /^limit_req_status 429;$/m);
+
+    const ops = block(config, 'location /v2/relay/');
+    assert.match(ops, /^limit_req zone=relay_ops burst=10 nodelay;$/m);
+    assert.match(ops, /^error_page 429 = @relay_rate_limited;$/m);
+    assert.match(ops, /^proxy_pass \$server_upstream;$/m);
+    const info = block(config, 'location = /v2/relay');
+    assert.match(info, /^limit_req zone=relay_info burst=20 nodelay;$/m);
+    assert.match(info, /^error_page 429 = @relay_rate_limited;$/m);
+    assert.match(info, /^proxy_pass \$server_upstream;$/m);
+
+    const limited = block(config, 'location @relay_rate_limited');
+    const body = limited.match(/^return 429 '([^']*)';$/m);
+    assert.ok(body, 'rate-limit location must return 429 with a body');
+    const envelope = JSON.parse(body[1]);
+    assert.deepEqual(Object.keys(envelope), ['error']);
+    assert.equal(envelope.error.code, 'rate_limited');
+    assert.equal(typeof envelope.error.message, 'string');
+    assert.match(limited, /^default_type application\/json;$/m);
+    assert.match(limited, /^add_header Retry-After 60 always;$/m);
+    assert.match(limited, /^add_header Access-Control-Allow-Origin "\*" always;$/m);
+});
+
+test('gateway trusts X-Forwarded-For only from private peers', async () => {
+    const config = await gatewayDirectives();
+    assert.match(config, /^real_ip_header X-Forwarded-For;$/m);
+    assert.match(config, /^real_ip_recursive on;$/m);
+    const trusted = [...config.matchAll(/^set_real_ip_from (\S+);$/gm)].map((m) => m[1]);
+    assert.deepEqual(trusted.sort(), [
+        '10.0.0.0/8',
+        '127.0.0.1',
+        '172.16.0.0/12',
+        '192.168.0.0/16',
+        '::1',
+        'fc00::/7',
+    ]);
+});
+
+const nginxMissing = process.platform === 'win32'
+    ? 'nginx -t needs a POSIX nginx; run under WSL or Linux'
+    : spawnSync('nginx', ['-v']).error && 'nginx binary not installed';
+
+test('gateway config passes nginx -t', { skip: nginxMissing }, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dagon-zkapi-gateway-'));
+    try {
+        // Keep nginx's compiled-in default error log inside the scratch prefix.
+        await mkdir(join(dir, 'logs'));
+        const result = spawnSync('nginx', ['-t', '-p', dir, '-c', gatewayConfig], { encoding: 'utf8' });
+        assert.equal(result.status, 0, result.stderr);
+    } finally {
+        await rm(dir, { recursive: true, force: true });
+    }
 });

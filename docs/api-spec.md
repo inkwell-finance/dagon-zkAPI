@@ -19,6 +19,14 @@ Inference runs directly against the issued provider key.
 | POST | `/v2/ledger/escapes/release/prepare` | Prepare release of a parked escape payout (`{payer, note_id}`) |
 | POST | `/v2/ledger/escapes/rent-refund/prepare` | Prepare refund of parked escape rent to the escaper (`{payer, note_id}`) |
 | POST | `/v2/ledger/usdc-accounts/prepare` | Prepare idempotent creation of `owner`'s canonical USDC token account, rent paid by `payer` (`{payer, owner}`) |
+| GET | `/v2/relay` | Optional CCTP relay: relayer, fee account, margin, SOL price, worst-case quotes, relayed burn minimum |
+| POST | `/v2/relay/deposits/prepare` | Atomic ek-owned deposit with rent advance/refund; unsigned v0 transaction + `submit_token`, no standalone staging |
+| POST | `/v2/relay/receives/prepare` | Fallback CCTP receive of a zkAPI inbound burn into an existing `ATA(ek)`: relayer-signed v0 transaction, client broadcasts |
+| POST | `/v2/relay/exits/prepare` | Mutual close or escape with the relayer as vault owner and the ek's fee in the same v0 transaction; unsigned + `submit_token` |
+| POST | `/v2/relay/escapes/finalize` | Finalize or release a relayed escape |
+| POST | `/v2/relay/burns/prepare` | CCTP burn of `ATA(owner)`; unsigned + `submit_token` (the relay holds the event key) |
+| POST | `/v2/relay/sweeps/prepare` | Sweep of `ATA(owner)` to an existing USDC account; unsigned + `submit_token` |
+| POST | `/v2/relay/submit` | Ek-signed prepared transaction + token: the relay signs, reserves risk, broadcasts and returns it complete |
 | GET | `/v2/requests/{client_request_id}` | Recover signed settlement |
 | GET | `/v2/nullifiers/{nullifier}` | Recover by nullifier |
 
@@ -48,6 +56,11 @@ Withdrawal and escape prepare bodies take `destination` = the payout USDC token
 account (any owner; clients default to the wallet's canonical associated token
 account and create it first with `/v2/ledger/usdc-accounts/prepare`). Deposits
 draw from the payer's canonical USDC token account.
+
+The `/v2/relay/*` routes exist only when the operator configures a relay key
+(otherwise `404 {"error":{"code":"relay_disabled"}}`); see
+[the server's relay section](SOLANA_SERVER.md#cctp-relay) for fees, the receive subsidy,
+the exact transaction shapes and the error codes.
 
 OA-org issuance includes verifier-backed station/org evidence checked by the
 browser's independently pinned verifier. Directly managed keys use durable

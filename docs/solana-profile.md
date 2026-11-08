@@ -275,6 +275,61 @@ node scripts/check-solana-parity.mjs --solana-identity PATH --solana-rpc-url URL
   [--bin-dir PATH] [--mainnet-rpc-url URL]
 ```
 
+### CCTP test harness (test-only)
+
+`scripts/localnet/cctp/` puts Circle CCTP V2 on a local validator for the
+cross-chain deposit/exit flows: both mainnet programs
+(`--clone-upgradeable-program`; executable hashes pinned in
+`scripts/localnet/cctp/programs.json` and checked after start, re-pin with
+`node scripts/localnet/cctp/validator.mjs --pin` after a reviewed Circle
+upgrade), and mainnet `token_messenger`, `token_minter`, `local_token(USDC)`,
+custody, fee-recipient ATA and `remote_token_messenger`/`token_pair` for
+domains 0, 2, 3 and 6. Only the MessageTransmitter state is rewritten: its
+`enabled_attesters` become fresh local secp256k1 keys (same count, ascending,
+threshold unchanged), written to `RUN/cctp-attesters.json`. Variants
+`mt-paused` and `minter-paused` set the paused flags; `--cctp-denylist` preloads
+`denylist_account` PDAs. `iris-sim.mjs` serves the Iris V2 endpoints and signs
+with the local keys, `forwarding-sim.mjs` plays Circle's Forwarding Service,
+and `anvil.mjs` forks Base with the test attesters enabled on
+MessageTransmitterV2.
+
+```sh
+# standalone (no vault): CCTP localnet + Base fork + iris-sim + forwarding-sim
+node scripts/localnet/cctp/harness.mjs --run-dir /tmp/cctp-run [--rpc-port 18899] \
+  [--variant normal|mt-paused|minter-paused] [--denylist KEY,...] [--anvil-port 18545] [--iris-port 18333] [--no-anvil] [--no-forwarder]
+# full stack with CCTP, then the simulators against it
+ZKAPI_STATE_SEED=... ZKAPI_CLEAR_SEED=... node scripts/localnet/stack.mjs --run-dir RUN --rpc-port 18899 --cctp \
+  [--cctp-variant mt-paused|minter-paused] [--cctp-denylist KEY,...]
+node scripts/localnet/cctp/harness.mjs --attach-solana http://127.0.0.1:18899 --attesters RUN/cctp-attesters.json --payer RUN/payer.json
+# golden end-to-end test (real receive_message, deposit_for_burn(_with_hook), Base receiveMessage)
+DAGON_CCTP_GOLDEN=1 node --test scripts/localnet/cctp/golden.test.mjs
+# SDK end-to-end test: the full stack (e2e-stack.mjs: stack --cctp, anvil, iris-sim,
+# forwarding-sim, indexer, serverd with the relay) driven through the real browser SDK
+DAGON_CCTP_E2E=1 node --test --test-concurrency=1 scripts/localnet/cctp/e2e.test.mjs
+```
+
+`e2e.test.mjs` runs `BrowserWalletRuntime`, its WASM proof worker and
+`ZkapiCctpWallet` under Node (`node-wallet.mjs` supplies only the browser
+platform: an in-memory IndexedDB, Web Storage, a Web Worker over
+`worker_threads` and a loopback server for `browser-config.json`, the manifest
+and the proving keys built by `sdk/build.mjs`). It needs the release binaries
+(`DAGON_E2E_BIN_DIR`, default `target/release`), ports 18899 (+101, +102) and
+18545, and prices the relay at `DAGON_E2E_SOL_USD` (default 150). Scenarios:
+Fast and Standard deposits from Base, a mutual close burned Fast to Base, an
+escape left pending (serverd, the indexer and the relay refuse a vault whose
+challenge period differs from the profile, so escape finalization is covered
+by the Rust lifecycle test), EVM denylist, forwarding outage with the free
+relay receive, a paused vault, tampering relay proxies (staged commitment,
+fee, recipient, extra instruction), refund before/after `refund_after`, relay
+and self-funded sweeps, relay down and disabled, a denylisted ek, and the
+`mt-paused` / `minter-paused` variant stacks.
+
+`MAINNET_RPC_URL` and `BASE_RPC_URL` select the clone and fork sources. The
+harness stops everything on SIGINT/SIGTERM; under Volta start it with
+`"$(node -p process.execPath)" scripts/localnet/cctp/harness.mjs ...` so the
+signal reaches Node. A `receive_message` does not fit a legacy transaction:
+`solana-tx.mjs` sends v0 transactions over a CCTP address lookup table.
+
 ### Runtime feature parity
 
 The runtime is pinned to Agave 4.4.1. `crates/dagon-zkapi-deploy/src/agave-4.4.1-features.json`

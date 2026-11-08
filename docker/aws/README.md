@@ -93,6 +93,18 @@ unpaused.
 
 - Do not publish server, indexer or challenger ports. Only the gateway
   should be reachable by clients.
+- Terminate TLS at an edge (host proxy or VPC load balancer) that appends the
+  client address to `X-Forwarded-For`. The gateway trusts that header only
+  from loopback and private (RFC 1918, `fc00::/7`) peers and uses the
+  rightmost untrusted hop; direct public clients are keyed by their own
+  address. An edge with a public address (for example CloudFront in front of
+  the load balancer) needs its ranges added as `set_real_ip_from` in
+  `docker/aws/nginx.conf`, or every client shares its address.
+- The gateway limits CCTP relay routes per client IP: `/v2/relay/` (prepares,
+  submit, escape finalize) to 30 requests/minute with burst 10, `GET
+  /v2/relay` to 60/minute with burst 20, excluding CORS preflights. Excess
+  requests get 429 `{"error":{"code":"rate_limited",...}}` with
+  `Retry-After: 60`. The relay's own per-key and global limits are a backstop.
 - Preserve `/var/lib/zkapi`; it contains the transcript database, finalized
   indexer state and challenge checkpoint.
 - Back up populated public deployment metadata together with its exact program,
