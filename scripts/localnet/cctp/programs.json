@@ -1,0 +1,18 @@
+{
+  "schema": "dagon-zkapi.cctp-programs.v1",
+  "note": "Circle CCTP V2 mainnet executables cloned into localnet. executable_sha256 = sha256(programdata[45..], trailing zero bytes trimmed). Re-pin after a Circle upgrade: node scripts/localnet/cctp/validator.mjs --pin",
+  "programs": [
+    {
+      "name": "message_transmitter_v2",
+      "program_id": "CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC",
+      "programdata": "2w2zCf9f5iyr7qcuWQH4DFNNahBZHgYkL4UVU3p5T1iS",
+      "executable_sha256": "d129c1b651da8dfb068f237a36b74f13d2dc3052def85295a8d7cc182915f8c2"
+    },
+    {
+      "name": "token_messenger_minter_v2",
+      "program_id": "CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe",
+      "programdata": "9ZEnLvCp3weopBnSaoSSjn7hoVk6zMXMpfH3LjNzBFFF",
+      "executable_sha256": "26fbafbdc2bfdced2b7311ed0c1ab8ccaaf4523a1058bf9caabc3d55fa1db169"
+    }
+  ]
+}

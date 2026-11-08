@@ -137,7 +137,11 @@ async function clockOffsetEnv(root, runDir, clockOffsetSeconds) {
   return { ...process.env, LD_PRELOAD: shim, DAGON_CLOCK_OFFSET_SECONDS: String(clockOffsetSeconds) };
 }
 
-export async function startLocalStack({ root = defaultRoot, runDir, binDir = join(root, 'target/release'), log = console.log, rpcPort = 8899, clockOffsetSeconds = 0, signal }) {
+/**
+ * `cctp` (test-only, default off): `{variant: 'normal'|'mt-paused'|'minter-paused', denylist: [pubkey]}`
+ * adds Circle CCTP V2 (scripts/localnet/cctp/validator.mjs) with local test attesters.
+ */
+export async function startLocalStack({ root = defaultRoot, runDir, binDir = join(root, 'target/release'), log = console.log, rpcPort = 8899, clockOffsetSeconds = 0, cctp = null, signal }) {
   if (!runDir) throw new Error('runDir is required (must be a new directory)');
   if (!process.env.ZKAPI_STATE_SEED || !process.env.ZKAPI_CLEAR_SEED) throw new Error('set ZKAPI_STATE_SEED and ZKAPI_CLEAR_SEED; use the same seeds for serverd');
   root = resolve(root); runDir = resolve(runDir); binDir = resolve(binDir);
@@ -195,6 +199,8 @@ export async function startLocalStack({ root = defaultRoot, runDir, binDir = joi
     const pdaSignerPath = await ensurePdaSigner(root, log);
     const faucetAccount = await usdcTokenAccountFixture(runDir, profile, faucet.publicKey, { amount: FAUCET_BALANCE, state: 1 });
     const frozenAccount = await usdcTokenAccountFixture(runDir, profile, frozenOwner.publicKey, { amount: 0n, state: 2 });
+    const cctpHarness = cctp ? await import('./cctp/validator.mjs') : null;
+    const cctpFixtures = cctp ? await cctpHarness.cctpValidatorFixtures({ runDir, mainnetUrl, cctp }) : null;
     const args = ['--ledger', join(runDir, 'ledger'), '--rpc-port', String(rpcPort), '--faucet-port', String(rpcPort + 101), '--gossip-port', String(rpcPort + 102), '--bind-address', '127.0.0.1', '--url', mainnetUrl,
       '--clone-feature-set',
       ...await immutableProgramAccounts(root, runDir, profile),
@@ -203,6 +209,7 @@ export async function startLocalStack({ root = defaultRoot, runDir, binDir = joi
       ...await mainnetProgramClones(mainnetUrl, [profile.asset.token_program, profile.asset.associated_token_program]),
       ...faucetAccount.flags, ...frozenAccount.flags,
       '--bpf-program', PDA_SIGNER_PROGRAM_ID, pdaSignerPath,
+      ...(cctpFixtures?.flags ?? []),
       '--log'];
     const validatorPath = process.env.DAGON_SOLANA_TEST_VALIDATOR ?? join(process.env.XDG_DATA_HOME ?? join(homedir(), '.local/share'), 'dagon-zkapi/agave-v4.4.1/solana-release/bin/solana-test-validator');
     const validatorEnv = await clockOffsetEnv(root, runDir, clockOffsetSeconds);
@@ -239,18 +246,20 @@ export async function startLocalStack({ root = defaultRoot, runDir, binDir = joi
     const initialized = await exec(binary, ['init-vault', '--solana-identity', identityPath, '--solana-rpc-url', rpcUrl, '--authority-keypair', authorityKeypairPath]);
     log(initialized.stdout.trim());
     await checkParity({ identityPath, rpcUrl, binDir, mainnetRpcUrl: mainnetUrl, log });
+    const cctpInfo = cctp ? { ...cctpFixtures.info, programs: await cctpHarness.verifyCctpPrograms(rpcUrl) } : null;
     if (failed) throw failed;
     const identity = JSON.parse(await readFile(identityPath, 'utf8'));
     return { rpcUrl, identityPath, identity, authorityKeypairPath, payerKeypairPath, treasuryTokenAccount: treasuryTokenAccount.toBase58(),
       usdcFaucetKeypairPath, usdcFaucetTokenAccount: faucetAccount.address.toBase58(),
       frozenUsdcOwnerKeypairPath, frozenUsdcTokenAccount: frozenAccount.address.toBase58(),
-      pdaSignerProgramId: PDA_SIGNER_PROGRAM_ID, clockOffsetSeconds, stop };
+      pdaSignerProgramId: PDA_SIGNER_PROGRAM_ID, clockOffsetSeconds, ...(cctpInfo ? { cctp: cctpInfo } : {}), stop };
   } catch (error) { await stop(); throw error; }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const { values } = parseArgs({ options: { 'run-dir': { type: 'string' }, 'bin-dir': { type: 'string' }, 'rpc-port': { type: 'string' },
-    'clock-offset-seconds': { type: 'string' }, 'clock-before-utc-midnight': { type: 'string' } } });
+    'clock-offset-seconds': { type: 'string' }, 'clock-before-utc-midnight': { type: 'string' },
+    cctp: { type: 'boolean' }, 'cctp-variant': { type: 'string' }, 'cctp-denylist': { type: 'string' } } });
   const controller = new AbortController();
   let stack; let shuttingDown = false;
   function shutdown() {
@@ -271,7 +280,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     const clockOffsetSeconds = values['clock-before-utc-midnight'] !== undefined
       ? clockOffsetBeforeUtcMidnight(integer('clock-before-utc-midnight', values['clock-before-utc-midnight']))
       : values['clock-offset-seconds'] !== undefined ? integer('clock-offset-seconds', values['clock-offset-seconds']) : 0;
-    stack = await startLocalStack({ runDir: values['run-dir'], binDir: values['bin-dir'], rpcPort: values['rpc-port'] ? Number(values['rpc-port']) : undefined, clockOffsetSeconds, signal: controller.signal });
+    const cctp = values.cctp || values['cctp-variant'] !== undefined || values['cctp-denylist'] !== undefined
+      ? { variant: values['cctp-variant'] ?? 'normal', denylist: values['cctp-denylist'] ? values['cctp-denylist'].split(',') : [] } : null;
+    stack = await startLocalStack({ runDir: values['run-dir'], binDir: values['bin-dir'], rpcPort: values['rpc-port'] ? Number(values['rpc-port']) : undefined, clockOffsetSeconds, cctp, signal: controller.signal });
     if (shuttingDown) { await stack.stop(); process.exit(0); }
     const { stop: _stop, ...fields } = stack;
     console.log(JSON.stringify(fields));
