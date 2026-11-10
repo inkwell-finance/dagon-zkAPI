@@ -1,0 +1,21 @@
+{
+ "request": {
+  "public": 13,
+  "picus-v6": 29702,
+  "free": 1143,
+  "is_neq-multiplier": 25,
+  "L-bits": 508
+ },
+ "withdrawal": {
+  "public": 17,
+  "picus-v6": 19762,
+  "L-bits": 1016,
+  "is_neq-multiplier": 49,
+  "free": 760
+ },
+ "transition": {
+  "public": 11,
+  "picus-v5": 31802,
+  "free": 32
+ }
+}

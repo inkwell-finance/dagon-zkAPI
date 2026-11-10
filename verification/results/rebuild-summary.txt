@@ -1,0 +1,87 @@
+repo: d05a8e38043879fac6b787c393968ade97c42bb1
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+Python 3.12.3
+Docker version 29.9.3, build 5457199
+elan 4.2.4 (227caca13 2026-08-25)
+Lean (version 4.24.0, x86_64-unknown-linux-gnu, commit 797c613eb9b6d4ec95db23e3e00af9ac6657f24b, Release)
+----- [01] Tool versions: PASS (2s)
+----- [02] Picus verdict classifier self-test: PASS (0s)
+request    ed73c7919790d3cb75e9fc60373aa7ac3c5fb4820c43f2364451ebfdb7f14566 ceremony.json MATCH
+withdrawal a2b46576733aafbe90b816a26cfe8f40c613d76581fbf9e982026e191fa0c973 ceremony.json MATCH
+transition a9cd49c195bd2d6e80664672f0994542baa12aa661e8e93bd9563f3bed8ad1c1 ceremony.json MATCH
+----- [03] Export r1cs and check ceremony.json pins: PASS (31s)
+request: sha256=ed73c7919790d3cb75e9fc60373aa7ac3c5fb4820c43f2364451ebfdb7f14566 pin_match=true constraints=31670 inst=13 wit=31378
+withdrawal: sha256=a2b46576733aafbe90b816a26cfe8f40c613d76581fbf9e982026e191fa0c973 pin_match=true constraints=22222 inst=17 wit=21587
+transition: sha256=a9cd49c195bd2d6e80664672f0994542baa12aa661e8e93bd9563f3bed8ad1c1 pin_match=true constraints=31810 inst=11 wit=31834
+----- [04] Instrumented mapper (byte-identical to the pins): PASS (34s)
+PASS L-bits canonical: to_bits_le gadget accepts the canonical 254-bit decomposition (400 values)
+PASS L-bits alias: the only other 254-bit decomposition x+p is rejected (259 values with x+p < 2^254)
+PASS L-bits p-1: p-1 accepted
+PASS L-bits p: bits of p rejected as a decomposition of 0
+PASS request genesis fixture: honest genesis request witness satisfies the pinned constraints
+PASS C1 is_eq multiplier (request genesis): multiplier wire (L830 anchor.is_eq(1)) replaced by a random value: still satisfied, same public inputs; it feeds no other constraint
+PASS C1 control: is_genesis flag: flipping is_not_equal itself is rejected
+PASS request non-genesis fixture: honest signed non-genesis request satisfies
+PASS C1 control: multiplier when anchor != 1: multiplier is pinned to 1/(anchor-1) when anchor != 1
+PASS C2 genesis prev_anchor / signature free: two genesis witnesses with different prev_anchor and arbitrary (R,s) both satisfy with identical public inputs (prev wire 17536)
+PASS C3 signature R pre-cofactor alias: ge and ge+(0,-1) both satisfy the R allocation (8*ge = R) with the same R
+PASS C4 251-bit scalar alias: bits(k) and bits(k+l) both satisfy H*bits with the same output point
+PASS withdrawal escape fixture: honest escape withdrawal satisfies
+PASS withdrawal control: final_balance + conceded != signed balance is rejected
+PASS L-EC denominators: a=1, d non-square; 1 +- d*x1*x2*y1*y2 and a*x^2+y^2, 2-a*x^2-y^2 non-zero on 202 on-curve points incl. 2-torsion
+----- [05] Forged-witness harness: PASS (3s)
+transition v5 slices 140 max constraints 401 {'bool': 225, 'bitsum': 4, 'bitsum_constraints': 4, 'ec': 0} unconstrained 0
+withdrawal v6 slices 311 max constraints 493 {'bool': 2571, 'ec': 4316, 'bitsum': 9, 'bitsum_constraints': 6} unconstrained 0
+request v6 slices 331 max constraints 493 {'ec': 3292, 'bool': 2128, 'bitsum': 5, 'bitsum_constraints': 5} unconstrained 0
+----- [06] Relabel and slice: PASS (6s)
+image veridise/picus@sha256:3e78b3b6e3adb064e713553debdf83424bad538a84d95afbafc95e2c9dfe7f5c
+request-v6      {'SAFE': 331}  wall sum 638s max 4.1s
+transition-v5   {'SAFE': 140}  wall sum 386s max 5.8s
+withdrawal-v6   {'SAFE': 311}  wall sum 617s max 6.1s
+782 slices, 782 SAFE
+----- [07] Picus slices (--strong --solver cvc5 --timeout 5000): PASS (304s)
+unproven wires: {'request': 0, 'withdrawal': 0, 'transition': 0}
+wire accounting equals results/compose-summary.json: True
+----- [08] Composition check (every wire accounted for): PASS (1s)
+Lean (version 4.24.0, x86_64-unknown-linux-gnu, commit 797c613eb9b6d4ec95db23e3e00af9ac6657f24b, Release)
+== mathlib f897ebcf72cd16f89ab4577d0c826cd14afaafc7
+Build completed successfully (1776 jobs).
+theorems: 15, with only [propext, Classical.choice, Quot.sound]: 15
+lean-export.json sha256 7b846f032126fe9097c57e1ed4c702de39206cd7056b0c3fb0d515991bc9a667 (expected 7b846f032126fe9097c57e1ed4c702de39206cd7056b0c3fb0d515991bc9a667)
+----- [09] Lean lemmas: build and axioms: PASS (129s)
+== request: sha256 ed73c7919790d3cb75e9fc60373aa7ac3c5fb4820c43f2364451ebfdb7f14566 (pin OK), 31391 wires, 31670 constraints
+== withdrawal: sha256 a2b46576733aafbe90b816a26cfe8f40c613d76581fbf9e982026e191fa0c973 (pin OK), 21604 wires, 22222 constraints
+== transition: sha256 a9cd49c195bd2d6e80664672f0994542baa12aa661e8e93bd9563f3bed8ad1c1 (pin OK), 31845 wires, 31810 constraints
+ALL LINKED
+----- [10] Linkage of the Lean lemmas to the pinned r1cs: PASS (15s)
+REJECTED  L-bits: one in-field constraint perturbed -> mismatches per site [1, 0]
+REJECTED  L-EC: add denominator uses d+1 -> linked: False
+REJECTED  L-EC: add y3 numerator perturbed -> linked: False
+REJECTED  L-EC premise: on-curve check of the R witness perturbed -> provenance failures 1
+REJECTED  L-neq: extra occurrence of m added -> occurrences 2, row ok [False]
+NEGATIVE CONTROLS: all rejected
+----- [11] Linkage negative controls: PASS (8s)
+PASS     Tool versions
+PASS     Picus verdict classifier self-test
+PASS     Export r1cs and check ceremony.json pins
+PASS     Instrumented mapper (byte-identical to the pins)
+PASS     Forged-witness harness
+PASS     Relabel and slice
+PASS     Picus slices (--strong --solver cvc5 --timeout 5000)
+PASS     Composition check (every wire accounted for)
+PASS     Lean lemmas: build and axioms
+PASS     Linkage of the Lean lemmas to the pinned r1cs
+PASS     Linkage negative controls
+===== SUMMARY
+PASS     Tool versions
+PASS     Picus verdict classifier self-test
+PASS     Export r1cs and check ceremony.json pins
+PASS     Instrumented mapper (byte-identical to the pins)
+PASS     Forged-witness harness
+PASS     Relabel and slice
+PASS     Picus slices (--strong --solver cvc5 --timeout 5000)
+PASS     Composition check (every wire accounted for)
+PASS     Lean lemmas: build and axioms
+PASS     Linkage of the Lean lemmas to the pinned r1cs
+PASS     Linkage negative controls
+VERIFICATION: PASS

@@ -53,7 +53,9 @@ Solana-only root transition uses the separate
 single-party ceremonies and must be replaced or accepted explicitly for a real
 deployment. See [note-bound commitments](docs/note-bound-commitments.md),
 [transition setup provenance](protocol/setup/solana-transition-v1/README.md),
-and [Solana server invariants](docs/SOLANA_SERVER.md).
+and [Solana server invariants](docs/SOLANA_SERVER.md). The pinned r1cs files are
+checked for under-constraint (Picus plus Lean-proved lemmas) in
+[circuit verification](verification/README.md).
 
 ## Build and test
 

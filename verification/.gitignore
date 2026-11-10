@@ -1,0 +1,9 @@
+# Everything rebuild.sh generates: exported r1cs, marks, slices, Picus logs, cargo target, run logs.
+/work/
+# Lean build tree (Mathlib checkout and oleans) and the export written next to Export.lean.
+/lean/.lake/
+/lean/lean-export.json
+/mapper/target/
+__pycache__/
+*.r1cs
+*.log

@@ -113,6 +113,8 @@ reads the code, the "you must trust the server's code" caveat below disappears.
   (`snarkjs zkey verify` against the r1cs and Powers of Tau) before it is accepted.
 - Attestation = sha256 of `dagon-zkapi-ceremony-v1\nround:<n>\n` followed by `<circuit>:<contribution hash>\n` for
   each circuit in order.
+- Circuit verification: Picus plus Lean-proved lemmas, linked to the pinned r1cs, show every wire is fixed by the
+  public and private inputs. See `verification/README.md`; reproduce with `verification/rebuild.sh`.
 - Source: <https://github.com/inkwell-finance/dagon-zkAPI/tree/ccc634b/ceremony>. Design and operator guide:
   `ceremony/README.md`.
 

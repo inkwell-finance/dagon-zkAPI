@@ -1,0 +1,16 @@
+PASS L-bits canonical: to_bits_le gadget accepts the canonical 254-bit decomposition (400 values)
+PASS L-bits alias: the only other 254-bit decomposition x+p is rejected (259 values with x+p < 2^254)
+PASS L-bits p-1: p-1 accepted
+PASS L-bits p: bits of p rejected as a decomposition of 0
+PASS request genesis fixture: honest genesis request witness satisfies the pinned constraints
+PASS C1 is_eq multiplier (request genesis): multiplier wire (L830 anchor.is_eq(1)) replaced by a random value: still satisfied, same public inputs; it feeds no other constraint
+PASS C1 control: is_genesis flag: flipping is_not_equal itself is rejected
+PASS request non-genesis fixture: honest signed non-genesis request satisfies
+PASS C1 control: multiplier when anchor != 1: multiplier is pinned to 1/(anchor-1) when anchor != 1
+PASS C2 genesis prev_anchor / signature free: two genesis witnesses with different prev_anchor and arbitrary (R,s) both satisfy with identical public inputs (prev wire 17536)
+PASS C3 signature R pre-cofactor alias: ge and ge+(0,-1) both satisfy the R allocation (8*ge = R) with the same R
+PASS C4 251-bit scalar alias: bits(k) and bits(k+l) both satisfy H*bits with the same output point
+PASS withdrawal escape fixture: honest escape withdrawal satisfies
+PASS withdrawal control: final_balance + conceded != signed balance is rejected
+PASS L-EC denominators: a=1, d non-square; 1 +- d*x1*x2*y1*y2 and a*x^2+y^2, 2-a*x^2-y^2 non-zero on 202 on-curve points incl. 2-torsion
+0 failures
