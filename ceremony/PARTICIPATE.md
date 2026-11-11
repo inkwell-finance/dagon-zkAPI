@@ -91,9 +91,11 @@ reads the code, the "you must trust the server's code" caveat below disappears.
 
 ## How you can check your contribution was used
 
-1. Your attestation hash appears in the public transcript: <https://ceremony.dagon.so/files/transcript.json>.
-2. After the ceremony is sealed, anyone can re-verify everything from scratch:
-   `node verify-ceremony.mjs https://ceremony.dagon.so --ceremony ceremony.json` (see `ceremony/README.md`).
+1. Your attestation hash appears in the public transcript: <https://ceremony.dagon.so/files/transcript.json>, also
+   mirrored at <https://ceremony-files.dagon.so/files/transcript.json>.
+2. After the ceremony is sealed, anyone can re-verify everything from scratch, against the coordinator or the
+   independent mirror (which keeps the archive online after the coordinator is retired):
+   `node verify-ceremony.mjs https://ceremony-files.dagon.so --ceremony ceremony.json` (see `ceremony/README.md`).
 
 ## Timeline
 
