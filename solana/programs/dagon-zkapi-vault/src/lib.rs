@@ -2340,3 +2340,6 @@ mod tests {
 
 #[cfg(test)]
 mod concession_tests;
+
+#[cfg(kani)]
+mod kani_proofs;
