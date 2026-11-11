@@ -76,6 +76,14 @@ An independently obtained verifier and pinned inputs check the algebra and artif
 
    Obtain `closed.json` independently **before the beacon exists**, not from the final mirror afterward. `--strict` requires finality, all historical rounds including init, online beacon authentication, pinned config and checkpoint. It requires final zkeys and exact published VK JSON matching derived keys, and can emit an adoption manifest. Default verification checks historical hashes/MPC prefixes and fully verifies only the last algebraic key; `--all-rounds` verifies every historical algebraic file. `--final-only` cannot combine with `--all-rounds`/`--strict`. `--offline` cannot produce a strict adoption manifest. A self-consistent transcript cannot prove omitted participants did not exist: use repeatable `--receipt HASH` checks. Cache creation is automatic; downloads honor bounded Retry-After backoff.
 
+   **Independent mirror.** Every published file is also served from an R2 mirror at `https://ceremony-files.dagon.so/files/…` (same layout as the coordinator's `/files/`). A Cloudflare Worker copies new rounds every 10 minutes, checking each key's sha256 against the transcript before it stays in the mirror, and keeps the archive online after the coordinator is retired. The mirror is untrusted by design: point the verifier at it instead of the coordinator and it checks every hash and replays every contribution the same way, so a tampered mirror cannot produce a PASS:
+
+   ```sh
+   node verify-ceremony.mjs https://ceremony-files.dagon.so --ceremony ceremony.json
+   ```
+
+   The mirror also avoids the coordinator's per-IP rate limit on `/files/` when verifying many rounds.
+
 ## Staying safe
 
 * **Use a device you trust.** A laptop or phone you own, with an up-to-date browser or operating system. Not a shared or work machine you do not control.
