@@ -12,13 +12,12 @@ export const INDEXER_LAG_MAX_WAIT_MS = 12_000;
 const INDEXER_LAG_INITIAL_DELAY_MS = 250;
 const INDEXER_LAG_MAX_DELAY_MS = 2_000;
 
-// The indexer mirrors the finalized vault on its own poll, so right after a
-// deposit (or any vault update) its snapshot can lack the newest note or root.
-// That is lag, not an inconsistency: retry the snapshot with bounded backoff
-// and only hand a snapshot that holds `requiredNoteId` at the expected root to
-// the proof worker. `expectedActiveRoot` is a fixed root or an async reader
-// that is re-read on every attempt, so a vault that moves on while we wait is
-// followed. Without either constraint the first snapshot is returned.
+// Retry only a mismatch against the expected finalized root. A missing note
+// at a matching root is inconsistent, not lag: retrying based on the private
+// note ID would let a malicious indexer probe it with fabricated note counts.
+// `expectedActiveRoot` is a fixed root or an async reader re-read each attempt,
+// so a vault that moves while we wait is followed. Without a root constraint
+// there is no trusted lag signal, so the first snapshot is checked once.
 export async function waitForTreeSnapshot(loadSnapshot, {
     requiredNoteId = null,
     expectedActiveRoot = null,
@@ -38,10 +37,15 @@ export async function waitForTreeSnapshot(loadSnapshot, {
         signal?.throwIfAborted();
         const [snapshot, root] = await Promise.all([loadSnapshot(), readExpectedRoot()]);
         signal?.throwIfAborted();
-        const holdsNote = requiredNoteId == null
-            || Number(snapshot?.next_note_id) > Number(requiredNoteId);
         const atRoot = root == null || sameFelt(snapshot?.root, root);
-        if (holdsNote && atRoot) return snapshot;
+        if (atRoot) {
+            if (requiredNoteId != null && !(Number(snapshot?.next_note_id) > Number(requiredNoteId))) {
+                const error = new Error('The zkAPI indexer snapshot is inconsistent with the required note.');
+                error.code = 'indexer_inconsistent';
+                throw error;
+            }
+            return snapshot;
+        }
         if (now() + delayMs > deadline) break;
         await sleep(delayMs);
         signal?.throwIfAborted();

@@ -222,7 +222,7 @@ test('active root synchronization waits for the indexer and fails closed', async
     assert.equal(unconstrained, 1, 'a snapshot with no required note or root is read once');
 });
 
-test('a snapshot missing the requested note is indexer lag, retried with bounded backoff', async () => {
+test('a snapshot with an old root is retried with bounded backoff before proving', async () => {
     const roots = await import(pathToFileURL(path.join(__dirname, 'services/zkapiActiveRoot.mjs')));
     const lagPolls = 4;
     let clock = 0;
@@ -257,7 +257,7 @@ test('a snapshot missing the requested note is indexer lag, retried with bounded
     await assert.rejects(
         roots.waitForTreeSnapshot(
             async () => ({ root: '0x1', next_note_id: 5 }),
-            { requiredNoteId: 5, ...timing }
+            { requiredNoteId: 5, expectedActiveRoot: '0x2', ...timing }
         ),
         error => error.code === 'indexer_root_lag'
     );
@@ -280,10 +280,38 @@ test('snapshot waits stop on abort and do not poll after a delayed timer wakeup'
         return { root: '0x1', next_note_id: 0 };
     }, {
         requiredNoteId: 0,
+        expectedActiveRoot: '0x2',
         now: () => clock,
         sleep: async () => { clock = 12_001; }
     }), error => error.code === 'indexer_root_lag');
     assert.equal(polls, 1);
+});
+
+test('snapshot retry traffic depends on the public root, never the private note threshold', async () => {
+    const { waitForTreeSnapshot } = await import('../services/zkapiActiveRoot.mjs');
+    for (const requiredNoteId of [0, 5]) {
+        let polls = 0;
+        const waits = [];
+        const pending = waitForTreeSnapshot(async () => {
+            polls += 1;
+            return { root: polls === 1 ? '0x1' : '0x2', next_note_id: 3 };
+        }, {
+            requiredNoteId,
+            expectedActiveRoot: '0x2',
+            sleep: async milliseconds => waits.push(milliseconds)
+        });
+        if (requiredNoteId === 0) assert.equal((await pending).next_note_id, 3);
+        else await assert.rejects(pending, error => error.code === 'indexer_inconsistent');
+        assert.equal(polls, 2, 'a matching root stops GETs regardless of the private note ID');
+        assert.deepEqual(waits, [250]);
+    }
+
+    let polls = 0;
+    await assert.rejects(waitForTreeSnapshot(async () => {
+        polls += 1;
+        return { root: '0x1', next_note_id: 0 };
+    }, { requiredNoteId: 0 }), error => error.code === 'indexer_inconsistent');
+    assert.equal(polls, 1, 'without a trusted root, a missing note cannot trigger retries either');
 });
 
 test('only a never-journaled prepared deposit can be re-planned or replaced', async () => {

@@ -2121,7 +2121,9 @@ class BrowserWalletRuntime extends EventTarget {
         const serverRoot = error?.data?.latest_root;
         if (requestRoot == null || serverRoot == null || sameFelt(requestRoot, serverRoot)) return false;
         try {
-            return sameFelt(requestRoot, await this.finalizedVaultRoot(signal));
+            const root = await this.finalizedVaultRoot(signal);
+            throwIfAborted(signal);
+            return sameFelt(requestRoot, root);
         } catch {
             throwIfAborted(signal);
             return false;

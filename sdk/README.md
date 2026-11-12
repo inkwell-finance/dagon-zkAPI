@@ -182,10 +182,12 @@ the note commitment with its own. A deposit that landed is
 installed from the finalized note account alone: confirmation never reads the
 operator's indexer, so withholding the tree mirror cannot keep a landed deposit
 from being exited. Requests still read and verify the mirror: a request proves
-against the finalized vault root, and a mirror snapshot that does not yet hold
-the note or that root (the indexer polls the vault, so it can trail a fresh
-deposit) is retried with bounded backoff for about 12 seconds before the proof
-worker runs, then fails with `indexer_root_lag`. A `stale_root` rejection of a
+against the finalized vault root. The SDK retries while the indexer root lags
+the vault (bounded backoff for about 12 seconds, then `indexer_root_lag`);
+it never retries on a missing note at a matching root. That inconsistent
+snapshot fails before the proof worker with `indexer_inconsistent`. Basing
+retries only on the public root prevents an untrusted indexer from probing a
+private note ID by varying its advertised note count. A `stale_root` rejection of a
 request proved at the finalized vault root, with a different server root, is
 treated as server poll lag; the SDK resends the identical request for up to
 10 seconds, including time spent checking the vault before each resend.

@@ -1329,6 +1329,34 @@ test('server-lag resends respect vault-read time and delayed timer wakeups', asy
     }
 });
 
+test('a canceled vault read cannot turn into a stale-root journal-clearing error', async () => {
+    const runtime = runtimeForLeaseRequests();
+    const controller = new AbortController();
+    runtime.remoteJson = async () => { throw staleRootError('0x0e'); };
+    runtime.finalizedVaultRoot = async () => {
+        controller.abort();
+        return '0xbb';
+    };
+    await assert.rejects(runtime.requestLeaseWithRetry(
+        { public_inputs: { active_root: '0xaa' } }, undefined, controller.signal),
+    error => error.name === 'AbortError');
+});
+
+test('a matching-root snapshot missing the note fails before proving without a second GET', async () => {
+    const runtime = runtimeForLeaseRequests();
+    runtime.runtime = { state: { note_id: 5 } };
+    runtime.finalizedVaultRoot = async () => '0xaa';
+    let reads = 0;
+    runtime.remoteJson = async () => {
+        reads += 1;
+        return { root: '0xaa', next_note_id: 3 };
+    };
+    runtime.worker = { call: () => assert.fail('an inconsistent snapshot must not reach the worker') };
+    await assert.rejects(runtime.prepareLeaseRequest(),
+        error => error.code === 'indexer_inconsistent');
+    assert.equal(reads, 1);
+});
+
 test('checkout never exposes a key retired while ensureLease was resolving', async () => {
     const runtime = runtimeForLeaseRequests();
     const lease = { api_key: 'must-not-be-returned', inFlight: 0 };
