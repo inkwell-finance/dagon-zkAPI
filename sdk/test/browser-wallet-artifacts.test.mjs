@@ -196,23 +196,73 @@ test('browser exits are leaf-bound: no root read, Merkle path or root retry', ()
 
 test('active root synchronization waits for the indexer and fails closed', async () => {
     const roots = await import(pathToFileURL(path.join(__dirname, 'services/zkapiActiveRoot.mjs')));
+    const instant = { maxWaitMs: 1_000, initialDelayMs: 1, sleep: async () => {} };
     let calls = 0;
-    const current = await roots.waitForExpectedActiveRoot(async () => {
+    const current = await roots.waitForTreeSnapshot(async () => {
         calls += 1;
-        return { active_root: calls === 1 ? '0x10' : '0x11' };
-    }, 17n, { attempts: 3, delayMs: 0, sleep: async () => {} });
-    assert.equal(current.active_root, '0x11');
+        return { root: calls === 1 ? '0x10' : '0x11', next_note_id: 1 };
+    }, { expectedActiveRoot: 17n, ...instant });
+    assert.equal(current.root, '0x11');
     assert.equal(calls, 2);
     assert.equal(roots.sameFelt('0x11', 17n), true);
 
     await assert.rejects(
-        roots.waitForExpectedActiveRoot(
-            async () => ({ active_root: '0x12' }),
-            '0x13',
-            { attempts: 2, delayMs: 0, sleep: async () => {} }
+        roots.waitForTreeSnapshot(
+            async () => ({ root: '0x12', next_note_id: 1 }),
+            { expectedActiveRoot: '0x13', ...instant, maxWaitMs: 2 }
         ),
         error => error.code === 'indexer_root_lag'
     );
+
+    let unconstrained = 0;
+    await roots.waitForTreeSnapshot(async () => {
+        unconstrained += 1;
+        return { root: '0x1', next_note_id: 0 };
+    }, instant);
+    assert.equal(unconstrained, 1, 'a snapshot with no required note or root is read once');
+});
+
+test('a snapshot missing the requested note is indexer lag, retried with bounded backoff', async () => {
+    const roots = await import(pathToFileURL(path.join(__dirname, 'services/zkapiActiveRoot.mjs')));
+    const lagPolls = 4;
+    let clock = 0;
+    const waits = [];
+    const timing = {
+        now: () => clock,
+        sleep: async milliseconds => { waits.push(milliseconds); clock += milliseconds; }
+    };
+    let polls = 0;
+    const snapshot = await roots.waitForTreeSnapshot(async () => {
+        polls += 1;
+        return polls <= lagPolls
+            ? { root: '0x1', next_note_id: 5 }
+            : { root: '0x2', next_note_id: 6 };
+    }, { requiredNoteId: 5, expectedActiveRoot: '0x2', ...timing });
+    assert.equal(snapshot.next_note_id, 6);
+    assert.equal(polls, lagPolls + 1);
+    assert.deepEqual(waits, [250, 500, 1_000, 2_000]);
+
+    // A vault that moves on while we wait is followed: the root is re-read.
+    let vaultRoot = '0x2';
+    polls = 0;
+    const moved = await roots.waitForTreeSnapshot(async () => {
+        polls += 1;
+        if (polls === 2) vaultRoot = '0x3';
+        return { root: '0x3', next_note_id: 7 };
+    }, { requiredNoteId: 5, expectedActiveRoot: async () => vaultRoot, ...timing });
+    assert.equal(moved.root, '0x3');
+
+    clock = 0;
+    waits.length = 0;
+    await assert.rejects(
+        roots.waitForTreeSnapshot(
+            async () => ({ root: '0x1', next_note_id: 5 }),
+            { requiredNoteId: 5, ...timing }
+        ),
+        error => error.code === 'indexer_root_lag'
+    );
+    assert.ok(clock <= roots.INDEXER_LAG_MAX_WAIT_MS, `waited ${clock}ms`);
+    assert.ok(clock >= 10_000, `gave the indexer ${clock}ms`);
 });
 
 test('only a never-journaled prepared deposit can be re-planned or replaced', async () => {

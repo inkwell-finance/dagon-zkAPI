@@ -1,6 +1,6 @@
 import { browserSdkOptions, beginBrowserSdkInitialization, browserSdkTransport } from '../configure.js';
 import { CHAT_SPENDING_TIER_USD } from './zkapiRequestCompat.mjs';
-import { sameFelt, waitForExpectedActiveRoot } from './zkapiActiveRoot.mjs';
+import { sameFelt, waitForTreeSnapshot } from './zkapiActiveRoot.mjs';
 import { chooseEscapeConcession, exitProofLive, exitProofLiveUntil, exitProofValidUntil, reusableExitProof }
     from './zkapiExitPolicy.mjs';
 import { canonicalChainId, sameChainId } from './zkapiLedgerIdentity.mjs';
@@ -48,6 +48,13 @@ const LEASE_ISSUE_MAX_WAIT_MS = 75_000;
 const LEASE_ISSUE_MAX_ATTEMPTS = 5;
 const LEASE_ISSUE_INITIAL_RETRY_MS = 5_000;
 const LEASE_ISSUE_MAX_RETRY_MS = 30_000;
+// The server polls the finalized vault root on its own interval (1s by
+// default), so the indexer can serve a just-finalized root a moment before
+// the server adopts it. A `stale_root` whose request root is the finalized
+// vault root is that lag: resend the identical request for this long.
+const STALE_ROOT_LAG_MAX_WAIT_MS = 10_000;
+const STALE_ROOT_LAG_INITIAL_RETRY_MS = 500;
+const STALE_ROOT_LAG_MAX_RETRY_MS = 2_000;
 // Never begin a potentially long frontier-model stream on a key that is near
 // the server's independent settlement boundary. A follow-up inside this
 // window transparently closes the old key and obtains a fresh key at the selected model tier.
@@ -1564,22 +1571,33 @@ class BrowserWalletRuntime extends EventTarget {
             slot: operationState.slot };
     }
 
-    async treePath(noteId, requireExisting = true, expectedActiveRoot = null) {
-        return waitForExpectedActiveRoot(async () => {
-            const snapshot = await this.remoteJson(`${this.config.funding.indexer_url}/v1/tree/snapshot`);
-            return this.worker.call('treePath', { snapshot, noteId, requireExisting });
-        }, expectedActiveRoot, { sleep: milliseconds => delay(milliseconds) });
+    indexerSnapshot({ requiredNoteId = null, expectedActiveRoot = null, signal = null } = {}) {
+        return waitForTreeSnapshot(
+            () => this.remoteJson(`${this.config.funding.indexer_url}/v1/tree/snapshot`, signal ? { signal } : undefined),
+            { requiredNoteId, expectedActiveRoot, sleep: milliseconds => delay(milliseconds, signal) }
+        );
+    }
+
+    async treePath(noteId, requireExisting = true, expectedActiveRoot = null, signal = null) {
+        const snapshot = await this.indexerSnapshot({
+            requiredNoteId: requireExisting ? noteId : null,
+            expectedActiveRoot,
+            signal
+        });
+        return this.worker.call('treePath', { snapshot, noteId, requireExisting });
     }
 
     async nextDepositPath(expectedActiveRoot = null) {
-        return waitForExpectedActiveRoot(async () => {
-            const snapshot = await this.remoteJson(`${this.config.funding.indexer_url}/v1/tree/snapshot`);
-            return this.worker.call('treePath', {
-                snapshot,
-                noteId: Number(snapshot.next_note_id),
-                requireExisting: false
-            });
-        }, expectedActiveRoot, { sleep: milliseconds => delay(milliseconds) });
+        const snapshot = await this.indexerSnapshot({ expectedActiveRoot });
+        return this.worker.call('treePath', {
+            snapshot,
+            noteId: Number(snapshot.next_note_id),
+            requireExisting: false
+        });
+    }
+
+    async finalizedVaultRoot() {
+        return (await assertSolanaVault(this.config.funding)).root;
     }
 
     // Only a never-journaled plan can be re-planned (new amount or vault
@@ -1917,7 +1935,14 @@ class BrowserWalletRuntime extends EventTarget {
         }
         if (journal) return journal.prepared_request;
         onProgress('syncing', 'Checking your private balance…');
-        const path = await this.treePath(this.runtime.state.note_id, true);
+        // Prove against the finalized vault root and a snapshot that holds this
+        // note: right after a deposit the indexer may not have polled it yet.
+        const path = await this.treePath(
+            this.runtime.state.note_id,
+            true,
+            () => this.finalizedVaultRoot(),
+            signal
+        );
         throwIfAborted(signal);
         const now = Date.now();
         // C2: one bound per state. A request proof already left the device at
@@ -2010,14 +2035,17 @@ class BrowserWalletRuntime extends EventTarget {
         const now = retryOptions.now || Date.now;
         const sleep = retryOptions.sleep || delay;
         const deadline = now() + maxWaitMs;
+        const staleRootDeadline = now() + STALE_ROOT_LAG_MAX_WAIT_MS;
         const body = JSON.stringify(request);
         let attempt = 1;
+        let staleRootRetryMs = STALE_ROOT_LAG_INITIAL_RETRY_MS;
+        let resent = false;
 
         while (true) {
             throwIfAborted(signal);
             onProgress(
                 'requesting',
-                attempt === 1
+                attempt === 1 && !resent
                     ? 'Creating a temporary key for this chat…'
                     : 'Retrying temporary key creation…'
             );
@@ -2030,6 +2058,21 @@ class BrowserWalletRuntime extends EventTarget {
                 });
             } catch (error) {
                 throwIfAborted(signal);
+                if (error?.code === 'stale_root') {
+                    // A stale_root is rejected before any nullifier is reserved,
+                    // so resending the identical request is safe. Only the
+                    // server-behind case can heal; a request at an older root
+                    // needs a new proof, so it fails at once as before.
+                    if (now() + staleRootRetryMs > staleRootDeadline
+                        || !(await this.serverRootLagsRequest(request, error))) {
+                        throw error;
+                    }
+                    onProgress('waiting', 'The temporary-key service is catching up with the latest vault root…');
+                    await sleep(staleRootRetryMs, signal);
+                    staleRootRetryMs = Math.min(staleRootRetryMs * 2, STALE_ROOT_LAG_MAX_RETRY_MS);
+                    resent = true;
+                    continue;
+                }
                 const backoffDelayMs = Math.min(
                     initialRetryMs * (2 ** Math.max(0, attempt - 1)),
                     maxRetryMs
@@ -2054,6 +2097,19 @@ class BrowserWalletRuntime extends EventTarget {
                 await sleep(retryDelayMs, signal);
                 attempt += 1;
             }
+        }
+    }
+
+    // True when the request was proved at the finalized vault root and the
+    // server still reports an older one: its root poll is behind, not the proof.
+    async serverRootLagsRequest(request, error) {
+        const requestRoot = request?.public_inputs?.active_root;
+        const serverRoot = error?.data?.latest_root;
+        if (requestRoot == null || serverRoot == null || sameFelt(requestRoot, serverRoot)) return false;
+        try {
+            return sameFelt(requestRoot, await this.finalizedVaultRoot());
+        } catch {
+            return false;
         }
     }
 

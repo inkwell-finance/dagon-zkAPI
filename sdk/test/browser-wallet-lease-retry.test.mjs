@@ -1089,6 +1089,147 @@ test('selected cap reaches proof inputs and insufficient funds never start provi
         'durable proof must stay identical across a changed selection until recovery settles it');
 });
 
+function staleRootError(latestRoot) {
+    return new BrowserWalletHttpError(`stale root: latest is ${latestRoot}`, 409, 'stale_root', {
+        status: 'error',
+        error_code: 'stale_root',
+        error_message: `stale root: latest is ${latestRoot}`,
+        retriable: true,
+        latest_root: latestRoot
+    });
+}
+
+test('a lease right after a deposit waits for a lagging indexer before proving', async () => {
+    const runtime = runtimeForLeaseRequests();
+    runtime.config.funding.indexer_url = 'https://indexer.example';
+    runtime.config.wallet_core = { policy_charge_cap: 50_000 };
+    runtime.config.policy_enabled = true;
+    runtime.config.proving_keys = { request: {} };
+    // Note 0 is finalized on chain; the indexer has not polled it yet.
+    runtime.runtime = { state: { note_id: 0, current_balance: 5_000_000 } };
+    runtime.commit = async next => { runtime.runtime = next; };
+    const vaultRoots = [];
+    runtime.finalizedVaultRoot = async () => { vaultRoots.push('0xaa'); return '0xaa'; };
+    const lagPolls = 2;
+    const snapshotUrls = [];
+    runtime.remoteJson = async url => {
+        snapshotUrls.push(url);
+        return snapshotUrls.length <= lagPolls
+            ? { root: '0x0e', next_note_id: 0, leaves: [] }
+            : { root: '0xaa', next_note_id: 1, leaves: ['0x1'] };
+    };
+    const calls = [];
+    runtime.worker = { call: async (operation, payload) => {
+        calls.push({ operation, payload });
+        if (operation === 'treePath') {
+            assert.ok(payload.snapshot.next_note_id > payload.noteId,
+                'the proof worker never sees a snapshot that lacks the note');
+            return { active_root: payload.snapshot.root, note_id: payload.noteId, siblings: [] };
+        }
+        const request = { payload: payload.args.payload, public_inputs: {
+            solvency_bound: payload.config.request_charge_cap, active_root: payload.args.active_root } };
+        return { journal: { prepared_request: request }, request,
+            state: { ...payload.state, bound_at_state: payload.config.request_charge_cap } };
+    } };
+
+    const prepared = await runtime.prepareLeaseRequest(undefined, null, 1);
+
+    assert.equal(snapshotUrls.length, lagPolls + 1);
+    assert.ok(snapshotUrls.every(url => url === 'https://indexer.example/v1/tree/snapshot'));
+    assert.equal(vaultRoots.length, lagPolls + 1, 'the finalized vault root is the expected root');
+    assert.deepEqual(calls.map(call => call.operation), ['treePath', 'prepareRequest']);
+    assert.equal(calls[0].payload.requireExisting, true);
+    assert.equal(prepared.public_inputs.active_root, '0xaa');
+});
+
+test('a server whose root poll trails the vault gets the identical lease request again', async () => {
+    const runtime = runtimeForLeaseRequests();
+    runtime.finalizedVaultRoot = async () => '0xaa';
+    const request = {
+        client_request_id: 'proved-at-new-root',
+        payload: JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1 }),
+        public_inputs: { solvency_bound: 1_000_000, active_root: '0xaa' }
+    };
+    const bodies = [];
+    const waits = [];
+    const progress = [];
+    let clock = 0;
+    runtime.remoteJson = async (_url, init) => {
+        bodies.push(init.body);
+        if (bodies.length <= 2) throw staleRootError('0x0e');
+        return { status: 'active', client_request_id: request.client_request_id };
+    };
+
+    const lease = await runtime.requestLeaseWithRetry(
+        request,
+        (phase, message) => progress.push({ phase, message }),
+        null,
+        { now: () => clock, sleep: async milliseconds => { waits.push(milliseconds); clock += milliseconds; } }
+    );
+
+    assert.equal(lease.client_request_id, request.client_request_id);
+    assert.equal(bodies.length, 3);
+    assert.ok(bodies.every(body => body === bodies[0]));
+    assert.deepEqual(waits, [500, 1_000]);
+    assert.ok(progress.some(entry => entry.phase === 'waiting' && /catching up/.test(entry.message)));
+    assert.equal(progress.at(-1).message, 'Retrying temporary key creation…');
+});
+
+test('stale_root lag retries are bounded; a proof at an older root fails at once', async () => {
+    const runtime = runtimeForLeaseRequests();
+    runtime.finalizedVaultRoot = async () => '0xaa';
+    let clock = 0;
+    const waits = [];
+    const timing = { now: () => clock, sleep: async milliseconds => { waits.push(milliseconds); clock += milliseconds; } };
+    let attempts = 0;
+    const lagging = staleRootError('0x0e');
+    runtime.remoteJson = async () => { attempts += 1; throw lagging; };
+    await assert.rejects(
+        runtime.requestLeaseWithRetry(
+            { client_request_id: 'server-never-catches-up', public_inputs: { active_root: '0xaa' } },
+            () => {},
+            null,
+            timing
+        ),
+        candidate => candidate === lagging
+    );
+    assert.ok(clock <= 10_000, `stale_root lag wait ${clock}ms stays bounded`);
+    assert.deepEqual(waits, [500, 1_000, 2_000, 2_000, 2_000, 2_000]);
+    assert.equal(attempts, waits.length + 1);
+
+    // The request root is behind the vault: only a new proof can help.
+    attempts = 0;
+    waits.length = 0;
+    const behind = staleRootError('0xaa');
+    runtime.remoteJson = async () => { attempts += 1; throw behind; };
+    await assert.rejects(
+        runtime.requestLeaseWithRetry(
+            { client_request_id: 'proved-at-old-root', public_inputs: { active_root: '0x0e' } },
+            () => {},
+            null,
+            timing
+        ),
+        candidate => candidate === behind
+    );
+    assert.equal(attempts, 1);
+    assert.deepEqual(waits, []);
+
+    // An unreadable vault never turns stale_root into a retry.
+    attempts = 0;
+    runtime.finalizedVaultRoot = async () => { throw new Error('rpc down'); };
+    runtime.remoteJson = async () => { attempts += 1; throw lagging; };
+    await assert.rejects(
+        runtime.requestLeaseWithRetry(
+            { client_request_id: 'vault-unreadable', public_inputs: { active_root: '0xaa' } },
+            () => {},
+            null,
+            timing
+        ),
+        candidate => candidate === lagging
+    );
+    assert.equal(attempts, 1);
+});
+
 test('checkout never exposes a key retired while ensureLease was resolving', async () => {
     const runtime = runtimeForLeaseRequests();
     const lease = { api_key: 'must-not-be-returned', inFlight: 0 };
