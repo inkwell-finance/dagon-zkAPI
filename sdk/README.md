@@ -186,11 +186,24 @@ against the finalized vault root, and a mirror snapshot that does not yet hold
 the note or that root (the indexer polls the vault, so it can trail a fresh
 deposit) is retried with bounded backoff for about 12 seconds before the proof
 worker runs, then fails with `indexer_root_lag`. A `stale_root` rejection of a
-request proved at the finalized vault root means the server's own root poll is
-behind; the SDK resends the identical request for up to 10 seconds. A request
-proved at an older root still fails at once, and the next attempt re-proves. A vault whose
-pause flag is set still loads: the program reopens exits after the bounded
-pause, and only new deposits are refused while the flag stays set.
+request proved at the finalized vault root, with a different server root, is
+treated as server poll lag; the SDK resends the identical request for up to
+10 seconds, including time spent checking the vault before each resend.
+A request proved at an older root still fails at once, and the next attempt
+re-proves. Cancellation reaches both the snapshot fetch and finalized-vault
+RPC and stops backoff and worker dispatch. A vault whose pause flag is set
+still loads: the program reopens exits after the bounded pause, and only new
+deposits are refused while the flag stays set.
+
+These waits are not a traffic-analysis defense: repeated requests are linkable
+as attempts at the same lease (the request ID, nullifier and proof are unchanged),
+and deterministic backoff reveals lag/retry timing. This extends the existing
+identical-request transport retry behavior, not the linkability of separate
+notes or successful leases. The SDK fetches the same full `/v1/tree/snapshot`
+for every note and computes the path locally; neither the note ID nor a
+note-specific path URL is sent to the indexer. Lag adds snapshot queries and
+vault RPC reads, so observers can correlate their timing with deposits and lease
+creation; use of a proxy does not eliminate that residual timing exposure.
 
 Signing-key trust pins compare hexadecimal field values rather than their
 padding or letter case; different key values are always rejected.

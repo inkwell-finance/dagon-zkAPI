@@ -265,6 +265,27 @@ test('a snapshot missing the requested note is indexer lag, retried with bounded
     assert.ok(clock >= 10_000, `gave the indexer ${clock}ms`);
 });
 
+test('snapshot waits stop on abort and do not poll after a delayed timer wakeup', async () => {
+    const { waitForTreeSnapshot } = await import('../services/zkapiActiveRoot.mjs');
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(waitForTreeSnapshot(
+        () => assert.fail('an already canceled wait must not fetch'),
+        { signal: controller.signal }), error => error.name === 'AbortError');
+
+    let clock = 0;
+    let polls = 0;
+    await assert.rejects(waitForTreeSnapshot(async () => {
+        polls += 1;
+        return { root: '0x1', next_note_id: 0 };
+    }, {
+        requiredNoteId: 0,
+        now: () => clock,
+        sleep: async () => { clock = 12_001; }
+    }), error => error.code === 'indexer_root_lag');
+    assert.equal(polls, 1);
+});
+
 test('only a never-journaled prepared deposit can be re-planned or replaced', async () => {
     const { BrowserWalletRuntime } = await import(pathToFileURL(path.join(__dirname, 'services/browserWalletRuntime.js')));
     const runtime = new BrowserWalletRuntime();

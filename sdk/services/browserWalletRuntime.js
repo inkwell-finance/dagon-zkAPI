@@ -121,14 +121,19 @@ function exactTrustedUrl(supplied, expected, label) {
 }
 
 function delay(milliseconds, signal) {
+    throwIfAborted(signal);
     return new Promise((resolve, reject) => {
-        const timer = setTimeout(resolve, milliseconds);
-        signal?.addEventListener('abort', () => {
+        const onAbort = () => {
             clearTimeout(timer);
             const error = new Error('Request aborted');
             error.name = 'AbortError';
             reject(error);
-        }, { once: true });
+        };
+        const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+        }, milliseconds);
+        signal?.addEventListener('abort', onAbort, { once: true });
     });
 }
 
@@ -1574,7 +1579,7 @@ class BrowserWalletRuntime extends EventTarget {
     indexerSnapshot({ requiredNoteId = null, expectedActiveRoot = null, signal = null } = {}) {
         return waitForTreeSnapshot(
             () => this.remoteJson(`${this.config.funding.indexer_url}/v1/tree/snapshot`, signal ? { signal } : undefined),
-            { requiredNoteId, expectedActiveRoot, sleep: milliseconds => delay(milliseconds, signal) }
+            { requiredNoteId, expectedActiveRoot, signal, sleep: milliseconds => delay(milliseconds, signal) }
         );
     }
 
@@ -1584,6 +1589,7 @@ class BrowserWalletRuntime extends EventTarget {
             expectedActiveRoot,
             signal
         });
+        throwIfAborted(signal);
         return this.worker.call('treePath', { snapshot, noteId, requireExisting });
     }
 
@@ -1596,8 +1602,12 @@ class BrowserWalletRuntime extends EventTarget {
         });
     }
 
-    async finalizedVaultRoot() {
-        return (await assertSolanaVault(this.config.funding)).root;
+    async finalizedVaultRoot(signal = null) {
+        throwIfAborted(signal);
+        const timeout = AbortSignal.timeout(20_000);
+        return (await assertSolanaVault(this.config.funding, {
+            signal: signal ? AbortSignal.any([signal, timeout]) : timeout
+        })).root;
     }
 
     // Only a never-journaled plan can be re-planned (new amount or vault
@@ -1940,7 +1950,7 @@ class BrowserWalletRuntime extends EventTarget {
         const path = await this.treePath(
             this.runtime.state.note_id,
             true,
-            () => this.finalizedVaultRoot(),
+            () => this.finalizedVaultRoot(signal),
             signal
         );
         throwIfAborted(signal);
@@ -2064,11 +2074,15 @@ class BrowserWalletRuntime extends EventTarget {
                     // server-behind case can heal; a request at an older root
                     // needs a new proof, so it fails at once as before.
                     if (now() + staleRootRetryMs > staleRootDeadline
-                        || !(await this.serverRootLagsRequest(request, error))) {
+                        || !(await this.serverRootLagsRequest(request, error, signal))) {
                         throw error;
                     }
+                    throwIfAborted(signal);
+                    if (now() + staleRootRetryMs > staleRootDeadline) throw error;
                     onProgress('waiting', 'The temporary-key service is catching up with the latest vault root…');
                     await sleep(staleRootRetryMs, signal);
+                    throwIfAborted(signal);
+                    if (now() > staleRootDeadline) throw error;
                     staleRootRetryMs = Math.min(staleRootRetryMs * 2, STALE_ROOT_LAG_MAX_RETRY_MS);
                     resent = true;
                     continue;
@@ -2102,13 +2116,14 @@ class BrowserWalletRuntime extends EventTarget {
 
     // True when the request was proved at the finalized vault root and the
     // server still reports an older one: its root poll is behind, not the proof.
-    async serverRootLagsRequest(request, error) {
+    async serverRootLagsRequest(request, error, signal = null) {
         const requestRoot = request?.public_inputs?.active_root;
         const serverRoot = error?.data?.latest_root;
         if (requestRoot == null || serverRoot == null || sameFelt(requestRoot, serverRoot)) return false;
         try {
-            return sameFelt(requestRoot, await this.finalizedVaultRoot());
+            return sameFelt(requestRoot, await this.finalizedVaultRoot(signal));
         } catch {
+            throwIfAborted(signal);
             return false;
         }
     }

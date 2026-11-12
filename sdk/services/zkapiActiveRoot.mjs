@@ -22,6 +22,7 @@ const INDEXER_LAG_MAX_DELAY_MS = 2_000;
 export async function waitForTreeSnapshot(loadSnapshot, {
     requiredNoteId = null,
     expectedActiveRoot = null,
+    signal = null,
     maxWaitMs = INDEXER_LAG_MAX_WAIT_MS,
     initialDelayMs = INDEXER_LAG_INITIAL_DELAY_MS,
     maxDelayMs = INDEXER_LAG_MAX_DELAY_MS,
@@ -34,13 +35,17 @@ export async function waitForTreeSnapshot(loadSnapshot, {
     const deadline = now() + maxWaitMs;
     let delayMs = initialDelayMs;
     while (true) {
+        signal?.throwIfAborted();
         const [snapshot, root] = await Promise.all([loadSnapshot(), readExpectedRoot()]);
+        signal?.throwIfAborted();
         const holdsNote = requiredNoteId == null
             || Number(snapshot?.next_note_id) > Number(requiredNoteId);
         const atRoot = root == null || sameFelt(snapshot?.root, root);
         if (holdsNote && atRoot) return snapshot;
         if (now() + delayMs > deadline) break;
         await sleep(delayMs);
+        signal?.throwIfAborted();
+        if (now() > deadline) break;
         delayMs = Math.min(delayMs * 2, maxDelayMs);
     }
     const error = new Error('The zkAPI indexer is still catching up with the latest vault root. Try again in a few seconds.');

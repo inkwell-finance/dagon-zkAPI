@@ -1230,6 +1230,105 @@ test('stale_root lag retries are bounded; a proof at an older root fails at once
     assert.equal(attempts, 1);
 });
 
+test('lease snapshot cancellation reaches both reads and prevents worker dispatch', async () => {
+    const runtime = runtimeForLeaseRequests();
+    runtime.runtime = { state: { note_id: 0 } };
+    const controller = new AbortController();
+    let snapshotSignal;
+    let vaultSignal;
+    runtime.remoteJson = async (_url, init) => {
+        snapshotSignal = init.signal;
+        return { root: '0xaa', next_note_id: 1 };
+    };
+    runtime.finalizedVaultRoot = async signal => {
+        vaultSignal = signal;
+        controller.abort();
+        return '0xaa';
+    };
+    runtime.worker = { call: () => assert.fail('a canceled snapshot must not reach the worker') };
+    await assert.rejects(runtime.prepareLeaseRequest(undefined, controller.signal),
+        error => error.name === 'AbortError');
+    assert.equal(snapshotSignal, controller.signal);
+    assert.equal(vaultSignal, controller.signal);
+});
+
+test('finalized vault RPC is canceled by the lease signal', async () => {
+    const runtime = runtimeForLeaseRequests();
+    const controller = new AbortController();
+    const originalFetch = globalThis.fetch;
+    let rpcSignal;
+    globalThis.fetch = async (_url, init) => {
+        rpcSignal = init.signal;
+        return new Promise((_resolve, reject) => {
+            rpcSignal.addEventListener('abort', () => reject(rpcSignal.reason), { once: true });
+            controller.abort();
+        });
+    };
+    try {
+        await assert.rejects(runtime.finalizedVaultRoot(controller.signal),
+            error => error.name === 'AbortError');
+        assert.equal(rpcSignal.aborted, true);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test('canceling the server-lag vault read preserves AbortError and never resends', async () => {
+    const runtime = runtimeForLeaseRequests();
+    const controller = new AbortController();
+    let attempts = 0;
+    runtime.remoteJson = async () => { attempts += 1; throw staleRootError('0x0e'); };
+    runtime.finalizedVaultRoot = async signal => {
+        assert.equal(signal, controller.signal);
+        controller.abort();
+        signal.throwIfAborted();
+    };
+    await assert.rejects(runtime.requestLeaseWithRetry(
+        { public_inputs: { active_root: '0xaa' } }, undefined, controller.signal),
+    error => error.name === 'AbortError');
+    assert.equal(attempts, 1);
+});
+
+test('server-lag backoff handles cancellation before and during the timer', async () => {
+    for (const duringTimer of [false, true]) {
+        const runtime = runtimeForLeaseRequests();
+        const controller = new AbortController();
+        let attempts = 0;
+        runtime.remoteJson = async () => { attempts += 1; throw staleRootError('0x0e'); };
+        runtime.finalizedVaultRoot = async () => '0xaa';
+        await assert.rejects(runtime.requestLeaseWithRetry(
+            { public_inputs: { active_root: '0xaa' } },
+            phase => {
+                if (phase !== 'waiting') return;
+                if (duringTimer) setImmediate(() => controller.abort());
+                else controller.abort();
+            }, controller.signal),
+        error => error.name === 'AbortError');
+        assert.equal(attempts, 1);
+    }
+});
+
+test('server-lag resends respect vault-read time and delayed timer wakeups', async () => {
+    for (const slowVault of [true, false]) {
+        const runtime = runtimeForLeaseRequests();
+        let clock = 0;
+        let attempts = 0;
+        let sleeps = 0;
+        const failure = staleRootError('0x0e');
+        runtime.remoteJson = async () => { attempts += 1; throw failure; };
+        runtime.finalizedVaultRoot = async () => {
+            if (slowVault) clock += 10_001;
+            return '0xaa';
+        };
+        await assert.rejects(runtime.requestLeaseWithRetry(
+            { public_inputs: { active_root: '0xaa' } }, undefined, null,
+            { now: () => clock, sleep: async () => { sleeps += 1; clock += 10_001; } }),
+        error => error === failure);
+        assert.equal(attempts, 1, 'no POST after the ten-second retry deadline');
+        assert.equal(sleeps, slowVault ? 0 : 1);
+    }
+});
+
 test('checkout never exposes a key retired while ensureLease was resolving', async () => {
     const runtime = runtimeForLeaseRequests();
     const lease = { api_key: 'must-not-be-returned', inFlight: 0 };
