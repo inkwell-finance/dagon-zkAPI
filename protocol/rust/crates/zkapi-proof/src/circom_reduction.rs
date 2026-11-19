@@ -118,6 +118,45 @@ mod tests {
     use ark_std::rand::{rngs::StdRng, SeedableRng};
 
     #[test]
+    fn witness_map_matches_explicit_qap_with_instance_copy_rows() {
+        use ark_poly::GeneralEvaluationDomain;
+        use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
+        type D = GeneralEvaluationDomain<Fr>;
+        let cs = ConstraintSystem::new_ref();
+        Product { x: Some(Fr::from(3u64)), y: Some(Fr::from(5u64)), z: Some(Fr::from(15u64)) }
+            .generate_constraints(cs.clone()).unwrap();
+        cs.finalize();
+        assert!(cs.is_satisfied().unwrap());
+        let matrices = cs.to_matrices().unwrap();
+        let cs = cs.borrow().unwrap();
+        let assignment = cs.instance_assignment.iter().chain(&cs.witness_assignment)
+            .copied().collect::<Vec<_>>();
+        let n = matrices.num_constraints;
+        let inputs = matrices.num_instance_variables;
+        let actual = CircomReduction::witness_map_from_matrices::<Fr, D>(
+            &matrices, inputs, n, &assignment).unwrap();
+        let domain = D::new(n + inputs).unwrap();
+        let doubled = D::new(2 * domain.size()).unwrap();
+        let mut without_copies_differs = false;
+        for (index, value) in actual.iter().enumerate() {
+            let point = doubled.element(2 * index + 1);
+            let lagrange = domain.evaluate_all_lagrange_coefficients(point);
+            let evaluate = |matrix: &Vec<Vec<(Fr, usize)>>| -> Fr {
+                matrix.iter().enumerate().map(|(row, terms)| {
+                    evaluate_constraint(terms, &assignment) * lagrange[row]
+                }).sum()
+            };
+            let a = evaluate(&matrices.a);
+            let b = evaluate(&matrices.b);
+            let c = evaluate(&matrices.c);
+            let copies: Fr = (0..inputs).map(|i| assignment[i] * lagrange[n + i]).sum();
+            assert_eq!(*value, (a + copies) * b - c);
+            without_copies_differs |= *value != a * b - c;
+        }
+        assert!(without_copies_differs);
+    }
+
+    #[test]
     fn circom_reduction_matches_the_snarkjs_h_query_layout() {
         let mut rng = StdRng::seed_from_u64(7);
         let x = Fr::rand(&mut rng);

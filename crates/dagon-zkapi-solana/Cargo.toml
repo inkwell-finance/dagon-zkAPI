@@ -5,6 +5,10 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# Host-only regression keys. Never usable in an SBF program.
+test-verifier = []
+
 [dependencies]
 base64 = { workspace = true }
 groth16-solana = "0.2.0"

@@ -252,6 +252,14 @@ pub fn verify_state_signature(
     message: CircuitField,
     signature: StateSignature,
 ) -> bool {
+    if !public.is_on_curve()
+        || !public.is_in_correct_subgroup_assuming_on_curve()
+        || public.is_zero()
+        || !signature.r.is_on_curve()
+        || !signature.r.is_in_correct_subgroup_assuming_on_curve()
+    {
+        return false;
+    }
     let challenge = signature_challenge(signature.r, message);
     let lhs = EdwardsProjective::generator().mul_bigint(signature.s.into_bigint());
     let rhs = signature.r.into_group() + public.mul_bigint(challenge.into_bigint());
@@ -263,13 +271,52 @@ fn scalar_bits_witness(
     value: EdwardsScalarField,
 ) -> Result<Vec<Boolean<CircuitField>>, SynthesisError> {
     let native_bits = value.into_bigint().to_bits_le();
-    (0..EdwardsScalarField::MODULUS_BIT_SIZE as usize)
+    let bits = (0..EdwardsScalarField::MODULUS_BIT_SIZE as usize)
         .map(|index| {
             Boolean::new_witness(cs.clone(), || {
                 Ok(native_bits.get(index).copied().unwrap_or(false))
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    enforce_canonical_scalar(&bits)?;
+    Ok(bits)
+}
+
+fn enforce_canonical_scalar(bits: &[Boolean<CircuitField>]) -> Result<(), SynthesisError> {
+    Boolean::enforce_smaller_or_equal_than_le(
+        bits,
+        (-EdwardsScalarField::ONE).into_bigint(),
+    )?;
+    Ok(())
+}
+
+/// Input allocation checks the curve equation, but not subgroup membership.
+/// A subgroup witness equal to the input proves membership cheaply: arkworks
+/// allocates its cofactor preimage and multiplies by eight. Reject the identity,
+/// whose Schnorr signatures can be forged without a signing secret.
+fn signing_key_input(
+    cs: ConstraintSystemRef<CircuitField>,
+    point: EdwardsAffine,
+) -> Result<EdwardsVar, SynthesisError> {
+    let input = EdwardsVar::new_input(cs.clone(), || Ok(point))?;
+    let subgroup = EdwardsVar::new_witness(cs, || Ok(point))?;
+    input.enforce_equal(&subgroup)?;
+    input.is_zero()?.enforce_equal(&Boolean::FALSE)?;
+    Ok(input)
+}
+
+fn enforce_deployment(
+    cs: ConstraintSystemRef<CircuitField>,
+    version: &FpVar<CircuitField>,
+    chain: &FpVar<CircuitField>,
+    chain_value: u64,
+    binding: &FpVar<CircuitField>,
+) -> Result<(), SynthesisError> {
+    version.enforce_equal(&FpVar::Constant(CircuitField::from(2u64)))?;
+    UInt64::new_witness(cs, || Ok(chain_value))?.to_fp()?.enforce_equal(chain)?;
+    chain.enforce_not_equal(&FpVar::zero())?;
+    // Deployment bindings are canonical BN254 field elements, not EVM addresses.
+    binding.enforce_not_equal(&FpVar::zero())
 }
 
 fn commitment_var(
@@ -379,9 +426,11 @@ impl ConstraintSynthesizer<CircuitField> for RequestCircuit {
         let chain_id =
             FpVar::new_input(cs.clone(), || Ok(CircuitField::from(self.public.chain_id)))?;
         let contract_address = FpVar::new_input(cs.clone(), || Ok(self.public.contract_address))?;
+        enforce_deployment(cs.clone(), &protocol_version, &chain_id,
+            self.public.chain_id, &contract_address)?;
         let active_root = FpVar::new_input(cs.clone(), || Ok(self.public.active_root))?;
         let state_signing_key =
-            EdwardsVar::new_input(cs.clone(), || Ok(self.public.state_signing_key))?;
+            signing_key_input(cs.clone(), self.public.state_signing_key)?;
         let request_time_field = FpVar::new_input(cs.clone(), || {
             Ok(CircuitField::from(self.public.request_time))
         })?;
@@ -677,11 +726,13 @@ impl ConstraintSynthesizer<CircuitField> for WithdrawalCircuit {
         let chain_id =
             FpVar::new_input(cs.clone(), || Ok(CircuitField::from(self.public.chain_id)))?;
         let contract_address = FpVar::new_input(cs.clone(), || Ok(self.public.contract_address))?;
+        enforce_deployment(cs.clone(), &protocol_version, &chain_id,
+            self.public.chain_id, &contract_address)?;
         let registration_field = FpVar::new_input(cs.clone(), || Ok(self.public.registration))?;
         let state_signing_key =
-            EdwardsVar::new_input(cs.clone(), || Ok(self.public.state_signing_key))?;
+            signing_key_input(cs.clone(), self.public.state_signing_key)?;
         let clearance_signing_key =
-            EdwardsVar::new_input(cs.clone(), || Ok(self.public.clearance_signing_key))?;
+            signing_key_input(cs.clone(), self.public.clearance_signing_key)?;
         let note_fields = FpVar::new_input(cs.clone(), || {
             Ok(packed_note_fields(self.public.note_id, self.public.deposit_amount, self.public.expiry))
         })?;
@@ -689,8 +740,11 @@ impl ConstraintSynthesizer<CircuitField> for WithdrawalCircuit {
             Ok(CircuitField::from(self.public.final_balance))
         })?;
         let destination = FpVar::new_input(cs.clone(), || Ok(self.public.destination))?;
-        // With the old tag removed, still bind the destination into the R1CS.
-        let _destination_bits = destination.to_bits_le()?;
+        // The wire statement carries a 20-byte destination binding. Its bit
+        // decomposition both binds the public input and enforces that width.
+        for bit in &destination.to_bits_le()?[160..] {
+            bit.enforce_equal(&Boolean::FALSE)?;
+        }
         let withdrawal_nullifier =
             FpVar::new_input(cs.clone(), || Ok(self.public.withdrawal_nullifier))?;
         let has_clearance = Boolean::new_input(cs.clone(), || Ok(self.public.has_clearance))?;
@@ -980,6 +1034,135 @@ mod tests {
 
     fn test_rng() -> StdRng {
         StdRng::seed_from_u64(0x7a6b_6170_6932)
+    }
+
+    #[test]
+    fn fixed_domains_and_native_hashes_match() {
+        use zkapi_core::v2 as native;
+        let labels = [DOMAIN_REG, DOMAIN_LEAF, DOMAIN_NODE, DOMAIN_NULLIFIER,
+            DOMAIN_ANCHOR, DOMAIN_AUTHORIZATION, DOMAIN_STATE, DOMAIN_CLEARANCE, DOMAIN_SIGNATURE];
+        for (index, label) in labels.iter().enumerate() {
+            assert!(label.len() < 31 && label[0] != 0);
+            let encoded = domain(label).into_bigint().to_bytes_be();
+            assert_eq!(&encoded[encoded.len() - label.len()..], *label);
+            for other in &labels[..index] {
+                assert_ne!(domain(label), domain(other));
+            }
+        }
+        let secret = CircuitField::from(42u64);
+        let felt = native::field_to_felt(&secret);
+        let registration = registration_commitment(secret);
+        assert_eq!(registration, native::felt_to_field(&native::registration_commitment(&felt)));
+        for amount in [1, u64::MAX as u128, u128::MAX] {
+            assert_eq!(note_leaf(u32::MAX, registration, amount, u64::MAX),
+                native::felt_to_field(&native::note_leaf(u32::MAX,
+                    &native::field_to_felt(&registration), amount, u64::MAX)));
+        }
+        let n = request_nullifier(secret, u32::MAX, CircuitField::ONE);
+        let nf = native::nullifier(&felt, u32::MAX, &native::GENESIS_ANCHOR);
+        assert_eq!(n, native::felt_to_field(&nf));
+        assert_eq!(next_anchor(n), native::felt_to_field(&native::next_anchor(&nf)));
+        assert_eq!(authorization_tag(n, secret),
+            native::felt_to_field(&native::authorization_tag(&nf, &felt)));
+        let key = StateSigningKey::from_secret(EdwardsScalarField::ONE).public;
+        assert_eq!(state_message(2, 1, secret, key, n),
+            native::felt_to_field(&native::state_message(2, 1, &felt,
+                &native::field_to_felt(&key.x), &native::field_to_felt(&key.y), &nf)));
+        assert_eq!(clearance_message(2, 1, secret, n),
+            native::felt_to_field(&native::clearance_message(2, 1, &felt, &nf)));
+    }
+
+    #[test]
+    fn public_signing_keys_reject_torsion_and_identity_even_when_unused() {
+        // (0,-1) has order two. Input allocation alone used to accept it.
+        let torsion = EdwardsAffine::new_unchecked(CircuitField::ZERO, -CircuitField::ONE);
+        assert!(torsion.is_on_curve());
+        assert!(!torsion.is_in_correct_subgroup_assuming_on_curve());
+        for point in [torsion, EdwardsAffine::zero()] {
+            let old = ConstraintSystem::new_ref();
+            EdwardsVar::new_input(old.clone(), || Ok(point)).unwrap();
+            assert!(old.is_satisfied().unwrap());
+
+            let mut request = genesis_request();
+            request.public.state_signing_key = point;
+            assert!(!satisfied(request));
+            let mut withdrawal = escape_fixture();
+            withdrawal.public.clearance_signing_key = point;
+            assert!(!satisfied(withdrawal));
+        }
+        // Identity-key Schnorr forgery: sG = R for every message.
+        let signature = StateSignature {
+            r: EdwardsProjective::generator().into_affine(),
+            s: EdwardsScalarField::ONE,
+        };
+        assert!(!verify_state_signature(EdwardsAffine::zero(), CircuitField::ONE, signature));
+    }
+
+    #[test]
+    fn scalar_witness_rejects_order_aliases() {
+        for noncanonical in [false, true] {
+            let cs = ConstraintSystem::new_ref();
+            let value = if noncanonical {
+                EdwardsScalarField::MODULUS
+            } else {
+                EdwardsScalarField::ZERO.into_bigint()
+            };
+            let bits = value.to_bits_le().into_iter()
+                .take(EdwardsScalarField::MODULUS_BIT_SIZE as usize)
+                .map(|bit| Boolean::new_witness(cs.clone(), || Ok(bit)).unwrap())
+                .collect::<Vec<_>>();
+            // Both 0 and r satisfy the old scalar-multiplication relation.
+            let g = EdwardsVar::new_constant(cs.clone(), EdwardsProjective::generator()).unwrap();
+            g.scalar_mul_le(bits.iter()).unwrap().enforce_equal(&EdwardsVar::zero()).unwrap();
+            assert!(cs.is_satisfied().unwrap());
+            enforce_canonical_scalar(&bits).unwrap();
+            assert_eq!(cs.is_satisfied().unwrap(), !noncanonical);
+        }
+    }
+
+    #[test]
+    fn deployment_and_destination_ranges_are_constrained() {
+        for version in [0, 1, 3, u16::MAX] {
+            let mut request = genesis_request();
+            request.public.protocol_version = version;
+            assert!(!satisfied(request));
+            let mut withdrawal = escape_fixture();
+            withdrawal.public.protocol_version = version;
+            resign_withdrawal(&mut withdrawal);
+            assert!(!satisfied(withdrawal));
+        }
+        // Exercise range constraints directly with adversarial field inputs;
+        // Rust's public u64 cannot express 2^64.
+        for chain in [CircuitField::ZERO, CircuitField::from(2u64).pow([64])] {
+            let cs = ConstraintSystem::new_ref();
+            let version = FpVar::new_input(cs.clone(), || Ok(CircuitField::from(2u64))).unwrap();
+            let chain_var = FpVar::new_input(cs.clone(), || Ok(chain)).unwrap();
+            let binding = FpVar::new_input(cs.clone(), || Ok(CircuitField::ONE)).unwrap();
+            let result = enforce_deployment(cs.clone(), &version, &chain_var, 1, &binding);
+            assert!(result.is_err() || !cs.is_satisfied().unwrap());
+        }
+        let mut withdrawal = escape_fixture();
+        withdrawal.public.destination = CircuitField::from(2u64).pow([160]);
+        assert!(!satisfied(withdrawal));
+        let mut boundary = escape_fixture();
+        boundary.public.destination = CircuitField::from(2u64).pow([160]) - CircuitField::ONE;
+        assert!(satisfied(boundary));
+    }
+
+    #[test]
+    fn exported_systems_match_every_arkworks_constraint_and_witness() {
+        fn check(name: &str, circuit: impl ConstraintSynthesizer<CircuitField>) {
+            let cs = ConstraintSystem::new_ref();
+            cs.set_optimization_goal(ark_relations::r1cs::OptimizationGoal::Constraints);
+            circuit.generate_constraints(cs.clone()).unwrap();
+            cs.finalize();
+            assert!(cs.is_satisfied().unwrap());
+            eprintln!("{name} constraints: {}", cs.num_constraints());
+            crate::ceremony::assert_export_equivalent(cs);
+        }
+        check("request", fixture());
+        check("withdrawal", withdrawal_fixture());
+        check("transition", solana_transition_fixture(true));
     }
 
     fn fixture() -> RequestCircuit {

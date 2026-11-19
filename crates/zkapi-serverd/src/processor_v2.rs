@@ -1724,7 +1724,6 @@ fn current_timestamp_ms() -> u64 {
 mod tests {
     use super::*;
 
-    use std::path::PathBuf;
 
     use zkapi_types::wire::{Groth16ProofWire, ProofBackendWire};
     use zkapi_types::RequestPublicInputsV2;
@@ -1732,12 +1731,7 @@ mod tests {
     use crate::test_support::{lease_payload, NullifierRead, StubLedger};
 
     fn setup_directory() -> String {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../protocol/setup/v2")
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .to_string()
+        zkapi_proof::test_setup().to_string_lossy().into_owned()
     }
 
     fn oa_lease_processor(store: Arc<NullifierStore>) -> RequestProcessor {
@@ -3436,6 +3430,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prepared.request.payload, payload);
+        let mut wrong_id = prepared.request.clone();
+        wrong_id.client_request_id.push_str("-forged");
+        assert!(matches!(
+            processor.validate_and_reserve(&wrong_id),
+            Err(ServerError::InvalidProof(_))
+        ));
         let serialized = serde_json::to_string(&prepared.journal).unwrap();
         let journal: zkapi_browser::PendingRequestJournal =
             serde_json::from_str(&serialized).unwrap();

@@ -30,12 +30,12 @@ use crate::groth16::{
     StateSigningKey, WithdrawalCircuit, WithdrawalPublic, WithdrawalWitness,
 };
 
-/// Concession exits and note-bound derived anchor chains; earlier keys are incompatible.
-pub const CIRCUIT_ID: &str = "zkapi-v2-concession-v1";
+/// Hardened key/scalar and deployment constraints; earlier keys are incompatible.
+pub const CIRCUIT_ID: &str = zkapi_types::GROTH16_CIRCUIT_ID;
 /// Header of single-party arkworks keys (default QAP reduction).
-const KEY_HEADER: &[u8] = b"zkapi-v2-concession-v1\0";
+const KEY_HEADER: &[u8] = b"zkapi-v2-hardening-v1\0";
 /// Header of keys converted from a snarkjs ceremony (`CircomReduction`).
-const KEY_HEADER_SNARKJS: &[u8] = b"zkapi-v2-concession-v1/snarkjs\0";
+const KEY_HEADER_SNARKJS: &[u8] = b"zkapi-v2-hardening-v1/snarkjs\0";
 pub const SOLANA_TRANSITION_CIRCUIT_ID: &str = "dagon-zkapi-solana-transition-v1";
 const SOLANA_TRANSITION_KEY_HEADER: &[u8] = b"dagon-zkapi-solana-transition-v1\0";
 const SOLANA_TRANSITION_KEY_HEADER_SNARKJS: &[u8] = b"dagon-zkapi-solana-transition-v1/snarkjs\0";
@@ -984,8 +984,10 @@ mod tests {
 
     #[test]
     fn key_headers_select_the_reduction_kind() {
-        let setup = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../setup/v2");
-        let legacy = fs::read(setup.join(REQUEST_VERIFYING_KEY_FILE)).unwrap();
+        let old_setup = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../setup/v2");
+        let old = fs::read(old_setup.join(REQUEST_VERIFYING_KEY_FILE)).unwrap();
+        assert!(decode_compressed::<VerifyingKey<Bn254>>(&old).is_err());
+        let legacy = fs::read(crate::test_setup().join(REQUEST_VERIFYING_KEY_FILE)).unwrap();
         let (key, kind) = decode_compressed::<VerifyingKey<Bn254>>(&legacy).unwrap();
         assert_eq!(kind, KeyKind::Legacy);
 

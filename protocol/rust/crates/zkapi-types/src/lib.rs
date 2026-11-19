@@ -27,6 +27,10 @@ pub use solana::{
 /// Protocol version for the compact BN254 proof protocol.
 pub const PROTOCOL_VERSION: u16 = 2;
 
+/// Constraint identity, independent of the unchanged wire protocol version.
+/// Earlier request/withdrawal keys must be replaced after the new ceremony.
+pub const GROTH16_CIRCUIT_ID: &str = "zkapi-v2-hardening-v1";
+
 /// Merkle tree depth.
 pub const MERKLE_DEPTH: usize = 32;
 

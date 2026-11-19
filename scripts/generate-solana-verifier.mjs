@@ -5,7 +5,13 @@ import path from 'node:path';
 import process from 'node:process';
 
 const root = path.resolve(import.meta.dirname, '..');
-const manifestPath = path.join(root, 'protocol', 'setup', 'v2', 'manifest.json');
+const option = (name, fallback) => {
+  const index = process.argv.indexOf(name);
+  if (index < 0) return fallback;
+  if (!process.argv[index + 1]) throw new Error(`missing ${name} value`);
+  return path.resolve(process.argv[index + 1]);
+};
+const manifestPath = path.join(option('--setup', path.join(root, 'protocol', 'setup', 'v2')), 'manifest.json');
 const transitionManifestPath = path.join(
   root,
   'protocol',
@@ -13,18 +19,19 @@ const transitionManifestPath = path.join(
   'solana-transition-v1',
   'manifest.json',
 );
-const outputPath = path.join(
-  root,
-  'crates',
-  'dagon-zkapi-solana',
-  'src',
-  'verifying_keys.rs',
-);
+const outputPath = option('--output', path.join(
+  root, 'crates', 'dagon-zkapi-solana', 'src', 'verifying_keys.rs',
+));
 
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 const transitionManifest = JSON.parse(
   fs.readFileSync(transitionManifestPath, 'utf8'),
 );
+const types = fs.readFileSync(path.join(root, 'protocol/rust/crates/zkapi-types/src/lib.rs'), 'utf8');
+const circuitId = types.match(/pub const GROTH16_CIRCUIT_ID: &str = "([^"]+)";/)?.[1];
+if (!circuitId || manifest.circuit_id !== circuitId) {
+  throw new Error('stale Groth16 setup: replace after the new ceremony');
+}
 
 function bytes(value) {
   const body = value.startsWith('0x') ? value.slice(2) : value;

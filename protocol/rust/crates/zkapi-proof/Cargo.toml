@@ -5,6 +5,10 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# Exposes fresh, isolated setup generation to dependent crates' tests only.
+test-utils = []
+
 [dependencies]
 zkapi-types  = { workspace = true }
 zkapi-core   = { workspace = true }

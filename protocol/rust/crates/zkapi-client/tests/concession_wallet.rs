@@ -1,6 +1,6 @@
 //! Concession-exit behaviour of the native wallet: successor checks S1–S6,
 //! one bound per state (C2), the exit lock (C3) and the concession choice
-//! (E2/E3), with real proofs from the committed setup.
+//! (E2/E3), with real proofs from an isolated test setup.
 
 use std::path::{Path, PathBuf};
 
@@ -27,7 +27,7 @@ const WINDOW: u64 = 21_905;
 const DESTINATION: [u8; 20] = [0x11; 20];
 
 fn setup_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../setup/v2")
+    zkapi_proof::test_setup().to_path_buf()
 }
 
 fn state_signer() -> CompactSigner {

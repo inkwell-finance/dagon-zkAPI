@@ -1,6 +1,6 @@
-//! Regenerate the real-proof Solana vault regression fixture with the
-//! committed setup (run from `protocol/rust`):
-//! cargo run --release -p zkapi-proof --example vault_challenge_fixture -- ../setup/v2 \
+//! Regenerate the real-proof Solana vault regression fixture with an
+//! isolated test setup (run from `protocol/rust`):
+//! cargo run --release -p zkapi-proof --example vault_challenge_fixture -- /tmp/zkapi-test-setup \
 //!   > ../test-vectors/vault-challenge.json
 //!
 //! Every statement is bound to a fixed test deployment (genesis hash, program

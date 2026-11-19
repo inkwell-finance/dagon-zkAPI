@@ -1,5 +1,4 @@
 use super::*;
-use std::path::PathBuf;
 use zkapi_proof::compact::{CompactSigner, RequestVerifier, WithdrawalVerifier};
 use zkapi_types::wire::ProofBackendWire;
 
@@ -421,7 +420,7 @@ fn fetched_key_bytes_produce_verifiable_browser_proofs() {
     let leaf = state_note_leaf(&state);
     let mut tree = MerkleTree::new();
     tree.set_leaf(note_id, leaf);
-    let setup = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../setup/v2");
+    let setup = zkapi_proof::test_setup();
     let request_prover =
         RequestProver::from_bytes(&std::fs::read(setup.join("request.pk")).unwrap()).unwrap();
     let request_verifier = RequestVerifier::load(&setup).unwrap();

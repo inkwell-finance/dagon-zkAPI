@@ -435,3 +435,84 @@ mod adoption_tests {
         result
     }
 }
+
+/// Decode the public binary format independently of the writer, compare every
+/// coefficient, and evaluate the decoded equations on the arkworks witness.
+#[cfg(test)]
+pub(crate) fn assert_export_equivalent(cs: ark_relations::r1cs::ConstraintSystemRef<Fr>) {
+    use std::collections::BTreeMap;
+    use std::io::{Cursor, Read};
+    fn u32_at(reader: &mut Cursor<&[u8]>) -> usize {
+        let mut bytes = [0; 4];
+        reader.read_exact(&mut bytes).unwrap();
+        u32::from_le_bytes(bytes) as usize
+    }
+    fn u64_at(reader: &mut Cursor<&[u8]>) -> u64 {
+        let mut bytes = [0; 8];
+        reader.read_exact(&mut bytes).unwrap();
+        u64::from_le_bytes(bytes)
+    }
+    fn normalized(row: &[(Fr, usize)]) -> BTreeMap<usize, Fr> {
+        let mut terms = BTreeMap::new();
+        for (coefficient, wire) in row {
+            *terms.entry(*wire).or_insert(Fr::from(0u64)) += coefficient;
+        }
+        terms.retain(|_, value| *value != Fr::from(0u64));
+        terms
+    }
+    let matrices = cs.to_matrices().unwrap();
+    let bytes = r1cs_bytes(&matrices).unwrap();
+    assert_eq!(&bytes[..4], b"r1cs");
+    let mut file = Cursor::new(bytes.as_slice());
+    file.set_position(4);
+    assert_eq!(u32_at(&mut file), 1);
+    assert_eq!(u32_at(&mut file), 3);
+    let mut sections = BTreeMap::new();
+    for _ in 0..3 {
+        let kind = u32_at(&mut file);
+        let size = u64_at(&mut file) as usize;
+        let start = file.position() as usize;
+        assert!(sections.insert(kind, &bytes[start..start + size]).is_none());
+        file.set_position((start + size) as u64);
+    }
+    assert_eq!(file.position() as usize, bytes.len());
+    let wires = matrices.num_instance_variables + matrices.num_witness_variables;
+    let mut header = Cursor::new(sections[&1]);
+    assert_eq!(u32_at(&mut header), 32);
+    let mut modulus = [0; 32];
+    header.read_exact(&mut modulus).unwrap();
+    assert_eq!(modulus.as_slice(), Fr::MODULUS.to_bytes_le());
+    assert_eq!(u32_at(&mut header), wires);
+    assert_eq!(u32_at(&mut header), 0);
+    assert_eq!(u32_at(&mut header), matrices.num_instance_variables - 1);
+    assert_eq!(u32_at(&mut header), matrices.num_witness_variables);
+    assert_eq!(u64_at(&mut header), wires as u64);
+    assert_eq!(u32_at(&mut header), matrices.num_constraints);
+    assert_eq!(header.position() as usize, sections[&1].len());
+    let mut labels = Cursor::new(sections[&3]);
+    for wire in 0..wires {
+        assert_eq!(u64_at(&mut labels), wire as u64);
+    }
+    assert_eq!(labels.position() as usize, sections[&3].len());
+    let borrowed = cs.borrow().unwrap();
+    let assignment = borrowed.instance_assignment.iter()
+        .chain(&borrowed.witness_assignment).copied().collect::<Vec<_>>();
+    let mut constraints = Cursor::new(sections[&2]);
+    for row in 0..matrices.num_constraints {
+        let mut evaluated = [Fr::from(0u64); 3];
+        for (side, matrix) in [&matrices.a, &matrices.b, &matrices.c].into_iter().enumerate() {
+            let mut decoded = BTreeMap::new();
+            for _ in 0..u32_at(&mut constraints) {
+                let wire = u32_at(&mut constraints);
+                let mut coefficient = [0; 32];
+                constraints.read_exact(&mut coefficient).unwrap();
+                let coefficient = Fr::from_le_bytes_mod_order(&coefficient);
+                assert!(decoded.insert(wire, coefficient).is_none());
+                evaluated[side] += coefficient * assignment[wire];
+            }
+            assert_eq!(decoded, normalized(&matrix[row]), "row {row}, side {side}");
+        }
+        assert_eq!(evaluated[0] * evaluated[1], evaluated[2], "exported row {row}");
+    }
+    assert_eq!(constraints.position() as usize, sections[&2].len());
+}

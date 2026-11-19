@@ -30,7 +30,7 @@ assumptions. Groth16/BN254 and Baby-JubJub are not post-quantum.
 
 ## Compatibility and setup
 
-The circuit identifier is `zkapi-v2-concession-v1`. Proving and verifying key
+The circuit identifier is `zkapi-v2-hardening-v1`. Proving and verifying key
 files carry that header; loaders reject files without the expected circuit header
 before decoding. Public deployment manifests must advertise
 `proof_setup.circuit_id`, and clients must
@@ -48,6 +48,34 @@ The vault has an immutable verifier and signing keys. Its circuit, proof
 artifacts, denomination, and client pins must match exactly. Wallet state and
 recovery journals are bound to that configuration. See
 [the Solana server](SOLANA_SERVER.md) for asset and billing configuration.
+
+### Pre-ceremony hardening
+
+Request and withdrawal signing keys are nonidentity, on-curve prime-subgroup
+points, including when a signature branch is disabled. Scalar witnesses are
+canonical modulo the Baby-JubJub subgroup order. Deployment fields require
+version 2, a nonzero u64 chain ID, and a nonzero BN254-field binding. Withdrawal
+destinations are 160-bit bindings, constrained by their bit decomposition.
+
+The old production setup and Solana verifier constants are intentionally retained:
+**replace after the new ceremony**. Their circuit identifier is incompatible with
+the hardened request/withdrawal circuits, and the Solana verifier fails closed
+on stale key metadata or input counts. The transition circuit is unchanged.
+The generator's `--check` also refuses a setup with the old circuit identifier.
+
+Host regression tests use isolated single-party keys, never production keys.
+`test-verifier` is rejected on the Solana target. To regenerate the fixtures:
+
+```sh
+cargo run --release --manifest-path protocol/rust/Cargo.toml -p zkapi-proof --example setup -- /tmp/zkapi-test-setup
+node scripts/generate-solana-verifier.mjs --setup /tmp/zkapi-test-setup --output crates/dagon-zkapi-solana/src/test_verifying_keys.rs
+cargo run --release --manifest-path protocol/rust/Cargo.toml -p zkapi-proof --example vault_challenge_fixture -- /tmp/zkapi-test-setup > protocol/test-vectors/vault-challenge.json
+```
+
+`groth16::tests::exported_systems_match_every_arkworks_constraint_and_witness`
+independently decodes exported R1CS headers, every coefficient and wire label,
+and evaluates every decoded row against each circuit's arkworks witness.
+
 
 ## Challenge and settlement requirements
 

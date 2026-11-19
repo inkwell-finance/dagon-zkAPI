@@ -18,7 +18,7 @@ use zkapi_types::{
 
 #[tokio::test]
 async fn sequential_signed_state_cannot_branch_across_equal_or_unequal_notes() {
-    let setup = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../protocol/setup/v2");
+    let setup = zkapi_proof::test_setup();
     let prover = RequestProver::load(&setup).unwrap();
     let withdrawal_prover = WithdrawalProver::load(&setup).unwrap();
     let withdrawal_verifier = WithdrawalVerifier::load(&setup).unwrap();

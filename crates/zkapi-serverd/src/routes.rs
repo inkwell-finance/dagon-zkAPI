@@ -868,10 +868,7 @@ mod rate_limit_tests {
     async fn usdc_wallet_routes_reach_the_ledger() {
         use tower::ServiceExt;
         let mut config = crate::test_support::config(crate::test_support::oa_source());
-        config.proof_setup_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../protocol/setup/v2")
-            .to_string_lossy()
-            .into_owned();
+        config.proof_setup_dir = zkapi_proof::test_setup().to_string_lossy().into_owned();
         let signer = Arc::new(crate::signer::ServerSigner::new(
             &config.state_seed,
             &config.clear_seed,

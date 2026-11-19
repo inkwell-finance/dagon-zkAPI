@@ -14,3 +14,6 @@ serde_json   = { workspace = true }
 uuid         = { workspace = true }
 reqwest      = { workspace = true }
 thiserror       = { workspace = true }
+
+[dev-dependencies]
+zkapi-proof = { workspace = true, features = ["test-utils"] }
