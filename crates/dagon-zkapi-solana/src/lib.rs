@@ -22,8 +22,26 @@ const KEY_SOURCE: &str = include_str!("verifying_keys.rs");
 #[cfg(any(test, feature = "test-verifier"))]
 const KEY_SOURCE: &str = include_str!("test_verifying_keys.rs");
 
-fn current_key_source(source: &str) -> bool {
-    source.contains(zkapi_types::GROTH16_CIRCUIT_ID)
+// Evaluate metadata at compile time: do not scan or retain generated source in
+// the deployed verifier's instruction path.
+const KEYS_CURRENT: bool = current_key_source(KEY_SOURCE);
+const fn current_key_source(source: &str) -> bool {
+    let source = source.as_bytes();
+    let id = zkapi_types::GROTH16_CIRCUIT_ID.as_bytes();
+    let mut start = 0;
+    while start + id.len() + 2 <= source.len() {
+        if source[start] == b'(' && source[start + id.len() + 1] == b')' {
+            let mut matched = 0;
+            while matched < id.len() && source[start + matched + 1] == id[matched] {
+                matched += 1;
+            }
+            if matched == id.len() {
+                return true;
+            }
+        }
+        start += 1;
+    }
+    false
 }
 
 use base64::Engine;
@@ -145,7 +163,7 @@ fn verify_bytes<const N: usize>(
 ) -> Result<(), SolanaVerifierError> {
     // Input counts alone cannot identify a circuit: hardening leaves them
     // unchanged. Also require the generated key's constraint identity.
-    if !current_key_source(KEY_SOURCE) || key.nr_pubinputs != N + 1 || key.vk_ic.len() != N + 1 {
+    if !KEYS_CURRENT || key.nr_pubinputs != N + 1 || key.vk_ic.len() != N + 1 {
         return Err(SolanaVerifierError::StaleVerifyingKey);
     }
     if proof.len() != 256 {
