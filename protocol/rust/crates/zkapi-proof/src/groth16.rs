@@ -1073,6 +1073,15 @@ mod tests {
     }
 
     #[test]
+    fn zero_deployment_binding_is_rejected_even_at_genesis() {
+        let mut request = genesis_request();
+        request.public.contract_address = CircuitField::ZERO;
+        let cs = ConstraintSystem::new_ref();
+        let result = request.generate_constraints(cs.clone());
+        assert!(result.is_err() || !cs.is_satisfied().unwrap());
+    }
+
+    #[test]
     fn public_signing_keys_reject_torsion_and_identity_even_when_unused() {
         // (0,-1) has order two. Input allocation alone used to accept it.
         let torsion = EdwardsAffine::new_unchecked(CircuitField::ZERO, -CircuitField::ONE);
