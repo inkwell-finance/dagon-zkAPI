@@ -47,15 +47,16 @@ fixtures, development setup keys, or generated artifacts as production pins.
   trusted money path. A future experimental ledger may implement `CreditLedger`
   without changing the request API or vault semantics.
 
-The selected authorization circuit is `zkapi-v2-concession-v1`. The
+The selected authorization circuit is `zkapi-v2-hardening-v1`. The
 Solana-only root transition uses the separate
-`dagon-zkapi-solana-transition-v1` circuit. Both checked-in setups are
-single-party ceremonies and must be replaced or accepted explicitly for a real
-deployment. See [note-bound commitments](docs/note-bound-commitments.md),
+`dagon-zkapi-solana-transition-v1` circuit. The checked-in setups are
+single-party ceremonies; the old request/withdrawal keys predate the hardening
+and cannot be adopted for these circuits. See [note-bound commitments](docs/note-bound-commitments.md),
 [transition setup provenance](protocol/setup/solana-transition-v1/README.md),
-and [Solana server invariants](docs/SOLANA_SERVER.md). The pinned r1cs files are
-checked for under-constraint (Picus plus Lean-proved lemmas) in
-[circuit verification](verification/README.md).
+and [Solana server invariants](docs/SOLANA_SERVER.md). The Picus and Lean results in
+[circuit verification](verification/README.md) are pinned to the round-1 r1cs,
+not the hardened request/withdrawal r1cs used in [ceremony round 2](ceremony/PARTICIPATE.md).
+Those checks have not been rerun on the hardened circuits; transition is byte-identical.
 
 ## Build and test
 
