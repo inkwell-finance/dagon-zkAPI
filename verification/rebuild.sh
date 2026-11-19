@@ -83,6 +83,7 @@ EOF
 mapper() {
   # picus-mapper re-synthesises the circuits with section/free-witness marks, exports them through
   # zkapi_proof::ceremony::r1cs_bytes and refuses to continue unless the bytes hash to the pins.
+  python3 "$VERIF/tools/check_mapper.py" || return 1
   (cd "$VERIF/mapper" && CARGO_TARGET_DIR="$WORK/target" cargo build --release --locked) || return 1
   "$WORK/target/release/picus-mapper" "$OUT"
 }

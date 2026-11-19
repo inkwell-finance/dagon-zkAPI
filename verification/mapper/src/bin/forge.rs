@@ -1,4 +1,4 @@
-//! Throwaway forged-witness and gadget-lemma checks for the Picus audit.
+//! Forged-witness and gadget-lemma regression checks for the pinned circuits.
 //! Every check prints PASS/FAIL with what it demonstrates; exit code 1 on FAIL.
 
 #[path = "../circuits.rs"]
@@ -175,33 +175,33 @@ fn set_wire(cs: &ConstraintSystemRef<Fr>, wire: usize, v: Fr) -> Fr {
 
 fn is_eq_multiplier(rng: &mut StdRng) {
     // genesis: anchor == 1, so is_eq's inverse-multiplier is unconstrained
-    let cs = synth(MarkedRequest(request_fixture(rng, true)));
+    let cs = synth(MarkedRequest::from(request_fixture(rng, true)));
     check("request genesis fixture", cs.is_satisfied().unwrap(), "honest genesis request witness satisfies the pinned constraints");
     let ni = cs.num_instance_variables();
-    let s = section_start("request/L830") + ni;
+    let s = section_start("request/L879") + ni;
     // wires: s = is_not_equal (no booleanity), s+1 = multiplier
     let forged = Fr::rand(rng);
     let old = set_wire(&cs, s + 1, forged);
     let sat = cs.is_satisfied().unwrap();
     check("C1 is_eq multiplier (request genesis)", sat && old != forged,
-        "multiplier wire (L830 anchor.is_eq(1)) replaced by a random value: still satisfied, same public inputs; it feeds no other constraint");
+        "multiplier wire (L879 anchor.is_eq(1)) replaced by a random value: still satisfied, same public inputs; it feeds no other constraint");
     set_wire(&cs, s + 1, old);
     let old_ne = set_wire(&cs, s, Fr::from(1u64));
     check("C1 control: is_genesis flag", !cs.is_satisfied().unwrap(), "flipping is_not_equal itself is rejected");
     set_wire(&cs, s, old_ne);
 
-    let cs2 = synth(MarkedRequest(request_fixture(rng, false)));
+    let cs2 = synth(MarkedRequest::from(request_fixture(rng, false)));
     check("request non-genesis fixture", cs2.is_satisfied().unwrap(), "honest signed non-genesis request satisfies");
-    let s2 = section_start("request/L830") + ni;
+    let s2 = section_start("request/L879") + ni;
     set_wire(&cs2, s2 + 1, Fr::rand(rng));
     check("C1 control: multiplier when anchor != 1", !cs2.is_satisfied().unwrap(), "multiplier is pinned to 1/(anchor-1) when anchor != 1");
 }
 
 fn genesis_free_witnesses(rng: &mut StdRng) {
     // genesis: prev_anchor only feeds the (disabled) chain equality; signature unchecked
-    let cs = synth(MarkedRequest(request_fixture(rng, true)));
+    let cs = synth(MarkedRequest::from(request_fixture(rng, true)));
     let ni = cs.num_instance_variables();
-    let prev = find_free("request prev_anchor", 0)[0].1 + 0;
+    let prev = find_free("request/prev_anchor", 0)[0].1 + 0;
     let _ = ni;
     // Changing prev_anchor requires recomputing its two Poseidon hashes; instead
     // re-synthesise with a different prev_anchor and compare public inputs.
@@ -213,7 +213,7 @@ fn genesis_free_witnesses(rng: &mut StdRng) {
         s: Scalar::from(99u64),
     };
     a.witness.prev_anchor = Fr::from(0u64);
-    let (ca, cb) = (synth(MarkedRequest(a.clone())), synth(MarkedRequest(b.clone())));
+    let (ca, cb) = (synth(MarkedRequest::from(a.clone())), synth(MarkedRequest::from(b.clone())));
     let same_pub = a.public.to_field_elements() == b.public.to_field_elements();
     check("C2 genesis prev_anchor / signature free", ca.is_satisfied().unwrap() && cb.is_satisfied().unwrap() && same_pub,
         &format!("two genesis witnesses with different prev_anchor and arbitrary (R,s) both satisfy with identical public inputs (prev wire {prev})"));
@@ -239,29 +239,39 @@ fn torsion_and_scalar_aliases(rng: &mut StdRng) {
     check("C3 signature R pre-cofactor alias", outs == vec![true, true] && ge != alt,
         "ge and ge+(0,-1) both satisfy the R allocation (8*ge = R) with the same R");
 
-    // C4: 251-bit scalar witnesses (s, blinding, rerandomization) are not range-checked
-    // below the subgroup order l; k and k+l give the same point.
-    let l = Big(Scalar::MODULUS.0.to_vec());
-    let mut found = false;
-    for _ in 0..64 {
-        let k = Scalar::rand(rng);
-        let kb = Big(k.into_bigint().0.to_vec());
-        let alias = kb.add(&l);
-        if (251..256).any(|i| alias.bit(i)) { continue; }
-        let h = balance_blinding_generator();
-        let mut pts = vec![];
-        for bits in [bits_le(&kb, 251), bits_le(&alias, 251)] {
-            let cs = ConstraintSystem::<Fr>::new_ref();
-            let hv = EdwardsVar::new_constant(cs.clone(), h).unwrap();
-            let bs: Vec<Boolean<Fr>> = bits.iter().map(|b| Boolean::new_witness(cs.clone(), || Ok(*b)).unwrap()).collect();
-            let out = hv.scalar_mul_le(bs.iter()).unwrap();
-            assert!(cs.is_satisfied().unwrap());
-            pts.push(out.value().unwrap());
-        }
-        found = pts[0] == pts[1];
-        break;
+    // The same cofactor ambiguity now also exists in the signing-key membership witness.
+    let fixture = request_fixture(rng, true);
+    let key = fixture.public.state_signing_key;
+    let cs = synth(MarkedRequest::from(fixture));
+    let q_wire = find_free("request/signing key Q", cs.num_instance_variables())[0].1;
+    let alternative = (key.mul_by_cofactor_inv().into_group() + t2.into_group()).into_affine();
+    let alt_cs = ConstraintSystem::<Fr>::new_ref();
+    alt_cs.set_optimization_goal(OptimizationGoal::Constraints);
+    let mut q = EdwardsVar::new_variable_omit_prime_order_check(
+        alt_cs.clone(), || Ok(alternative.into_group()),
+        ark_r1cs_std::alloc::AllocationMode::Witness).unwrap();
+    for _ in 0..3 { q.double_in_place().unwrap(); }
+    alt_cs.finalize();
+    let before = cs.borrow().unwrap().witness_assignment[q_wire - cs.num_instance_variables()];
+    for (i, value) in alt_cs.borrow().unwrap().witness_assignment.iter().enumerate() {
+        set_wire(&cs, q_wire + i, *value);
     }
-    check("C4 251-bit scalar alias", found, "bits(k) and bits(k+l) both satisfy H*bits with the same output point");
+    check("C3 signing-key Q pre-cofactor alias", cs.is_satisfied().unwrap()
+        && before != alternative.x && q.value().unwrap() == key.into_group(),
+        &format!("Q+(0,-1) and recomputed doubles satisfy the full request with unchanged public key; Q wires {q_wire}, {}", q_wire + 1));
+
+    // Exercise the identical scalar allocator used in the pinned mapper, not an unbounded surrogate.
+    for (name, value, accepted) in [
+        ("zero", Scalar::from(0u64).into_bigint(), true),
+        ("r-1", (-Scalar::from(1u64)).into_bigint(), true),
+        ("r", Scalar::MODULUS, false),
+    ] {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let result = circuits::scalar_bits_witness(cs.clone(), value);
+        let satisfied = result.is_ok() && cs.is_satisfied().unwrap();
+        check(&format!("C4 hardened scalar {name}"), satisfied == accepted,
+            if accepted { "canonical boundary accepted" } else { "subgroup-order alias rejected" });
+    }
 }
 
 fn withdrawal_check(rng: &mut StdRng) {
@@ -290,11 +300,11 @@ fn withdrawal_check(rng: &mut StdRng) {
             state_signature: sig, clearance_signature: StateSignature { r: EdwardsAffine::zero(), s: Scalar::from(0u64) },
         },
     };
-    let cs = synth(MarkedWithdrawal(c.clone()));
+    let cs = synth(MarkedWithdrawal::from(c.clone()));
     check("withdrawal escape fixture", cs.is_satisfied().unwrap(), "honest escape withdrawal satisfies");
     let mut bad = c.clone();
     bad.public.final_balance = balance - conceded + 1;
-    let cs = synth(MarkedWithdrawal(bad));
+    let cs = synth(MarkedWithdrawal::from(bad));
     check("withdrawal control", !cs.is_satisfied().unwrap(), "final_balance + conceded != signed balance is rejected");
 }
 fn ec_denominators(rng: &mut StdRng) {

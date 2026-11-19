@@ -57,15 +57,15 @@ def ec_pairs(clist):
 
 
 GROUPS = {
-    # withdrawal L705-L722: UInt bits allocated in one section and tied to the
+    # withdrawal note fields: UInt bits allocated in one section and tied to the
     # public inputs only by later constraints. One slice per group, in order;
     # each constraint goes to the earliest group whose wires cover it.
     'withdrawal': {'groups': [
-        ['withdrawal/L705 ', 'withdrawal/L706 ', 'withdrawal/L717 '],   # packed note fields
-        ['withdrawal/L707-708 '],                                        # final_balance == public
-        ['withdrawal/L710-711 '],                                        # conceded == public
-        ['withdrawal/L709 ', 'withdrawal/L714 '],                        # balance = final + conceded
-        ['withdrawal/L715 '],                                            # deposit >= balance
+        ['withdrawal/L754 ', 'withdrawal/L755 ', 'withdrawal/L766 '], # packed note fields
+        ['withdrawal/L756 '],                                      # final_balance == public
+        ['withdrawal/L759 '],                                      # conceded == public
+        ['withdrawal/L758 ', 'withdrawal/L763 '],                  # balance = final + conceded
+        ['withdrawal/L764 '],                                      # deposit >= balance
     ]},
 }
 

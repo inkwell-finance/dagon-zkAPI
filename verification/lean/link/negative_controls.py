@@ -20,35 +20,46 @@ def check(name, rejected, detail):
         failed.append(name)
 
 
+bits = link.link_bits('request', cons)
+assert len(bits) == 2 and all(not s['mismatches'] for s in bits)
 c = list(cons)
-a, b, cc = c[18482 + 300]
-c[18482 + 300] = (a, {**b, 0: 5}, cc)
+i = bits[0]['cons_range'][0] + 300
+a, b, cc = c[i]
+c[i] = (a, {**b, 0: 5}, cc)
 mism = [len(s['mismatches']) for s in link.link_bits('request', c)]
 check('L-bits: one in-field constraint perturbed', mism == [1, 0], f'mismatches per site {mism}')
 
+add_i = next(i for i, kind, _ in link.ec_pairs(cons) if kind == 'add')
+assert link.link_add(cons, add_i) is not None
 c = list(cons)
-a, b, cc = c[21011]
+a, b, cc = c[add_i]
 b = dict(b)
-b[20891] = (b[20891] + 1) % P
-c[21011] = (a, b, cc)
-linked = link.link_add(c, 21011) is not None
+den_wire = next(w for w in b if w)
+b[den_wire] = (b[den_wire] + 1) % P
+c[add_i] = (a, b, cc)
+linked = link.link_add(c, add_i) is not None
 check('L-EC: add denominator uses d+1', not linked, f'linked: {linked}')
 
 c = list(cons)
-a, b, cc = c[21012]
-c[21012] = (a, b, {**cc, 20888: 2})
-linked = link.link_add(c, 21011) is not None
+a, b, cc = c[add_i + 1]
+c[add_i + 1] = (a, b, {**cc, 0: (cc.get(0, 0) + 1) % P})
+linked = link.link_add(c, add_i) is not None
 check('L-EC: add y3 numerator perturbed', not linked, f'linked: {linked}')
 
-c = list(cons)
-a, b, cc = c[23252]
-c[23252] = (a, b, {**cc, 0: 5})
-pairs, res, fails = link.link_ec(c)
-pv, pf = link.provenance(c, res)
-check('L-EC premise: on-curve check of the R witness perturbed', len(pf) == 1, f'provenance failures {len(pf)}')
+from r1cs import Marks
+marks = Marks(os.path.join(link.OUT, 'request.marks.json'))
+for label in ('L339 R witness', 'L296 signing key Q witness'):
+    start = next(cs for lab, _, _, cs, _ in marks.section_ranges() if label in lab)
+    c = list(cons)
+    a, b, cc = c[start + 2]
+    c[start + 2] = (a, b, {**cc, 0: (cc.get(0, 0) + 1) % P})
+    pairs, res, fails = link.link_ec(c)
+    pv, pf = link.provenance(c, res)
+    check(f'L-EC premise: on-curve check of {label} perturbed',
+          len(pf) == 1, f'provenance failures {len(pf)}')
 
 c = list(cons)
-m = 18962  # an is_neq multiplier (request)
+m = link.link_neq('request', cons)[0][0]['m']
 c.append(({m: 1}, {0: 1}, {m: 1}))  # m now occurs in a second constraint
 occ = sum(1 for (x, y, z) in c if m in x or m in y or m in z)
 rows = [r['ok'] for r in link.link_neq('request', c)[0] if r['m'] == m]
