@@ -41,8 +41,8 @@ linked = link.link_add(c, add_i) is not None
 check('L-EC: add denominator uses d+1', not linked, f'linked: {linked}')
 
 # Preserve the original shape-only numerator control on a variable+variable add.
-var_add = next(i for i, kind, _ in link.ec_pairs(cons)
-               if kind == 'add' and link.link_add(cons, i)['kind'] == 'var+var')
+# link_ec returns one result per gadget; for var+var adds the x3 constraint is start + 4.
+var_add = next(r['cons'][0] + 4 for r in link.link_ec(cons)[1] if r['kind'] == 'var+var')
 c = list(cons)
 a, b, cc = c[var_add + 1]
 wire = next(w for w in cc if w)
