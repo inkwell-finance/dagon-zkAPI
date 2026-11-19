@@ -2,7 +2,7 @@
   "name": "Dagon zkAPI Groth16 trusted setup",
   "version": 1,
   "curve": "bn128",
-  "contributionsCloseAt": "2026-12-04T00:00:00Z",
+  "contributionsCloseAt": "2026-12-18T23:59:00Z",
   "ptau": {
     "url": "https://circom.info/powersOfTau28_hez_final_16.ptau",
     "hash": "6a6277a2f74e1073601b4f9fed6e1e55226917efb0f0db8a07d98ab01df1ccf43eb0e8c3159432acd4960e2f29fe84a4198501fa54c8dad9e43297453efec125",
@@ -14,15 +14,15 @@
       "id": "request",
       "r1cs": "request.r1cs",
       "publicInputs": 12,
-      "constraints": 31670,
-      "r1csSha256": "ed73c7919790d3cb75e9fc60373aa7ac3c5fb4820c43f2364451ebfdb7f14566"
+      "constraints": 32862,
+      "r1csSha256": "595545d3ef56eb2bbbbefdb8943aa85ba45d2c79340f94bf75de6ea05452945d"
     },
     {
       "id": "withdrawal",
       "r1cs": "withdrawal.r1cs",
       "publicInputs": 16,
-      "constraints": 22222,
-      "r1csSha256": "a2b46576733aafbe90b816a26cfe8f40c613d76581fbf9e982026e191fa0c973"
+      "constraints": 23537,
+      "r1csSha256": "ad31498f2330687325faec694b11a221194c7790909a092a59964e6382163c4d"
     },
     {
       "id": "transition",
@@ -35,8 +35,8 @@
   "beacon": {
     "source": "drand",
     "chain": "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971",
-    "round": 34599412,
-    "applyAfter": "2026-12-07T00:00:00Z",
+    "round": 34973812,
+    "applyAfter": "2026-12-20T00:00:00Z",
     "iterationsExp": 20
   }
 }

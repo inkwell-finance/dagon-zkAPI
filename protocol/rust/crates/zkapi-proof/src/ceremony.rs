@@ -403,36 +403,78 @@ mod adoption_tests {
         assert!(accepted_manifest(bytes, &hex::encode(Sha256::digest(bytes))).is_err());
     }
 
-    #[test]
-    fn ceremony_adoption_binds_circuits_and_input_bytes_before_decoding() -> Result<()> {
+    /// Attempt an import of a placeholder zkey under a strict manifest that
+    /// declares `r1cs` as the ceremony-verified digests; return its error.
+    fn import_error(dir: &Path, r1cs: &[String; 3]) -> Result<anyhow::Error> {
+        let keys: serde_json::Map<String, serde_json::Value> = CIRCUIT_IDS.iter().zip(r1cs).map(|(id, digest)|
+            ((*id).to_owned(), serde_json::json!({"zkeySha256": "0".repeat(64), "verificationKeySha256": "1".repeat(64), "r1csSha256": digest}))).collect();
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "finalized": true, "strict": true, "round": 2,
+            "checkpoint": {"round": 1}, "ceremonySha256": "2".repeat(64), "keys": keys
+        }))?;
+        let path = dir.join("adoption.json");
+        fs::write(&path, &manifest)?;
+        Ok(import_zkeys(dir, dir.join("out"), &path, &hex::encode(Sha256::digest(&manifest))).unwrap_err())
+    }
+
+    fn with_scratch_dir(test: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
         let dir = std::env::temp_dir().join(format!("ceremony-adoption-{}-{}",
             std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
         fs::create_dir(&dir)?;
-        let result = (|| -> Result<()> {
-            fs::write(dir.join("request_final.zkey"), b"substituted file")?;
-            let r1cs: Vec<String> = circuit_shapes()?.iter()
-                .map(|shape| Ok(hex::encode(Sha256::digest(r1cs_bytes(&shape.matrices)?))))
-                .collect::<Result<_>>()?;
-            let import = |r1cs_digest: &dyn Fn(usize) -> String| -> Result<anyhow::Error> {
-                let keys: serde_json::Map<String, serde_json::Value> = CIRCUIT_IDS.iter().enumerate().map(|(i, id)|
-                    ((*id).to_owned(), serde_json::json!({"zkeySha256": "0".repeat(64), "verificationKeySha256": "1".repeat(64), "r1csSha256": r1cs_digest(i)}))).collect();
-                let manifest = serde_json::to_vec(&serde_json::json!({
-                    "version": 1, "finalized": true, "strict": true, "round": 2,
-                    "checkpoint": {"round": 1}, "ceremonySha256": "2".repeat(64), "keys": keys
-                }))?;
-                let path = dir.join("adoption.json");
-                fs::write(&path, &manifest)?;
-                Ok(import_zkeys(&dir, dir.join("out"), &path, &hex::encode(Sha256::digest(&manifest))).unwrap_err())
-            };
-            let drifted = import(&|i| if i == 2 { "3".repeat(64) } else { r1cs[i].clone() })?;
+        fs::write(dir.join("request_final.zkey"), b"substituted file")?;
+        let result = test(&dir);
+        fs::remove_dir_all(&dir)?;
+        result
+    }
+
+    fn compiled_r1cs_digests() -> Result<[String; 3]> {
+        let digests: Vec<String> = circuit_shapes()?.iter()
+            .map(|shape| Ok(hex::encode(Sha256::digest(r1cs_bytes(&shape.matrices)?))))
+            .collect::<Result<_>>()?;
+        digests.try_into().map_err(|_| anyhow!("expected three circuits"))
+    }
+
+    #[test]
+    fn ceremony_adoption_binds_circuits_and_input_bytes_before_decoding() -> Result<()> {
+        with_scratch_dir(|dir| {
+            let r1cs = compiled_r1cs_digests()?;
+            let mut drifted_pins = r1cs.clone();
+            drifted_pins[2] = "3".repeat(64);
+            let drifted = import_error(dir, &drifted_pins)?;
             assert!(drifted.to_string().contains("transition: the circuit compiled into this importer differs"), "{drifted:#}");
-            let substituted = import(&|i| r1cs[i].clone())?;
+            let substituted = import_error(dir, &r1cs)?;
             assert!(substituted.to_string().contains("final zkey SHA256 differs"), "{substituted:#}");
             assert!(!dir.join("out").exists());
             Ok(())
-        })();
-        fs::remove_dir_all(&dir)?;
-        result
+        })
+    }
+
+    /// The published `ceremony/ceremony.json` pins are exactly the r1cs this
+    /// importer compiles, and a manifest from the superseded round-1 circuits
+    /// (pinned at ccc634b) is refused before any zkey is read.
+    #[test]
+    fn ceremony_pins_match_compiled_circuits_and_round_one_pins_are_rejected() -> Result<()> {
+        let config: serde_json::Value = serde_json::from_slice(&fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../ceremony/ceremony.json"))?)?;
+        let pinned: [String; 3] = CIRCUIT_IDS.map(|id| config["circuits"].as_array().unwrap().iter()
+            .find(|circuit| circuit["id"] == id).and_then(|circuit| circuit["r1csSha256"].as_str()).unwrap().to_owned());
+        assert_eq!(pinned, compiled_r1cs_digests()?, "ceremony.json r1csSha256 pins differ from the compiled circuits");
+        with_scratch_dir(|dir| {
+            let accepted = import_error(dir, &pinned)?;
+            assert!(accepted.to_string().contains("final zkey SHA256 differs"), "{accepted:#}");
+            // Round-1 pins; transition's constraints did not change, so its pin is identical.
+            for (index, id, old) in [
+                (0, "request", "ed73c7919790d3cb75e9fc60373aa7ac3c5fb4820c43f2364451ebfdb7f14566"),
+                (1, "withdrawal", "a2b46576733aafbe90b816a26cfe8f40c613d76581fbf9e982026e191fa0c973"),
+            ] {
+                let mut round_one = pinned.clone();
+                round_one[index] = old.to_owned();
+                let rejected = import_error(dir, &round_one)?;
+                assert!(rejected.to_string().contains(&format!("{id}: the circuit compiled into this importer differs")), "{rejected:#}");
+            }
+            assert!(!dir.join("out").exists());
+            Ok(())
+        })
     }
 }
 

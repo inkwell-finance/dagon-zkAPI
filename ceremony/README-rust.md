@@ -12,16 +12,15 @@ Circuit ids: `request`, `withdrawal`, `transition` (Solana Merkle transition).
 
 | id         | constraints | instance vars (incl. const 1) | witness vars | ptau power |
 |------------|------------:|------------------------------:|-------------:|-----------:|
-| request    | 30 821      | 13                            | 30 530       | 15         |
-| withdrawal | 35 969      | 15                            | 35 524       | 16         |
+| request    | 32 862      | 13                            | 32 155       | 16         |
+| withdrawal | 23 537      | 17                            | 22 391       | 15         |
 | transition | 31 810      | 11                            | 31 834       | 15         |
 
 `snarkjs zkey new` needs `ptau power >= ceil(log2(constraints + instanceVariables))`
 (it appends one `input * 0 = 0` constraint per public wire including the constant
-and takes the next power of two; see `zkey_new.js`, `cirPower`). The withdrawal circuit
-therefore needs a **power-16** Perpetual Powers of Tau file, which covers all three.
-Checked against snarkjs 0.7.6: `zkey new` of `withdrawal` with a power-15 ptau fails
-("circuit too big"), `request` with power 15 works. Regenerate with
+and takes the next power of two; see `zkey_new.js`, `cirPower`). The hardened request circuit
+(32 862 + 13 > 2^15) therefore needs a **power-16** Perpetual Powers of Tau file, which covers all three.
+`ceremony.json` pins power 16; `init` rejects any circuit that does not fit it. Regenerate with
 `cargo run --release -p zkapi-proof --example ceremony_export -- OUT_DIR`
 (writes `circuits.json` next to the `.r1cs` files).
 

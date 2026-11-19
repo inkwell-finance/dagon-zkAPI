@@ -4,8 +4,12 @@ This page explains what we're asking you to do, why, what it costs you, and how 
 can read it yourself or hand it to an AI assistant to summarise and walk you through it. Everything here can be
 checked against the source code in this repository.
 
-**The ask, in one sentence:** spend about 10 minutes, before **4 December 2026, 00:00 UTC**, running a small program
+**The ask, in one sentence:** spend about 10 minutes, before **18 December 2026, 23:59 UTC**, running a small program
 that mixes your own randomness into the cryptographic keys of Dagon zkAPI, then post the short hash it prints.
+
+**Round 2.** The ceremony was restarted on the hardened circuits (`zkapi-v2-hardening-v1`). The first round, opened on
+older circuits and closing 4 December, is superseded: its keys cannot be used and it will not be finalized. Its
+transcript stays public as "round 1, superseded". If you contributed there, thank you; please contribute again.
 
 ## Why we need you
 
@@ -30,7 +34,7 @@ Pick one way. All three do the same computation.
 1. Open <https://ceremony.dagon.so> on a laptop or phone you own.
 2. Optionally type a name to appear in the public list (or stay anonymous).
 3. Press **Contribute my randomness**. You may wait in a short queue.
-4. Keep the tab open until it says **Done**. It downloads about 105 MB, computes, and uploads about 105 MB.
+4. Keep the tab open until it says **Done**. It downloads about 108 MB, computes, and uploads about 108 MB.
 5. Copy the **attestation hash** and post it publicly (X, Farcaster, a GitHub gist, your blog).
 
 ### 2. Terminal, checked against published pins (recommended; needs Node.js 24+)
@@ -46,7 +50,7 @@ The two hashes must equal the ones published at
 
 ```
 8d87e42f22d3b4b2a6732f4c7b6b56852b7645896e21d59b0e0ca7c75624e32b  contribute.mjs
-fa188c5cb0e15827626cfce1e168321839a65e452a93a89602fab4349e076c5e  ceremony.json
+5abf83e5fa213e7997a535d92a4816d3461a533bf5e0485ed4078dd256757924  ceremony.json
 ```
 
 Then:
@@ -101,22 +105,25 @@ reads the code, the "you must trust the server's code" caveat below disappears.
 
 | When | What |
 | --- | --- |
-| Now – 4 Dec 2026, 00:00 UTC | Contributions open |
-| 4 Dec 2026 | Contributions close; the final state is published |
-| 7 Dec 2026, 00:00 UTC | The public drand randomness beacon round 34599412 (chosen in advance, in `ceremony.json`) seals the keys, so even the last contributor cannot steer the result |
+| Now – 18 Dec 2026, 23:59 UTC | Contributions open |
+| 18 Dec 2026, 23:59 UTC | Contributions close; the final state is published |
+| 20 Dec 2026, 00:00 UTC | The public drand randomness beacon round 34973812 (chosen in advance, in `ceremony.json`) seals the keys, so even the last contributor cannot steer the result |
 | After | Final keys, transcript and verifier output are published; the keys replace the current single-party keys |
 
 ## Technical summary (for reviewers and AI assistants)
 
 - Groth16 phase 2 on BN254 using snarkjs 0.7.6, over the public Hermez Perpetual Powers of Tau (power 16, pinned
-  blake2b-512 hash). Three circuits of `zkapi-v2-concession-v1`: `request`, `withdrawal`, `transition`, with r1cs
-  pinned by sha256 and reproducible from source (`ceremony_export`, see `ceremony/README.md`).
+  blake2b-512 hash). Three circuits: `request` and `withdrawal` (`zkapi-v2-hardening-v1`) and the Solana `transition`
+  (`dagon-zkapi-solana-transition-v1`), with r1cs pinned by sha256 and reproducible from source (`ceremony_export`,
+  see `ceremony/README.md`).
 - Each upload must extend the previous round by exactly one contribution and is fully re-verified
   (`snarkjs zkey verify` against the r1cs and Powers of Tau) before it is accepted.
 - Attestation = sha256 of `dagon-zkapi-ceremony-v1\nround:<n>\n` followed by `<circuit>:<contribution hash>\n` for
   each circuit in order.
-- Circuit verification: Picus plus Lean-proved lemmas, linked to the pinned r1cs, show every wire is fixed by the
-  public and private inputs. See `verification/README.md`; reproduce with `verification/rebuild.sh`.
+- Circuit verification: Picus plus Lean-proved lemmas showed every wire is fixed by the public and private inputs
+  for the round-1 r1cs; those results (`verification/results/`) are pinned to the round-1 hashes and have not yet been
+  re-run on the hardened request/withdrawal r1cs (transition is byte-identical). See `verification/README.md`;
+  reproduce with `verification/rebuild.sh`.
 - Source: <https://github.com/inkwell-finance/dagon-zkAPI/tree/ccc634b/ceremony>. Design and operator guide:
   `ceremony/README.md`.
 
