@@ -4891,6 +4891,7 @@ dependencies = [
  "clap",
  "dagon-zkapi-ledger",
  "dagon-zkapi-profile",
+ "dagon-zkapi-solana",
  "dagon-zkapi-solana-ledger",
  "dagon-zkapi-vault",
  "fs2",

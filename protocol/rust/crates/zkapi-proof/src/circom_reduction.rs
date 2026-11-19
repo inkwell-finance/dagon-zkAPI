@@ -143,7 +143,7 @@ mod tests {
             let lagrange = domain.evaluate_all_lagrange_coefficients(point);
             let evaluate = |matrix: &Vec<Vec<(Fr, usize)>>| -> Fr {
                 matrix.iter().enumerate().map(|(row, terms)| {
-                    evaluate_constraint(terms, &assignment) * lagrange[row]
+                    evaluate_constraint::<Fr, Fr, Fr>(terms, &assignment) * lagrange[row]
                 }).sum()
             };
             let a = evaluate(&matrices.a);
