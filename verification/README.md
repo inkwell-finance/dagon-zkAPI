@@ -14,25 +14,38 @@ repo's own exporter produces and refuse to continue unless their sha256 equals `
 
 ## What is proven
 
-For each pinned r1cs, **every wire is uniquely determined by the public inputs and the prover-chosen
-free witnesses** (secret, note fields, balance, Merkle siblings, anchors, blinding and
-rerandomization scalars, signature `R` and `s`). In other words, the r1cs computes exactly the
-arkworks gadget functions, and a prover has no freedom beyond the private inputs the spec gives it,
-apart from the four benign cases listed under [Known residuals](#known-residuals-c1c4-all-info).
+For each pinned r1cs, **every non-residual wire is uniquely determined by the public inputs and the
+declared prover-chosen free witnesses** (secret, request context, note fields, balance, Merkle
+siblings, anchors, canonical blinding/rerandomization/signature scalars, signature `R` cofactor
+preimages and signing-key cofactor preimages `Q`). The exception is the isolated equality-test
+multiplier described in C1. Free means *chosen as an input to this uniqueness analysis*, not
+unconstrained: these values must still satisfy every original circuit constraint.
+
+Thus this check establishes absence of additional internal witness freedom, not equivalence of the
+accepted relation to the protocol specification or uniqueness of the free witnesses themselves.
+See [Known residuals](#known-residuals) for the intentional conditional freedoms and cofactor aliases.
 
 | circuit | wires | constraints | Picus slices SAFE | lemmas used |
 |---|---|---|---|---|
 | transition | 31,845 | 31,810 | 140 / 140 | none (pure Picus result) |
-| withdrawal | 21,604 | 22,222 | 311 / 311 | L-EC, L-bits, L-neq |
-| request | 31,391 | 31,670 | 331 / 331 | L-EC, L-bits, L-neq |
+| withdrawal | 22,408 | 23,537 | 316 / 316 | L-EC, L-bits, L-neq |
+| request | 32,168 | 32,862 | 334 / 334 | L-EC, L-bits, L-neq |
+
+Circuit pins (`r1csSha256` in `ceremony/ceremony.json`, circuit ID `zkapi-v2-hardening-v1`):
+
+| circuit | r1cs sha256 |
+|---|---|
+| request | `595545d3ef56eb2bbbbefdb8943aa85ba45d2c79340f94bf75de6ea05452945d` |
+| withdrawal | `ad31498f2330687325faec694b11a221194c7790909a092a59964e6382163c4d` |
+| transition | `a9cd49c195bd2d6e80664672f0994542baa12aa661e8e93bd9563f3bed8ad1c1` |
 
 Wire accounting (`tools/compose.py`; 0 wires unproven in every circuit):
 
 | circuit | public | free | Picus-SAFE | L-bits | L-neq |
 |---|---|---|---|---|---|
 | transition | 11 | 32 | 31,802 | 0 | 0 |
-| withdrawal | 17 | 760 | 19,762 | 1,016 | 49 |
-| request | 13 | 1,143 | 29,702 | 508 | 25 |
+| withdrawal | 17 | 764 | 20,507 | 1,016 | 104 |
+| request | 13 | 1,145 | 30,424 | 508 | 78 |
 
 **What is not claimed.** Uniqueness holds *given* the free witnesses. Binding the free witnesses to the
 public inputs is cryptographic (Poseidon, EdDSA/Schnorr under the server key, Pedersen binding) and
@@ -43,15 +56,18 @@ of scope here; the earlier circuit audits covered that.
 
 1. **Export and pin check.** `protocol/rust/crates/zkapi-proof/examples/ceremony_export.rs` writes the
    three r1cs files; their sha256 must equal `ceremony.json`.
-2. **Wire map (`mapper/`).** `picus-mapper` is a verbatim copy of the three `generate_constraints`
-   bodies from `groth16.rs`, with only `sec()`/`free()` marker calls added (they read counters and
-   never touch the constraint system). It exports through the repo's own
-   `zkapi_proof::ceremony::r1cs_bytes` and aborts unless the bytes hash to the pins. Because the copy
-   is byte-identical, every wire and constraint index maps to an exact source section and the set of
-   free witnesses is known exactly (`<id>.marks.json`).
+2. **Wire map (`mapper/`).** `picus-mapper` contains verbatim copies of the three
+   `generate_constraints` bodies and their constraint-emitting helper gadgets from hardened
+   `groth16.rs`, with only `sec()`/`free()` marker calls added (they read counters and never touch the
+   constraint system). `tools/check_mapper.py` compares the bodies after removing these markers.
+   It exports through the repo's own `zkapi_proof::ceremony::r1cs_bytes` and aborts unless the bytes
+   hash to the pins. Every wire and constraint index therefore maps to the exact source section.
+   The first two coordinates of each signing-key `Q` and signature-`R` preimage allocation are
+   free; their curve-equation helpers and cofactor doublings are not. Each scalar's first 251
+   Boolean wires are free; the new `r−1` comparator's derived wires are not.
 3. **Forged-witness harness (`mapper/src/bin/forge.rs`).** Builds concrete witnesses on the pinned
    constraint system to confirm each residual below and to test the in-field gadget at its boundaries
-   (15 checks).
+   (18 checks).
 4. **Relabel and slice (`tools/`).** The pinned headers declare every witness a private input, so
    Picus would be vacuous on them as-is (`prepare.py` writes the relabelled whole-circuit copy).
    `chunk.py` cuts each circuit into slices of contiguous witness wires: slice inputs are the public
@@ -62,8 +78,9 @@ of scope here; the earlier circuit audits covered that.
 5. **Picus** (`veridise/picus@sha256:3e78b3b6e3adb064e713553debdf83424bad538a84d95afbafc95e2c9dfe7f5c`,
    cvc5 1.0.8 with finite fields) runs `--strong --solver cvc5 --timeout 5000` on every slice.
 6. **Composition (`tools/compose.py`).** Every wire must be public, free, lemma-backed, or a target of a
-   SAFE slice. By induction over slice order every wire is then unique. Dropping constraints owned by
-   later slices only enlarges a slice's solution set, so a SAFE slice stays sound.
+   SAFE slice. By induction over slice order every non-C1 wire is then unique. C1 multipliers
+   are isolated by L-neq, not asserted unique at equality. Dropping constraints owned by later
+   slices only enlarges a slice's solution set, so a SAFE slice stays sound.
 7. **Lean lemmas (`lean/`).** The three facts Picus cannot prove are proved in Lean 4 with Mathlib.
 8. **Linkage (`lean/link/link.py`).** Ties each Lean theorem to the exact constraints of the pinned
    r1cs that the slices took a lemma for; `negative_controls.py` shows the linkage rejects perturbed
@@ -81,7 +98,7 @@ certificate) and that the curve's `d = 168696/168700` is a non-square.
   on-curve inputs the arkworks 0.5 add and double gadgets (ark-ed-on-bn254, `a = 1`) never divide by
   zero, their outputs are unique and on the curve. The slices encode this by adding `D·inv = 1` and
   the implied `inv·N = t` for each division. `link.py` regenerates every add/double gadget
-  (3,804 gadgets, 7,608 denominator constraints) and checks the on-curve premise for all 6,837 input
+  (3,816 gadgets, 7,632 denominator constraints) and checks the on-curve premise for all 6,852 input
   points, using rule lemmas proved in Lean.
 - **L-bits: canonical 254-bit decomposition** (`InField.lean`: `toBitsLe_canonical`). A Lean generator
   reproduces arkworks' `AllocatedFp::to_bits_le` constraint emission, including
@@ -90,8 +107,29 @@ certificate) and that the curve's `d = 168696/168700` is a non-square.
   output exactly.
 - **L-neq: the `is_neq` multiplier** (`IsNeq.lean`: `isNeq_ne`, `isNeq_unique`, `isNeq_m_of_ne`,
   `isNeq_m_free`). In `(x−y)·m = ne`, `(x−y)·(1−ne) = 0`, the output `ne` is unique, and `m` is free
-  exactly when `x = y`. `link.py` checks that each of the 74 helper wires occurs in exactly this pair
-  and nowhere else.
+  exactly when `x = y`. `link.py` checks that each of the 182 helper wires occurs in exactly this pair
+  and nowhere else (the multiplier itself occurs only in the first constraint).
+
+### Hardened constraint families
+
+No new Lean theorem or axiom was needed. The existing composition covers all 790 slices:
+
+| added family | uniqueness evidence |
+|---|---|
+| signing-key `Q` allocation and cofactor clearing | two declared free coordinates per key; L-EC links the on-curve allocation and all add/double operations |
+| signing-key nonidentity | Picus proves the test result; L-neq isolates two equality-test multipliers per key |
+| scalar `r−1` bound | the 251 input bits remain free; Picus proves derived comparator wires, with 17 isolated L-neq multipliers per allocation |
+| deployment version, u64 chain ID and nonzero binding | Picus, including the unique chain-ID decomposition and nonzero inverses |
+| destination 160-bit limit | existing L-bits decomposition plus the added high-bit equalities; Picus handles remaining helpers |
+
+L-neq now covers request 78 / withdrawal 104 wires, versus 25 / 49 previously:
+the six scalar bounds add 102 helpers and the three signing keys add six. L-EC adds 12 gadgets.
+There were no non-SAFE slices in the hardened run after extending these existing classifications.
+The initial rebuild failed only the old wire-accounting snapshot and a negative-control assumption:
+perturbing `identity + Q` can match an add with a shifted input, but the full linkage rejects that
+input's on-curve premise. The controls retain the original variable-add perturbation and also
+check this shifted-input rejection; no solver verdict or circuit constraint was weakened.
+
 
 ## Trusted parts
 
@@ -109,22 +147,27 @@ certificate) and that the curve's `d = 168696/168700` is a non-square.
 - **The mapper copy** is trusted only as far as its sha256 equality with the pins, which makes the
   wire-to-source map exact.
 
-## Known residuals (C1–C4, all Info)
+## Known residuals
 
-Picus and the forged-witness harness found these non-unique wires. None changes a public input or a
-semantically meaningful private value (balance, deposit, note id, expiry, secret, nullifier, anchor,
-registration, leaf, commitment, root, destination).
+The following are evaluated against the hardened circuit ID `zkapi-v2-hardening-v1`
+(transition remains unchanged). None of the remaining residuals changes a public input or a
+semantically meaningful private value such as balance, secret, nullifier, commitment or destination.
 
-| # | wires | meaning | severity |
+| # | wires / scope | hardened status | severity |
 |---|---|---|---|
-| C1 | `is_neq` multiplier `m` (request 25, withdrawal 49) | inverse helper of an equality test, free only when the compared values are equal; occurs in one constraint, `ne` is unique (L-neq) | Info / false positive |
-| C2 | genesis `prev_anchor`; state signature `R`, `s` on genesis; clearance signature when `has_clearance = 0` | the anchor chain and signature checks are disabled by design in those cases | Info, intended |
-| C3 | signature `R` pre-cofactor point | arkworks allocates `R/8` and constrains `8·ge`; `ge + T` for a small-order `T` gives the same `R` | Info, intended |
-| C4 | 251-bit scalars (`s`, blinding, rerandomization) not reduced below the subgroup order ℓ | `k` and `k+ℓ` give the same point; only the point is used | Info, intended |
+| C1 | isolated `is_neq` multiplier `m`, including the signing-key nonidentity test and scalar-bound helpers | Still free when the compared values coincide; occurs in one constraint only. L-neq proves the Boolean result unique and the multiplier unique when the values differ. | Info / benign internal freedom |
+| C2 | genesis `prev_anchor` and state signature; clearance signature when `has_clearance = 0` | Still intentionally disabled checks. Scalars are now canonical even when the signature equation is disabled; signing keys are always subgroup-checked and nonidentity. | Info / intended |
+| C3 | signature `R` cofactor preimage and **new signing-key `Q` cofactor preimage** | Still possible to replace a preimage by its sum with an 8-torsion point. `8·(Q+T) = 8·Q` leaves the public key unchanged. The full-request harness demonstrates the new `Q` alias; this is representation freedom, not a signing-key bypass. | Info / intended |
+| C4 | formerly unbounded 251-bit scalar representations | **Resolved.** All six scalar-allocation sites enforce `bits ≤ r−1`, including disabled signatures. The identical mapper allocator accepts 0 and r−1 and rejects r. | Historical representation malleability; no remaining residual |
 
-A whole-circuit (undecomposed) Picus `--strong` run was attempted with 26 GB: transition and request
-were OOM-killed and withdrawal returned UNKNOWN (cvc5 per-query timeout). The decomposed result is
-the evidence. That UNKNOWN is what exposed a classifier bug: the old `run_picus.sh` matched the
+No separate subgroup-membership theorem is claimed: the formal composition establishes uniqueness
+of the cofactor-clearing computation given `Q`, using L-EC. The cryptographic interpretation of that
+computation and signing-key validation remain part of the circuit specification review.
+
+In the earlier, pre-hardening audit, a whole-circuit (undecomposed) Picus `--strong` run with
+26 GB OOM-killed transition and request; withdrawal returned UNKNOWN (cvc5 per-query timeout).
+The hardened evidence here is the decomposed rerun, not a whole-circuit solver result.
+That earlier UNKNOWN exposed a classifier bug: the old `run_picus.sh` matched the
 substring "properly constrained", which also occurs in Picus's UNKNOWN line, and labelled it SAFE.
 It now matches whole verdict lines only, and `tools/test_picus_verdict.sh` (run by `rebuild.sh`)
 checks this, including the old classifier as a regression case. No slice verdict was affected: every
@@ -161,8 +204,9 @@ curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh
 verification/rebuild.sh
 ```
 
-About 9 minutes on 8 cores with warm caches (Picus 5 minutes, Lean 2 minutes; the recorded clean run is
-`results/rebuild-summary.txt`). Generated files go to `verification/work/`
+The hardened run uses `ssh dagon-build`, a clean `git archive` export, and
+`dagon-busy zk-verify-hardened -- bash -lc '…'`, with `PICUS_PARALLEL=4` on its 8 vCPUs.
+The measured run is recorded in `results/rebuild-summary.txt`. Generated files go to `verification/work/`
 (override with `VERIF_WORK`); per-step logs are in `work/logs/`. Options: `PICUS_PARALLEL` (default
 6 containers), `PICUS_MEMORY` (default `3g` each), `PICUS_WALL` (default 900 s per slice).
 
@@ -172,18 +216,19 @@ The steps and their pass conditions:
 |---|---|
 | verdict classifier self-test | every fixture is classified correctly |
 | export r1cs | all three sha256 equal `ceremony.json` |
-| instrumented mapper | its exported bytes hash to the pins (it aborts otherwise) |
-| forged-witness harness | 15/15 checks PASS |
+| instrumented mapper | source bodies are verbatim and exported bytes hash to the pins |
+| forged-witness harness | 18/18 checks PASS |
 | relabel and slice | `chunk.py`'s partition and coverage assertions hold |
-| Picus | all 782 slices SAFE |
+| Picus | all 790 slices SAFE |
 | composition | 0 wires unproven; accounting equals `results/compose-summary.json` |
 | Lean | clean build; no forbidden constructs; 15 theorems with only the three standard axioms; export sha256 matches |
 | linkage | `link.py` prints `ALL LINKED` |
 | negative controls | every perturbation rejected |
 
-Ecne (a second, propagation-based checker) was also run on the same slices during the audit and
-confirmed 763 of 782; its 19 non-proofs were exactly the inverse and in-field slices, which Picus
-proved. It is not part of `rebuild.sh` because it needs Julia 1.7.3 with a 2022 package manifest.
+Ecne (a second, propagation-based checker) confirmed 763 of 782 slices in the **pre-hardening**
+audit; its 19 non-proofs were inverse and in-field slices that Picus proved. It has not been rerun
+on the hardened slices and is not evidence for them. It is not part of `rebuild.sh` because it
+needs Julia 1.7.3 with a 2022 package manifest.
 
 ### Layout
 

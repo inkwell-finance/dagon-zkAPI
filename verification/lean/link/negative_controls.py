@@ -40,11 +40,25 @@ c[add_i] = (a, b, cc)
 linked = link.link_add(c, add_i) is not None
 check('L-EC: add denominator uses d+1', not linked, f'linked: {linked}')
 
+# Preserve the original shape-only numerator control on a variable+variable add.
+var_add = next(i for i, kind, _ in link.ec_pairs(cons)
+               if kind == 'add' and link.link_add(cons, i)['kind'] == 'var+var')
+c = list(cons)
+a, b, cc = c[var_add + 1]
+wire = next(w for w in cc if w)
+c[var_add + 1] = (a, b, {**cc, wire: (cc[wire] + 1) % P})
+linked = link.link_add(c, var_add) is not None
+check('L-EC: add y3 numerator perturbed', not linked, f'linked: {linked}')
+
+# The first hardened add is identity + Q. Shifting its y numerator still matches
+# an add with a shifted input, but the indispensable on-curve premise must fail.
 c = list(cons)
 a, b, cc = c[add_i + 1]
 c[add_i + 1] = (a, b, {**cc, 0: (cc.get(0, 0) + 1) % P})
-linked = link.link_add(c, add_i) is not None
-check('L-EC: add y3 numerator perturbed', not linked, f'linked: {linked}')
+pairs, res, fails = link.link_ec(c)
+pv, pf = link.provenance(c, res)
+check('L-EC: shifted cofactor input rejected by full linkage',
+      bool(fails or pf), f'failed gadgets {len(fails)}, provenance failures {len(pf)}')
 
 from r1cs import Marks
 marks = Marks(os.path.join(link.OUT, 'request.marks.json'))
