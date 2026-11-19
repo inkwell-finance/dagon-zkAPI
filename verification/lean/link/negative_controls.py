@@ -72,12 +72,15 @@ for label in ('L339 R witness', 'L296 signing key Q witness'):
     check(f'L-EC premise: on-curve check of {label} perturbed',
           len(pf) == 1, f'provenance failures {len(pf)}')
 
-c = list(cons)
-m = link.link_neq('request', cons)[0][0]['m']
-c.append(({m: 1}, {0: 1}, {m: 1}))  # m now occurs in a second constraint
-occ = sum(1 for (x, y, z) in c if m in x or m in y or m in z)
-rows = [r['ok'] for r in link.link_neq('request', c)[0] if r['m'] == m]
-check('L-neq: extra occurrence of m added', occ == 2 and rows == [False], f'occurrences {occ}, row ok {rows}')
+neq = link.link_neq('request', cons)[0]
+for label in ('L298 signing key nonidentity', 'L283 scalar bound'):
+    m = next(r['m'] for r in neq if label in marks.wire_section(r['m']))
+    c = list(cons)
+    c.append(({m: 1}, {0: 1}, {m: 1}))  # m now occurs in a second constraint
+    occ = sum(1 for (x, y, z) in c if m in x or m in y or m in z)
+    rows = [r['ok'] for r in link.link_neq('request', c)[0] if r['m'] == m]
+    check(f'L-neq: extra occurrence of m in {label}', occ == 2 and rows == [False],
+          f'occurrences {occ}, row ok {rows}')
 
 print('NEGATIVE CONTROLS: all rejected' if not failed else f'NEGATIVE CONTROLS FAILED: {failed}')
 sys.exit(1 if failed else 0)

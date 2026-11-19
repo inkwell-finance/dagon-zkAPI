@@ -84,7 +84,8 @@ of scope here; the earlier circuit audits covered that.
 7. **Lean lemmas (`lean/`).** The three facts Picus cannot prove are proved in Lean 4 with Mathlib.
 8. **Linkage (`lean/link/link.py`).** Ties each Lean theorem to the exact constraints of the pinned
    r1cs that the slices took a lemma for; `negative_controls.py` shows the linkage rejects perturbed
-   constraints.
+   constraints, including extra multiplier occurrences in both hardened L-neq families (signing-key
+   nonidentity and scalar bounds), and a corrupted signing-key `Q` on-curve premise.
 
 ## The three lemmas
 
