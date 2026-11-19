@@ -229,7 +229,20 @@ Finalization refuses missing/late closure and refuses before `applyAfter`. It au
 
 ## Railway single-instance procedure
 
-1. Build the pinned Node 24 image with exported `r1cs/` files in its context; check config pins. `r1cs/` is gitignored and `railway up` honours `.gitignore`, so upload with `railway up --no-gitignore` (or build the image elsewhere) or the Dockerfile's `COPY r1cs` fails. Use **one replica**, one volume at `/data`, `DATA_DIR=/data`, and no overlapping writers. Enable `TRUST_PROXY=1` only after confirming actual Railway XFF semantics and preventing direct-origin header injection.
+1. Build the pinned Node 24 image with exported `r1cs/` files in its context; check config pins. **Upload a fresh, isolated context, never the working directory with `--no-gitignore`.** Railway CLI 5.71.0 skips `.git` and `node_modules`, but does not use `.dockerignore` to filter the upload; disabling `.gitignore` can ship `data/`, ptau, dry-run files and `.env` before Docker filters anything. A linked parent directory can also override the current directory. From `ceremony/` in the clean published checkout, after exporting and checking the pins:
+
+   ```bash
+   set -euo pipefail
+   DEPLOY_DIR=$(mktemp -d)
+   git archive HEAD:ceremony | tar -x -C "$DEPLOY_DIR"
+   mkdir "$DEPLOY_DIR/r1cs"
+   cp r1cs/request.r1cs r1cs/withdrawal.r1cs r1cs/transition.r1cs r1cs/circuits.json "$DEPLOY_DIR/r1cs/"
+   # Set these three variables to the existing target's IDs; do not rely on a parent link.
+   railway up "$DEPLOY_DIR" --path-as-root --no-gitignore \
+     --project "$RAILWAY_PROJECT" --service "$RAILWAY_SERVICE" --environment "$RAILWAY_ENVIRONMENT"
+   ```
+
+   The upload is exactly the tracked `ceremony/` tree plus those four export files: no local `node_modules/`, `web/dist/`, data, ptau, secrets or rehearsal artifacts. Keep this directory unchanged for the normal redeploy; do not run `npm ci`, build or init in it. Use service root `/` and Dockerfile path `Dockerfile`. `.dockerignore` filters the subsequent Docker context, not the Railway transfer; Docker rebuilds the bundles and installs its own dependencies. `--no-gitignore` is still required because the staged `.gitignore` lists `r1cs/`. Use **one replica**, one volume at `/data`, `DATA_DIR=/data`, and no overlapping writers. Enable `TRUST_PROXY=1` only after confirming actual Railway XFF semantics and preventing direct-origin header injection.
 2. First initialization only: set `INIT_ON_EMPTY=1`, run `serve`, wait for round-zero health, retain config/initial hashes externally, **remove the flag** and redeploy normally. Empty replacement volumes then fail closed; never re-enable init to conceal volume loss. Initialization (ptau download, `zkey new` and full verification of three keys) runs before the server listens and takes many minutes: leave the healthcheck path unset or set `RAILWAY_HEALTHCHECK_TIMEOUT_SEC` above the observed duration. Set `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` above one full verification if a redeploy should let an admitted contribution finish instead of losing it.
 3. Reserve at least **4 GiB** container memory; startup checks detected cgroup/host capacity. This is not an OS hard limit. The latest local Windows/Node 26 strict verification of 12 full-size historical keys peaked at **1,955,127,296 bytes RSS** (about 1.82 GiB); repeated malformed inputs were also rejected. These are not isolated Node 24/Railway measurements or proof of a hard upper bound. Before invitations benchmark under the actual image/cgroup and monitor OOM/restarts. Timeout is not a native-memory limit.
 4. Retention is about **128 GB per 1,000 rounds** before growth/staging/final copies/backups. Admission reserves 1 GiB plus three current rounds. Alert well before that threshold and budget independent backup storage.
