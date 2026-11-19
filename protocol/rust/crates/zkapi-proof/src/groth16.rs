@@ -266,11 +266,13 @@ pub fn verify_state_signature(
     lhs == rhs
 }
 
+/// Allocates a 251-bit Baby-JubJub scalar and bounds it by `r-1`, so every
+/// scalar has one witness. Takes the integer so tests can supply `r` itself.
 fn scalar_bits_witness(
     cs: ConstraintSystemRef<CircuitField>,
-    value: EdwardsScalarField,
+    value: <EdwardsScalarField as PrimeField>::BigInt,
 ) -> Result<Vec<Boolean<CircuitField>>, SynthesisError> {
-    let native_bits = value.into_bigint().to_bits_le();
+    let native_bits = value.to_bits_le();
     let bits = (0..EdwardsScalarField::MODULUS_BIT_SIZE as usize)
         .map(|index| {
             Boolean::new_witness(cs.clone(), || {
@@ -278,16 +280,8 @@ fn scalar_bits_witness(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    enforce_canonical_scalar(&bits)?;
+    Boolean::enforce_smaller_or_equal_than_le(&bits, (-EdwardsScalarField::ONE).into_bigint())?;
     Ok(bits)
-}
-
-fn enforce_canonical_scalar(bits: &[Boolean<CircuitField>]) -> Result<(), SynthesisError> {
-    Boolean::enforce_smaller_or_equal_than_le(
-        bits,
-        (-EdwardsScalarField::ONE).into_bigint(),
-    )?;
-    Ok(())
 }
 
 /// Input allocation checks the curve equation, but not subgroup membership.
@@ -328,7 +322,7 @@ fn commitment_var(
     let g = EdwardsVar::new_constant(cs.clone(), EdwardsProjective::generator())?;
     let h = EdwardsVar::new_constant(cs.clone(), balance_blinding_generator())?;
     let j = EdwardsVar::new_constant(cs.clone(), note_binding_generator())?;
-    let blinding_bits = scalar_bits_witness(cs, blinding)?;
+    let blinding_bits = scalar_bits_witness(cs, blinding.into_bigint())?;
     let note_bits = note_leaf.to_bits_le()?;
     Ok(g.scalar_mul_le(balance.bits.iter())?
         + h.scalar_mul_le(blinding_bits.iter())?
@@ -343,7 +337,7 @@ fn enforce_signature(
     condition: &Boolean<CircuitField>,
 ) -> Result<(), SynthesisError> {
     let r = EdwardsVar::new_witness(cs.clone(), || Ok(signature.r))?;
-    let s_bits = scalar_bits_witness(cs.clone(), signature.s)?;
+    let s_bits = scalar_bits_witness(cs.clone(), signature.s.into_bigint())?;
     let challenge_hash = poseidon_hash_var(
         cs.clone(),
         &[
@@ -516,7 +510,8 @@ impl ConstraintSynthesizer<CircuitField> for RequestCircuit {
         )?;
 
         let h = EdwardsVar::new_constant(cs.clone(), balance_blinding_generator())?;
-        let rerandomization_bits = scalar_bits_witness(cs.clone(), self.witness.rerandomization)?;
+        let rerandomization_bits =
+            scalar_bits_witness(cs.clone(), self.witness.rerandomization.into_bigint())?;
         let computed_anonymous =
             current_commitment + h.scalar_mul_le(rerandomization_bits.iter())?;
         computed_anonymous.enforce_equal(&anonymous_commitment)?;
@@ -1109,23 +1104,25 @@ mod tests {
 
     #[test]
     fn scalar_witness_rejects_order_aliases() {
-        for noncanonical in [false, true] {
+        let r = EdwardsScalarField::MODULUS;
+        // r aliases zero: the former unbounded bits satisfied G*bits = identity.
+        let old = ConstraintSystem::new_ref();
+        let g = EdwardsVar::new_constant(old.clone(), EdwardsProjective::generator()).unwrap();
+        let unbounded = r.to_bits_le().into_iter()
+            .take(EdwardsScalarField::MODULUS_BIT_SIZE as usize)
+            .map(|bit| Boolean::new_witness(old.clone(), || Ok(bit)).unwrap())
+            .collect::<Vec<_>>();
+        g.scalar_mul_le(unbounded.iter()).unwrap().enforce_equal(&EdwardsVar::zero()).unwrap();
+        assert!(old.is_satisfied().unwrap());
+        // The allocator behind every blinding, rerandomization and signature s
+        // accepts exactly 0..=r-1.
+        let r_minus_one = (-EdwardsScalarField::ONE).into_bigint();
+        for (value, canonical) in [(EdwardsScalarField::ZERO.into_bigint(), true),
+            (r_minus_one, true), (r, false)]
+        {
             let cs = ConstraintSystem::new_ref();
-            let value = if noncanonical {
-                EdwardsScalarField::MODULUS
-            } else {
-                EdwardsScalarField::ZERO.into_bigint()
-            };
-            let bits = value.to_bits_le().into_iter()
-                .take(EdwardsScalarField::MODULUS_BIT_SIZE as usize)
-                .map(|bit| Boolean::new_witness(cs.clone(), || Ok(bit)).unwrap())
-                .collect::<Vec<_>>();
-            // Both 0 and r satisfy the old scalar-multiplication relation.
-            let g = EdwardsVar::new_constant(cs.clone(), EdwardsProjective::generator()).unwrap();
-            g.scalar_mul_le(bits.iter()).unwrap().enforce_equal(&EdwardsVar::zero()).unwrap();
-            assert!(cs.is_satisfied().unwrap());
-            enforce_canonical_scalar(&bits).unwrap();
-            assert_eq!(cs.is_satisfied().unwrap(), !noncanonical);
+            scalar_bits_witness(cs.clone(), value).unwrap();
+            assert_eq!(cs.is_satisfied().unwrap(), canonical);
         }
     }
 
