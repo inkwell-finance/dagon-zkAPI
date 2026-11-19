@@ -234,9 +234,11 @@ Finalization refuses missing/late closure and refuses before `applyAfter`. It au
    ```bash
    set -euo pipefail
    DEPLOY_DIR=$(mktemp -d)
-   git archive HEAD:ceremony | tar -x -C "$DEPLOY_DIR"
+   # Run git archive from the repository root: run from ceremony/, it silently writes an empty archive.
+   git -C "$(git rev-parse --show-toplevel)" archive HEAD:ceremony | tar -x -C "$DEPLOY_DIR"
    mkdir "$DEPLOY_DIR/r1cs"
    cp r1cs/request.r1cs r1cs/withdrawal.r1cs r1cs/transition.r1cs r1cs/circuits.json "$DEPLOY_DIR/r1cs/"
+   test "$(find "$DEPLOY_DIR" -type f | wc -l)" -eq 61   # 57 tracked files + 4 exports
    # Set these three variables to the existing target's IDs; do not rely on a parent link.
    railway up "$DEPLOY_DIR" --path-as-root --no-gitignore \
      --project "$RAILWAY_PROJECT" --service "$RAILWAY_SERVICE" --environment "$RAILWAY_ENVIRONMENT"
