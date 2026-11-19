@@ -15,8 +15,8 @@ use zkapi_proof::groth16::*;
 use circuits::{Mark, MarkedRequest, MarkedTransition, MarkedWithdrawal, MARKS};
 
 const PINS: [(&str, &str); 3] = [
-    ("request", "ed73c7919790d3cb75e9fc60373aa7ac3c5fb4820c43f2364451ebfdb7f14566"),
-    ("withdrawal", "a2b46576733aafbe90b816a26cfe8f40c613d76581fbf9e982026e191fa0c973"),
+    ("request", "595545d3ef56eb2bbbbefdb8943aa85ba45d2c79340f94bf75de6ea05452945d"),
+    ("withdrawal", "ad31498f2330687325faec694b11a221194c7790909a092a59964e6382163c4d"),
     ("transition", "a9cd49c195bd2d6e80664672f0994542baa12aa661e8e93bd9563f3bed8ad1c1"),
 ];
 
@@ -148,8 +148,8 @@ fn dump(id: &str, m: &ConstraintMatrices<Fr>, out: &str) -> Result<()> {
 fn main() -> Result<()> {
     let out = std::env::args().nth(1).ok_or_else(|| anyhow!("usage: picus-mapper OUT_DIR"))?;
     fs::create_dir_all(&out)?;
-    dump("request", &matrices_of(MarkedRequest(request()))?, &out)?;
-    dump("withdrawal", &matrices_of(MarkedWithdrawal(withdrawal()))?, &out)?;
-    dump("transition", &matrices_of(MarkedTransition(transition()))?, &out)?;
+    dump("request", &matrices_of(MarkedRequest::from(request()))?, &out)?;
+    dump("withdrawal", &matrices_of(MarkedWithdrawal::from(withdrawal()))?, &out)?;
+    dump("transition", &matrices_of(MarkedTransition::from(transition()))?, &out)?;
     Ok(())
 }

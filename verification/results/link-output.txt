@@ -1,19 +1,19 @@
-== request: sha256 ed73c7919790d3cb75e9fc60373aa7ac3c5fb4820c43f2364451ebfdb7f14566 (pin OK), 31391 wires, 31670 constraints
-  L-bits site cons [18482, 19122] bits [18518, 18772]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 3 wires, all < base: True
-  L-bits site cons [24002, 24642] bits [23884, 24138]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 3 wires, all < base: True
+== request: sha256 595545d3ef56eb2bbbbefdb8943aa85ba45d2c79340f94bf75de6ea05452945d (pin OK), 32168 wires, 32862 constraints
+  L-bits site cons [18944, 19584] bits [18839, 19093]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 3 wires, all < base: True
+  L-bits site cons [24829, 25469] bits [24433, 24687]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 3 wires, all < base: True
   L-bits: 508 bit wires linked; equal to the Picus L-bits input set: True
-  L-EC: 1646 division pairs (3292 denominator constraints), linked 1646, failed 0; kinds {'var+const': 1130, 'var+var': 257, 'double': 257, 'const+var': 2}
-    const+var/ht: {'constraint': 2}
-    const+var/hu: {'folded': 2}
-    const+var/hv0: {'folded': 2}
-    const+var/hv1: {'folded': 2}
-    const+var/hx3: {'constraint': 2}
-    const+var/hy3: {'constraint': 2}
-    double/hx2: {'constraint': 257}
-    double/hx3: {'constraint': 257}
-    double/hxy: {'constraint': 257}
-    double/hy2: {'constraint': 257}
-    double/hy3: {'constraint': 257}
+  L-EC: 1650 division pairs (3300 denominator constraints), linked 1650, failed 0; kinds {'double': 260, 'const+var': 3, 'var+const': 1130, 'var+var': 257}
+    const+var/ht: {'constraint': 3}
+    const+var/hu: {'folded': 3}
+    const+var/hv0: {'folded': 3}
+    const+var/hv1: {'folded': 3}
+    const+var/hx3: {'constraint': 3}
+    const+var/hy3: {'constraint': 3}
+    double/hx2: {'constraint': 260}
+    double/hx3: {'constraint': 260}
+    double/hxy: {'constraint': 260}
+    double/hy2: {'constraint': 260}
+    double/hy3: {'constraint': 260}
     var+const/ht: {'constraint': 1130}
     var+const/hu: {'folded': 1130}
     var+const/hv0: {'folded': 1130}
@@ -26,51 +26,104 @@
     var+var/hv1: {'constraint': 257}
     var+var/hx3: {'constraint': 257}
     var+var/hy3: {'constraint': 257}
-  L-EC premise (inputs on curve): 3035 input points checked, failures 0; distinct points by rule {'boolsel': 5, 'const': 754, 'output': 1642, 'select': 1383, 'alloc': 2}
-  L-neq: 25 helper wires, shape+single-occurrence OK 25, independently re-detected 25, sets equal True
-    m=17548 ne=17547 cons=[17510, 17511] occurrences=1 ok=True
-    m=18790 ne=18789 cons=[18766, 18767] occurrences=1 ok=True
-    m=18794 ne=18793 cons=[18772, 18773] occurrences=1 ok=True
-    m=18800 ne=18799 cons=[18781, 18782] occurrences=1 ok=True
-    m=18833 ne=18832 cons=[18835, 18836] occurrences=1 ok=True
-    m=18889 ne=18888 cons=[18927, 18928] occurrences=1 ok=True
-    m=18907 ne=18906 cons=[18956, 18957] occurrences=1 ok=True
-    m=18923 ne=18922 cons=[18983, 18984] occurrences=1 ok=True
-    m=18930 ne=18929 cons=[18993, 18994] occurrences=1 ok=True
-    m=18936 ne=18935 cons=[19002, 19003] occurrences=1 ok=True
-    m=18956 ne=18955 cons=[19036, 19037] occurrences=1 ok=True
-    m=18962 ne=18961 cons=[19046, 19047] occurrences=1 ok=True
-    m=18974 ne=18973 cons=[19064, 19065] occurrences=1 ok=True
-    m=24156 ne=24155 cons=[24286, 24287] occurrences=1 ok=True
-    m=24160 ne=24159 cons=[24292, 24293] occurrences=1 ok=True
-    m=24166 ne=24165 cons=[24301, 24302] occurrences=1 ok=True
-    m=24199 ne=24198 cons=[24355, 24356] occurrences=1 ok=True
-    m=24255 ne=24254 cons=[24447, 24448] occurrences=1 ok=True
-    m=24273 ne=24272 cons=[24476, 24477] occurrences=1 ok=True
-    m=24289 ne=24288 cons=[24503, 24504] occurrences=1 ok=True
-    m=24296 ne=24295 cons=[24513, 24514] occurrences=1 ok=True
-    m=24302 ne=24301 cons=[24522, 24523] occurrences=1 ok=True
-    m=24322 ne=24321 cons=[24556, 24557] occurrences=1 ok=True
-    m=24328 ne=24327 cons=[24566, 24567] occurrences=1 ok=True
-    m=24340 ne=24339 cons=[24584, 24585] occurrences=1 ok=True
-== withdrawal: sha256 a2b46576733aafbe90b816a26cfe8f40c613d76581fbf9e982026e191fa0c973 (pin OK), 21604 wires, 22222 constraints
-  L-bits site cons [6, 646] bits [21, 275]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 1 wires, all < base: True
-  L-bits site cons [3633, 4273] bits [3484, 3738]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 3 wires, all < base: True
-  L-bits site cons [9153, 9793] bits [8850, 9104]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 3 wires, all < base: True
-  L-bits site cons [17025, 17665] bits [16564, 16818]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 3 wires, all < base: True
+  L-EC premise (inputs on curve): 3040 input points checked, failures 0; distinct points by rule {'alloc': 3, 'output': 1645, 'const': 754, 'boolsel': 5, 'select': 1383}
+  L-neq: 78 helper wires, shape+single-occurrence OK 78, independently re-detected 78, sets equal True
+    m=104 ne=103 cons=[94, 95] occurrences=1 ok=True
+    m=106 ne=105 cons=[96, 97] occurrences=1 ok=True
+    m=17641 ne=17640 cons=[17607, 17608] occurrences=1 ok=True
+    m=18629 ne=18628 cons=[18608, 18609] occurrences=1 ok=True
+    m=18633 ne=18632 cons=[18614, 18615] occurrences=1 ok=True
+    m=18639 ne=18638 cons=[18623, 18624] occurrences=1 ok=True
+    m=18672 ne=18671 cons=[18677, 18678] occurrences=1 ok=True
+    m=18728 ne=18727 cons=[18769, 18770] occurrences=1 ok=True
+    m=18739 ne=18738 cons=[18785, 18786] occurrences=1 ok=True
+    m=18742 ne=18741 cons=[18789, 18790] occurrences=1 ok=True
+    m=18751 ne=18750 cons=[18801, 18802] occurrences=1 ok=True
+    m=18758 ne=18757 cons=[18813, 18814] occurrences=1 ok=True
+    m=18771 ne=18770 cons=[18835, 18836] occurrences=1 ok=True
+    m=18774 ne=18773 cons=[18839, 18840] occurrences=1 ok=True
+    m=18790 ne=18789 cons=[18865, 18866] occurrences=1 ok=True
+    m=18793 ne=18792 cons=[18869, 18870] occurrences=1 ok=True
+    m=18804 ne=18803 cons=[18886, 18887] occurrences=1 ok=True
+    m=18807 ne=18806 cons=[18890, 18891] occurrences=1 ok=True
+    m=18813 ne=18812 cons=[18900, 18901] occurrences=1 ok=True
+    m=18834 ne=18833 cons=[18934, 18935] occurrences=1 ok=True
+    m=19111 ne=19110 cons=[19228, 19229] occurrences=1 ok=True
+    m=19115 ne=19114 cons=[19234, 19235] occurrences=1 ok=True
+    m=19121 ne=19120 cons=[19243, 19244] occurrences=1 ok=True
+    m=19154 ne=19153 cons=[19297, 19298] occurrences=1 ok=True
+    m=19210 ne=19209 cons=[19389, 19390] occurrences=1 ok=True
+    m=19228 ne=19227 cons=[19418, 19419] occurrences=1 ok=True
+    m=19244 ne=19243 cons=[19445, 19446] occurrences=1 ok=True
+    m=19251 ne=19250 cons=[19455, 19456] occurrences=1 ok=True
+    m=19257 ne=19256 cons=[19464, 19465] occurrences=1 ok=True
+    m=19277 ne=19276 cons=[19498, 19499] occurrences=1 ok=True
+    m=19283 ne=19282 cons=[19508, 19509] occurrences=1 ok=True
+    m=19295 ne=19294 cons=[19526, 19527] occurrences=1 ok=True
+    m=23743 ne=23742 cons=[24013, 24014] occurrences=1 ok=True
+    m=23747 ne=23746 cons=[24019, 24020] occurrences=1 ok=True
+    m=23753 ne=23752 cons=[24028, 24029] occurrences=1 ok=True
+    m=23786 ne=23785 cons=[24082, 24083] occurrences=1 ok=True
+    m=23842 ne=23841 cons=[24174, 24175] occurrences=1 ok=True
+    m=23853 ne=23852 cons=[24190, 24191] occurrences=1 ok=True
+    m=23856 ne=23855 cons=[24194, 24195] occurrences=1 ok=True
+    m=23865 ne=23864 cons=[24206, 24207] occurrences=1 ok=True
+    m=23872 ne=23871 cons=[24218, 24219] occurrences=1 ok=True
+    m=23885 ne=23884 cons=[24240, 24241] occurrences=1 ok=True
+    m=23888 ne=23887 cons=[24244, 24245] occurrences=1 ok=True
+    m=23904 ne=23903 cons=[24270, 24271] occurrences=1 ok=True
+    m=23907 ne=23906 cons=[24274, 24275] occurrences=1 ok=True
+    m=23918 ne=23917 cons=[24291, 24292] occurrences=1 ok=True
+    m=23921 ne=23920 cons=[24295, 24296] occurrences=1 ok=True
+    m=23927 ne=23926 cons=[24305, 24306] occurrences=1 ok=True
+    m=23948 ne=23947 cons=[24339, 24340] occurrences=1 ok=True
+    m=24705 ne=24704 cons=[25113, 25114] occurrences=1 ok=True
+    m=24709 ne=24708 cons=[25119, 25120] occurrences=1 ok=True
+    m=24715 ne=24714 cons=[25128, 25129] occurrences=1 ok=True
+    m=24748 ne=24747 cons=[25182, 25183] occurrences=1 ok=True
+    m=24804 ne=24803 cons=[25274, 25275] occurrences=1 ok=True
+    m=24822 ne=24821 cons=[25303, 25304] occurrences=1 ok=True
+    m=24838 ne=24837 cons=[25330, 25331] occurrences=1 ok=True
+    m=24845 ne=24844 cons=[25340, 25341] occurrences=1 ok=True
+    m=24851 ne=24850 cons=[25349, 25350] occurrences=1 ok=True
+    m=24871 ne=24870 cons=[25383, 25384] occurrences=1 ok=True
+    m=24877 ne=24876 cons=[25393, 25394] occurrences=1 ok=True
+    m=24889 ne=24888 cons=[25411, 25412] occurrences=1 ok=True
+    m=29742 ne=29741 cons=[30306, 30307] occurrences=1 ok=True
+    m=29746 ne=29745 cons=[30312, 30313] occurrences=1 ok=True
+    m=29752 ne=29751 cons=[30321, 30322] occurrences=1 ok=True
+    m=29785 ne=29784 cons=[30375, 30376] occurrences=1 ok=True
+    m=29841 ne=29840 cons=[30467, 30468] occurrences=1 ok=True
+    m=29852 ne=29851 cons=[30483, 30484] occurrences=1 ok=True
+    m=29855 ne=29854 cons=[30487, 30488] occurrences=1 ok=True
+    m=29864 ne=29863 cons=[30499, 30500] occurrences=1 ok=True
+    m=29871 ne=29870 cons=[30511, 30512] occurrences=1 ok=True
+    m=29884 ne=29883 cons=[30533, 30534] occurrences=1 ok=True
+    m=29887 ne=29886 cons=[30537, 30538] occurrences=1 ok=True
+    m=29903 ne=29902 cons=[30563, 30564] occurrences=1 ok=True
+    m=29906 ne=29905 cons=[30567, 30568] occurrences=1 ok=True
+    m=29917 ne=29916 cons=[30584, 30585] occurrences=1 ok=True
+    m=29920 ne=29919 cons=[30588, 30589] occurrences=1 ok=True
+    m=29926 ne=29925 cons=[30598, 30599] occurrences=1 ok=True
+    m=29947 ne=29946 cons=[30632, 30633] occurrences=1 ok=True
+== withdrawal: sha256 ad31498f2330687325faec694b11a221194c7790909a092a59964e6382163c4d (pin OK), 22408 wires, 23537 constraints
+  L-bits site cons [132, 772] bits [141, 395]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 1 wires, all < base: True
+  L-bits site cons [4218, 4858] bits [3832, 4086]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 3 wires, all < base: True
+  L-bits site cons [10103, 10743] bits [9426, 9680]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 3 wires, all < base: True
+  L-bits site cons [18340, 18980] bits [17368, 17622]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 3 wires, all < base: True
   L-bits: 1016 bit wires linked; equal to the Picus L-bits input set: True
-  L-EC: 2158 division pairs (4316 denominator constraints), linked 2158, failed 0; kinds {'var+const': 1130, 'var+var': 510, 'double': 514, 'const+var': 4}
-    const+var/ht: {'constraint': 4}
-    const+var/hu: {'folded': 4}
-    const+var/hv0: {'folded': 4}
-    const+var/hv1: {'folded': 4}
-    const+var/hx3: {'constraint': 4}
-    const+var/hy3: {'constraint': 4}
-    double/hx2: {'constraint': 514}
-    double/hx3: {'constraint': 514}
-    double/hxy: {'constraint': 514}
-    double/hy2: {'constraint': 514}
-    double/hy3: {'constraint': 514}
+  L-EC: 2166 division pairs (4332 denominator constraints), linked 2166, failed 0; kinds {'double': 520, 'const+var': 6, 'var+const': 1130, 'var+var': 510}
+    const+var/ht: {'constraint': 6}
+    const+var/hu: {'folded': 6}
+    const+var/hv0: {'folded': 6}
+    const+var/hv1: {'folded': 6}
+    const+var/hx3: {'constraint': 6}
+    const+var/hy3: {'constraint': 6}
+    double/hx2: {'constraint': 520}
+    double/hx3: {'constraint': 520}
+    double/hxy: {'constraint': 520}
+    double/hy2: {'constraint': 520}
+    double/hy3: {'constraint': 520}
     var+const/ht: {'constraint': 1130}
     var+const/hu: {'folded': 1130}
     var+const/hv0: {'folded': 1130}
@@ -83,57 +136,112 @@
     var+var/hv1: {'constraint': 510}
     var+var/hx3: {'constraint': 510}
     var+var/hy3: {'constraint': 510}
-  L-EC premise (inputs on curve): 3802 input points checked, failures 0; distinct points by rule {'boolsel': 5, 'const': 754, 'output': 2151, 'select': 1636, 'alloc': 4}
-  L-neq: 49 helper wires, shape+single-occurrence OK 49, independently re-detected 49, sets equal True
-    m=293 ne=292 cons=[290, 291] occurrences=1 ok=True
-    m=297 ne=296 cons=[296, 297] occurrences=1 ok=True
-    m=303 ne=302 cons=[305, 306] occurrences=1 ok=True
-    m=336 ne=335 cons=[359, 360] occurrences=1 ok=True
-    m=392 ne=391 cons=[451, 452] occurrences=1 ok=True
-    m=410 ne=409 cons=[480, 481] occurrences=1 ok=True
-    m=426 ne=425 cons=[507, 508] occurrences=1 ok=True
-    m=433 ne=432 cons=[517, 518] occurrences=1 ok=True
-    m=439 ne=438 cons=[526, 527] occurrences=1 ok=True
-    m=459 ne=458 cons=[560, 561] occurrences=1 ok=True
-    m=465 ne=464 cons=[570, 571] occurrences=1 ok=True
-    m=477 ne=476 cons=[588, 589] occurrences=1 ok=True
-    m=2514 ne=2513 cons=[2661, 2662] occurrences=1 ok=True
-    m=3756 ne=3755 cons=[3917, 3918] occurrences=1 ok=True
-    m=3760 ne=3759 cons=[3923, 3924] occurrences=1 ok=True
-    m=3766 ne=3765 cons=[3932, 3933] occurrences=1 ok=True
-    m=3799 ne=3798 cons=[3986, 3987] occurrences=1 ok=True
-    m=3855 ne=3854 cons=[4078, 4079] occurrences=1 ok=True
-    m=3873 ne=3872 cons=[4107, 4108] occurrences=1 ok=True
-    m=3889 ne=3888 cons=[4134, 4135] occurrences=1 ok=True
-    m=3896 ne=3895 cons=[4144, 4145] occurrences=1 ok=True
-    m=3902 ne=3901 cons=[4153, 4154] occurrences=1 ok=True
-    m=3922 ne=3921 cons=[4187, 4188] occurrences=1 ok=True
-    m=3928 ne=3927 cons=[4197, 4198] occurrences=1 ok=True
-    m=3940 ne=3939 cons=[4215, 4216] occurrences=1 ok=True
-    m=9122 ne=9121 cons=[9437, 9438] occurrences=1 ok=True
-    m=9126 ne=9125 cons=[9443, 9444] occurrences=1 ok=True
-    m=9132 ne=9131 cons=[9452, 9453] occurrences=1 ok=True
-    m=9165 ne=9164 cons=[9506, 9507] occurrences=1 ok=True
-    m=9221 ne=9220 cons=[9598, 9599] occurrences=1 ok=True
-    m=9239 ne=9238 cons=[9627, 9628] occurrences=1 ok=True
-    m=9255 ne=9254 cons=[9654, 9655] occurrences=1 ok=True
-    m=9262 ne=9261 cons=[9664, 9665] occurrences=1 ok=True
-    m=9268 ne=9267 cons=[9673, 9674] occurrences=1 ok=True
-    m=9288 ne=9287 cons=[9707, 9708] occurrences=1 ok=True
-    m=9294 ne=9293 cons=[9717, 9718] occurrences=1 ok=True
-    m=9306 ne=9305 cons=[9735, 9736] occurrences=1 ok=True
-    m=16836 ne=16835 cons=[17309, 17310] occurrences=1 ok=True
-    m=16840 ne=16839 cons=[17315, 17316] occurrences=1 ok=True
-    m=16846 ne=16845 cons=[17324, 17325] occurrences=1 ok=True
-    m=16879 ne=16878 cons=[17378, 17379] occurrences=1 ok=True
-    m=16935 ne=16934 cons=[17470, 17471] occurrences=1 ok=True
-    m=16953 ne=16952 cons=[17499, 17500] occurrences=1 ok=True
-    m=16969 ne=16968 cons=[17526, 17527] occurrences=1 ok=True
-    m=16976 ne=16975 cons=[17536, 17537] occurrences=1 ok=True
-    m=16982 ne=16981 cons=[17545, 17546] occurrences=1 ok=True
-    m=17002 ne=17001 cons=[17579, 17580] occurrences=1 ok=True
-    m=17008 ne=17007 cons=[17589, 17590] occurrences=1 ok=True
-    m=17020 ne=17019 cons=[17607, 17608] occurrences=1 ok=True
+  L-EC premise (inputs on curve): 3812 input points checked, failures 0; distinct points by rule {'alloc': 6, 'output': 2157, 'const': 754, 'boolsel': 5, 'select': 1636}
+  L-neq: 104 helper wires, shape+single-occurrence OK 104, independently re-detected 104, sets equal True
+    m=108 ne=107 cons=[94, 95] occurrences=1 ok=True
+    m=110 ne=109 cons=[96, 97] occurrences=1 ok=True
+    m=137 ne=136 cons=[126, 127] occurrences=1 ok=True
+    m=139 ne=138 cons=[128, 129] occurrences=1 ok=True
+    m=413 ne=412 cons=[416, 417] occurrences=1 ok=True
+    m=417 ne=416 cons=[422, 423] occurrences=1 ok=True
+    m=423 ne=422 cons=[431, 432] occurrences=1 ok=True
+    m=456 ne=455 cons=[485, 486] occurrences=1 ok=True
+    m=512 ne=511 cons=[577, 578] occurrences=1 ok=True
+    m=530 ne=529 cons=[606, 607] occurrences=1 ok=True
+    m=546 ne=545 cons=[633, 634] occurrences=1 ok=True
+    m=553 ne=552 cons=[643, 644] occurrences=1 ok=True
+    m=559 ne=558 cons=[652, 653] occurrences=1 ok=True
+    m=579 ne=578 cons=[686, 687] occurrences=1 ok=True
+    m=585 ne=584 cons=[696, 697] occurrences=1 ok=True
+    m=597 ne=596 cons=[714, 715] occurrences=1 ok=True
+    m=2634 ne=2633 cons=[2881, 2882] occurrences=1 ok=True
+    m=3622 ne=3621 cons=[3882, 3883] occurrences=1 ok=True
+    m=3626 ne=3625 cons=[3888, 3889] occurrences=1 ok=True
+    m=3632 ne=3631 cons=[3897, 3898] occurrences=1 ok=True
+    m=3665 ne=3664 cons=[3951, 3952] occurrences=1 ok=True
+    m=3721 ne=3720 cons=[4043, 4044] occurrences=1 ok=True
+    m=3732 ne=3731 cons=[4059, 4060] occurrences=1 ok=True
+    m=3735 ne=3734 cons=[4063, 4064] occurrences=1 ok=True
+    m=3744 ne=3743 cons=[4075, 4076] occurrences=1 ok=True
+    m=3751 ne=3750 cons=[4087, 4088] occurrences=1 ok=True
+    m=3764 ne=3763 cons=[4109, 4110] occurrences=1 ok=True
+    m=3767 ne=3766 cons=[4113, 4114] occurrences=1 ok=True
+    m=3783 ne=3782 cons=[4139, 4140] occurrences=1 ok=True
+    m=3786 ne=3785 cons=[4143, 4144] occurrences=1 ok=True
+    m=3797 ne=3796 cons=[4160, 4161] occurrences=1 ok=True
+    m=3800 ne=3799 cons=[4164, 4165] occurrences=1 ok=True
+    m=3806 ne=3805 cons=[4174, 4175] occurrences=1 ok=True
+    m=3827 ne=3826 cons=[4208, 4209] occurrences=1 ok=True
+    m=4104 ne=4103 cons=[4502, 4503] occurrences=1 ok=True
+    m=4108 ne=4107 cons=[4508, 4509] occurrences=1 ok=True
+    m=4114 ne=4113 cons=[4517, 4518] occurrences=1 ok=True
+    m=4147 ne=4146 cons=[4571, 4572] occurrences=1 ok=True
+    m=4203 ne=4202 cons=[4663, 4664] occurrences=1 ok=True
+    m=4221 ne=4220 cons=[4692, 4693] occurrences=1 ok=True
+    m=4237 ne=4236 cons=[4719, 4720] occurrences=1 ok=True
+    m=4244 ne=4243 cons=[4729, 4730] occurrences=1 ok=True
+    m=4250 ne=4249 cons=[4738, 4739] occurrences=1 ok=True
+    m=4270 ne=4269 cons=[4772, 4773] occurrences=1 ok=True
+    m=4276 ne=4275 cons=[4782, 4783] occurrences=1 ok=True
+    m=4288 ne=4287 cons=[4800, 4801] occurrences=1 ok=True
+    m=8736 ne=8735 cons=[9287, 9288] occurrences=1 ok=True
+    m=8740 ne=8739 cons=[9293, 9294] occurrences=1 ok=True
+    m=8746 ne=8745 cons=[9302, 9303] occurrences=1 ok=True
+    m=8779 ne=8778 cons=[9356, 9357] occurrences=1 ok=True
+    m=8835 ne=8834 cons=[9448, 9449] occurrences=1 ok=True
+    m=8846 ne=8845 cons=[9464, 9465] occurrences=1 ok=True
+    m=8849 ne=8848 cons=[9468, 9469] occurrences=1 ok=True
+    m=8858 ne=8857 cons=[9480, 9481] occurrences=1 ok=True
+    m=8865 ne=8864 cons=[9492, 9493] occurrences=1 ok=True
+    m=8878 ne=8877 cons=[9514, 9515] occurrences=1 ok=True
+    m=8881 ne=8880 cons=[9518, 9519] occurrences=1 ok=True
+    m=8897 ne=8896 cons=[9544, 9545] occurrences=1 ok=True
+    m=8900 ne=8899 cons=[9548, 9549] occurrences=1 ok=True
+    m=8911 ne=8910 cons=[9565, 9566] occurrences=1 ok=True
+    m=8914 ne=8913 cons=[9569, 9570] occurrences=1 ok=True
+    m=8920 ne=8919 cons=[9579, 9580] occurrences=1 ok=True
+    m=8941 ne=8940 cons=[9613, 9614] occurrences=1 ok=True
+    m=9698 ne=9697 cons=[10387, 10388] occurrences=1 ok=True
+    m=9702 ne=9701 cons=[10393, 10394] occurrences=1 ok=True
+    m=9708 ne=9707 cons=[10402, 10403] occurrences=1 ok=True
+    m=9741 ne=9740 cons=[10456, 10457] occurrences=1 ok=True
+    m=9797 ne=9796 cons=[10548, 10549] occurrences=1 ok=True
+    m=9815 ne=9814 cons=[10577, 10578] occurrences=1 ok=True
+    m=9831 ne=9830 cons=[10604, 10605] occurrences=1 ok=True
+    m=9838 ne=9837 cons=[10614, 10615] occurrences=1 ok=True
+    m=9844 ne=9843 cons=[10623, 10624] occurrences=1 ok=True
+    m=9864 ne=9863 cons=[10657, 10658] occurrences=1 ok=True
+    m=9870 ne=9869 cons=[10667, 10668] occurrences=1 ok=True
+    m=9882 ne=9881 cons=[10685, 10686] occurrences=1 ok=True
+    m=16678 ne=16677 cons=[17524, 17525] occurrences=1 ok=True
+    m=16682 ne=16681 cons=[17530, 17531] occurrences=1 ok=True
+    m=16688 ne=16687 cons=[17539, 17540] occurrences=1 ok=True
+    m=16721 ne=16720 cons=[17593, 17594] occurrences=1 ok=True
+    m=16777 ne=16776 cons=[17685, 17686] occurrences=1 ok=True
+    m=16788 ne=16787 cons=[17701, 17702] occurrences=1 ok=True
+    m=16791 ne=16790 cons=[17705, 17706] occurrences=1 ok=True
+    m=16800 ne=16799 cons=[17717, 17718] occurrences=1 ok=True
+    m=16807 ne=16806 cons=[17729, 17730] occurrences=1 ok=True
+    m=16820 ne=16819 cons=[17751, 17752] occurrences=1 ok=True
+    m=16823 ne=16822 cons=[17755, 17756] occurrences=1 ok=True
+    m=16839 ne=16838 cons=[17781, 17782] occurrences=1 ok=True
+    m=16842 ne=16841 cons=[17785, 17786] occurrences=1 ok=True
+    m=16853 ne=16852 cons=[17802, 17803] occurrences=1 ok=True
+    m=16856 ne=16855 cons=[17806, 17807] occurrences=1 ok=True
+    m=16862 ne=16861 cons=[17816, 17817] occurrences=1 ok=True
+    m=16883 ne=16882 cons=[17850, 17851] occurrences=1 ok=True
+    m=17640 ne=17639 cons=[18624, 18625] occurrences=1 ok=True
+    m=17644 ne=17643 cons=[18630, 18631] occurrences=1 ok=True
+    m=17650 ne=17649 cons=[18639, 18640] occurrences=1 ok=True
+    m=17683 ne=17682 cons=[18693, 18694] occurrences=1 ok=True
+    m=17739 ne=17738 cons=[18785, 18786] occurrences=1 ok=True
+    m=17757 ne=17756 cons=[18814, 18815] occurrences=1 ok=True
+    m=17773 ne=17772 cons=[18841, 18842] occurrences=1 ok=True
+    m=17780 ne=17779 cons=[18851, 18852] occurrences=1 ok=True
+    m=17786 ne=17785 cons=[18860, 18861] occurrences=1 ok=True
+    m=17806 ne=17805 cons=[18894, 18895] occurrences=1 ok=True
+    m=17812 ne=17811 cons=[18904, 18905] occurrences=1 ok=True
+    m=17824 ne=17823 cons=[18922, 18923] occurrences=1 ok=True
 == transition: sha256 a9cd49c195bd2d6e80664672f0994542baa12aa661e8e93bd9563f3bed8ad1c1 (pin OK), 31845 wires, 31810 constraints
   L-bits: 0 bit wires linked; equal to the Picus L-bits input set: True
   L-EC: 0 division pairs (0 denominator constraints), linked 0, failed 0; kinds {}

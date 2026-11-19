@@ -53,10 +53,14 @@ Solana-only root transition uses the separate
 single-party ceremonies; the old request/withdrawal keys predate the hardening
 and cannot be adopted for these circuits. See [note-bound commitments](docs/note-bound-commitments.md),
 [transition setup provenance](protocol/setup/solana-transition-v1/README.md),
-and [Solana server invariants](docs/SOLANA_SERVER.md). The Picus and Lean results in
-[circuit verification](verification/README.md) are pinned to the round-1 r1cs,
-not the hardened request/withdrawal r1cs used in [ceremony round 2](ceremony/PARTICIPATE.md).
-Those checks have not been rerun on the hardened circuits; transition is byte-identical.
+and [Solana server invariants](docs/SOLANA_SERVER.md). The Picus and Lean
+[circuit verification](verification/README.md) is pinned to the hardened request/withdrawal
+r1cs used in [ceremony round 2](ceremony/PARTICIPATE.md); transition is byte-identical.
+`verification/rebuild.sh` reproduces it: all 790 Picus slices SAFE, 0 composed wires unproven,
+all 8 negative controls rejected. It shows under-constraint freedom only (every wire fixed by the
+public and private inputs, up to the residuals listed there), not equivalence to the spec.
+Residuals C1–C3 remain, all Info; C4 (non-canonical scalars) is resolved. Ecne has not been
+rerun on the hardened circuits.
 
 ## Build and test
 

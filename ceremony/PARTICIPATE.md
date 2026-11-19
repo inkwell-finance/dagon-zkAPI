@@ -120,10 +120,11 @@ reads the code, the "you must trust the server's code" caveat below disappears.
   (`snarkjs zkey verify` against the r1cs and Powers of Tau) before it is accepted.
 - Attestation = sha256 of `dagon-zkapi-ceremony-v1\nround:<n>\n` followed by `<circuit>:<contribution hash>\n` for
   each circuit in order.
-- Circuit verification: Picus plus Lean-proved lemmas showed every wire is fixed by the public and private inputs
-  for the round-1 r1cs; those results (`verification/results/`) are pinned to the round-1 hashes and have not yet been
-  re-run on the hardened request/withdrawal r1cs (transition is byte-identical). See `verification/README.md`;
-  reproduce with `verification/rebuild.sh`.
+- Circuit verification: Picus plus Lean-proved lemmas show every wire of the hardened request/withdrawal r1cs
+  (and the byte-identical transition r1cs) is fixed by the public and private inputs, up to documented Info-level
+  residuals (C1–C3; C4 resolved). This rules out under-constraint only; it is not a proof that the circuits match the
+  spec, and Ecne was not rerun on them. Reproduce with `verification/rebuild.sh` (790/790 Picus SAFE, 0 unproven
+  wires, 8/8 negative controls rejected); details in `verification/README.md`.
 - Source: <https://github.com/inkwell-finance/dagon-zkAPI/tree/be7405c/ceremony>. Design and operator guide:
   `ceremony/README.md`.
 

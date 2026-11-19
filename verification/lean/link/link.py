@@ -28,8 +28,8 @@ from collections import Counter, defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PINS = {
-    'request': 'ed73c7919790d3cb75e9fc60373aa7ac3c5fb4820c43f2364451ebfdb7f14566',
-    'withdrawal': 'a2b46576733aafbe90b816a26cfe8f40c613d76581fbf9e982026e191fa0c973',
+    'request': '595545d3ef56eb2bbbbefdb8943aa85ba45d2c79340f94bf75de6ea05452945d',
+    'withdrawal': 'ad31498f2330687325faec694b11a221194c7790909a092a59964e6382163c4d',
     'transition': 'a9cd49c195bd2d6e80664672f0994542baa12aa661e8e93bd9563f3bed8ad1c1',
 }
 sys.path.insert(0, os.path.join(HERE, '..', '..', 'tools'))

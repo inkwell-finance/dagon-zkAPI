@@ -1,17 +1,17 @@
 {
  "request": {
   "public": 13,
-  "picus-v6": 29702,
-  "free": 1143,
-  "is_neq-multiplier": 25,
+  "picus-v6": 30424,
+  "free": 1145,
+  "is_neq-multiplier": 78,
   "L-bits": 508
  },
  "withdrawal": {
   "public": 17,
-  "picus-v6": 19762,
+  "picus-v6": 20507,
   "L-bits": 1016,
-  "is_neq-multiplier": 49,
-  "free": 760
+  "is_neq-multiplier": 104,
+  "free": 764
  },
  "transition": {
   "public": 11,

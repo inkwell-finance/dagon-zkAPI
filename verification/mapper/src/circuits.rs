@@ -1,8 +1,7 @@
-//! Instrumented, byte-identical copies of the three zkAPI synthesizers in
-//! protocol/rust/crates/zkapi-proof/src/groth16.rs (commit d05a8e3).
-//! The only additions are `sec`/`free` calls, which read counters and never
-//! touch the constraint system. main.rs asserts the exported r1cs bytes hash to
-//! the ceremony pins, which proves the copies are exact.
+//! Instrumented copies of the hardened zkAPI synthesizers and helper gadgets.
+//! Source: protocol/rust/crates/zkapi-proof/src/groth16.rs, zkapi-v2-hardening-v1.
+//! Function bodies are verbatim except counter-only sec()/free() markers.
+//! main.rs rejects any exported R1CS bytes that differ from the ceremony pins.
 
 use std::cell::RefCell;
 use std::ops::Not;
@@ -13,7 +12,7 @@ use ark_crypto_primitives::sponge::constraints::CryptographicSpongeVar;
 use ark_crypto_primitives::sponge::poseidon::constraints::PoseidonSpongeVar;
 use ark_crypto_primitives::sponge::poseidon::{find_poseidon_ark_and_mds, PoseidonConfig};
 use ark_ec::PrimeGroup;
-use ark_ed_on_bn254::{constraints::EdwardsVar, EdwardsProjective, Fr as EdwardsScalarField};
+use ark_ed_on_bn254::{constraints::EdwardsVar, EdwardsAffine, EdwardsProjective, Fr as EdwardsScalarField};
 use ark_ff::{BigInteger, Field, PrimeField};
 use ark_r1cs_std::alloc::AllocVar;
 use ark_r1cs_std::boolean::Boolean;
@@ -26,15 +25,16 @@ use ark_r1cs_std::groups::CurveVar;
 use ark_r1cs_std::prelude::{UInt128, UInt32, UInt64};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 use zkapi_proof::groth16::{
-    balance_blinding_generator, note_binding_generator, RequestCircuit, SolanaTransitionCircuit,
+    balance_blinding_generator, note_binding_generator, packed_note_fields,
+    RequestCircuit, RequestPublic, RequestWitness, SolanaTransitionCircuit,
+    SolanaTransitionPublic, SolanaTransitionWitness, WithdrawalPublic, WithdrawalWitness,
     StateSignature, WithdrawalCircuit,
 };
+use ark_r1cs_std::R1CSVar;
 
 #[derive(Clone, Debug)]
 pub enum Mark {
-    /// Start of a source-level section: (label, witness count, constraint count).
     Section(String, usize, usize),
-    /// Witness indices [start, end) are prover-chosen free values.
     Free(String, usize, usize),
 }
 
@@ -42,22 +42,36 @@ thread_local! {
     pub static MARKS: RefCell<Vec<Mark>> = const { RefCell::new(Vec::new()) };
 }
 
-fn nw(cs: &ConstraintSystemRef<CircuitField>) -> usize {
-    cs.num_witness_variables()
+fn label(label: &str, marks: &[Mark]) -> String {
+    if label.contains('/') {
+        label.to_string()
+    } else {
+        let circuit = marks.iter().find_map(|m| match m {
+            Mark::Section(s, _, _) => s.split('/').next(),
+            _ => None,
+        }).unwrap_or("gadget");
+        format!("{circuit}/{label}")
+    }
 }
 
-fn sec(cs: &ConstraintSystemRef<CircuitField>, label: &str) {
-    let m = Mark::Section(label.to_string(), cs.num_witness_variables(), cs.num_constraints());
-    MARKS.with(|v| v.borrow_mut().push(m));
+fn sec(cs: &ConstraintSystemRef<CircuitField>, name: &str) {
+    MARKS.with(|v| {
+        let mut marks = v.borrow_mut();
+        let name = label(name, &marks);
+        marks.push(Mark::Section(name, cs.num_witness_variables(), cs.num_constraints()));
+    });
 }
 
-fn free(cs: &ConstraintSystemRef<CircuitField>, label: &str, start: usize, len: Option<usize>) {
-    let end = match len {
-        Some(n) => start + n,
-        None => cs.num_witness_variables(),
-    };
-    MARKS.with(|v| v.borrow_mut().push(Mark::Free(label.to_string(), start, end)));
+// Mark only the next n input wires, never the allocator's derived helper wires.
+fn free(cs: &ConstraintSystemRef<CircuitField>, name: &str, n: usize) {
+    MARKS.with(|v| {
+        let mut marks = v.borrow_mut();
+        let name = label(name, &marks);
+        let start = cs.num_witness_variables();
+        marks.push(Mark::Free(name, start, start + n));
+    });
 }
+
 
 const DOMAIN_REG: &[u8] = b"zkapi.v2.reg";
 const DOMAIN_LEAF: &[u8] = b"zkapi.v2.leaf";
@@ -111,22 +125,63 @@ fn domain_var(label: &[u8]) -> FpVar<CircuitField> {
     FpVar::Constant(domain(label))
 }
 
-fn scalar_bits_witness(
+/// Allocates a 251-bit Baby-JubJub scalar and bounds it by `r-1`, so every
+/// scalar has one witness. Takes the integer so tests can supply `r` itself.
+pub(crate) fn scalar_bits_witness(
     cs: ConstraintSystemRef<CircuitField>,
-    value: EdwardsScalarField,
-    label: &str,
+    value: <EdwardsScalarField as PrimeField>::BigInt,
 ) -> Result<Vec<Boolean<CircuitField>>, SynthesisError> {
-    let w0 = nw(&cs);
-    let native_bits = value.into_bigint().to_bits_le();
-    let out = (0..EdwardsScalarField::MODULUS_BIT_SIZE as usize)
+    sec(&cs, "L275 scalar bits");
+    let native_bits = value.to_bits_le();
+    free(&cs, "scalar bits", 251);
+    let bits = (0..EdwardsScalarField::MODULUS_BIT_SIZE as usize)
         .map(|index| {
             Boolean::new_witness(cs.clone(), || {
                 Ok(native_bits.get(index).copied().unwrap_or(false))
             })
         })
-        .collect();
-    free(&cs, label, w0, None);
-    out
+        .collect::<Result<Vec<_>, _>>()?;
+    sec(&cs, "L283 scalar bound");
+    Boolean::enforce_smaller_or_equal_than_le(&bits, (-EdwardsScalarField::ONE).into_bigint())?;
+    Ok(bits)
+}
+
+/// Input allocation checks the curve equation, but not subgroup membership.
+/// A subgroup witness equal to the input proves membership cheaply: arkworks
+/// allocates its cofactor preimage and multiplies by eight. Reject the identity,
+/// whose Schnorr signatures can be forged without a signing secret.
+fn signing_key_input(
+    cs: ConstraintSystemRef<CircuitField>,
+    point: EdwardsAffine,
+) -> Result<EdwardsVar, SynthesisError> {
+    sec(&cs, "L295 public signing key on-curve");
+    let input = EdwardsVar::new_input(cs.clone(), || Ok(point))?;
+    sec(&cs, "L296 signing key Q witness");
+    free(&cs, "signing key Q pre-cofactor point", 2);
+    let subgroup = EdwardsVar::new_witness(cs, || Ok(point))?;
+    sec(&input.cs(), "L297 signing key subgroup equality");
+    input.enforce_equal(&subgroup)?;
+    sec(&input.cs(), "L298 signing key nonidentity");
+    input.is_zero()?.enforce_equal(&Boolean::FALSE)?;
+    Ok(input)
+}
+
+fn enforce_deployment(
+    cs: ConstraintSystemRef<CircuitField>,
+    version: &FpVar<CircuitField>,
+    chain: &FpVar<CircuitField>,
+    chain_value: u64,
+    binding: &FpVar<CircuitField>,
+) -> Result<(), SynthesisError> {
+    sec(&cs, "L309 deployment");
+    version.enforce_equal(&FpVar::Constant(CircuitField::from(2u64)))?;
+    sec(&cs, "L310 chain UInt64");
+    UInt64::new_witness(cs, || Ok(chain_value))?.to_fp()?.enforce_equal(chain)?;
+    sec(&chain.cs(), "L311 chain nonzero");
+    chain.enforce_not_equal(&FpVar::zero())?;
+    // Deployment bindings are canonical BN254 field elements, not EVM addresses.
+    sec(&binding.cs(), "L313 binding nonzero");
+    binding.enforce_not_equal(&FpVar::zero())
 }
 
 fn commitment_var(
@@ -134,25 +189,18 @@ fn commitment_var(
     balance: &UInt128<CircuitField>,
     blinding: EdwardsScalarField,
     note_leaf: &FpVar<CircuitField>,
-    p: &str,
 ) -> Result<EdwardsVar, SynthesisError> {
     let g = EdwardsVar::new_constant(cs.clone(), EdwardsProjective::generator())?;
     let h = EdwardsVar::new_constant(cs.clone(), balance_blinding_generator())?;
     let j = EdwardsVar::new_constant(cs.clone(), note_binding_generator())?;
-    sec(&cs, &format!("{p}/L283 commitment_var: blinding bits (scalar_bits_witness)"));
-    let blinding_bits = scalar_bits_witness(cs.clone(), blinding, &format!("{p} blinding bits"))?;
-    sec(&cs, &format!("{p}/L285 commitment_var: note_leaf.to_bits_le"));
+    sec(&cs, "L325 blinding bits");
+    let blinding_bits = scalar_bits_witness(cs, blinding.into_bigint())?;
+    sec(&note_leaf.cs(), "L326 note_leaf.to_bits_le");
     let note_bits = note_leaf.to_bits_le()?;
-    sec(&cs, &format!("{p}/L286 commitment_var: G*balance"));
-    let a = g.scalar_mul_le(balance.bits.iter())?;
-    sec(&cs, &format!("{p}/L287 commitment_var: H*blinding"));
-    let b = h.scalar_mul_le(blinding_bits.iter())?;
-    sec(&cs, &format!("{p}/L286-287 commitment_var: G*balance + H*blinding"));
-    let ab = a + b;
-    sec(&cs, &format!("{p}/L288 commitment_var: J*leaf"));
-    let c = j.scalar_mul_le(note_bits.iter())?;
-    sec(&cs, &format!("{p}/L288 commitment_var: (..) + J*leaf"));
-    Ok(ab + c)
+    sec(&note_leaf.cs(), "L327 G*balance + H*blinding + J*leaf");
+    Ok(g.scalar_mul_le(balance.bits.iter())?
+        + h.scalar_mul_le(blinding_bits.iter())?
+        + j.scalar_mul_le(note_bits.iter())?)
 }
 
 fn enforce_signature(
@@ -161,15 +209,13 @@ fn enforce_signature(
     message: &FpVar<CircuitField>,
     signature: StateSignature,
     condition: &Boolean<CircuitField>,
-    p: &str,
 ) -> Result<(), SynthesisError> {
-    sec(&cs, &format!("{p}/L298 enforce_signature: R witness (cofactor-cleared alloc)"));
-    let w0 = nw(&cs);
+    sec(&cs, "L339 R witness");
+    free(&cs, "signature R pre-cofactor point", 2);
     let r = EdwardsVar::new_witness(cs.clone(), || Ok(signature.r))?;
-    free(&cs, &format!("{p} signature R pre-cofactor point (x,y)"), w0, Some(2));
-    sec(&cs, &format!("{p}/L299 enforce_signature: s bits"));
-    let s_bits = scalar_bits_witness(cs.clone(), signature.s, &format!("{p} signature s bits"))?;
-    sec(&cs, &format!("{p}/L300 enforce_signature: challenge Poseidon"));
+    sec(&cs, "L340 signature s bits");
+    let s_bits = scalar_bits_witness(cs.clone(), signature.s.into_bigint())?;
+    sec(&cs, "L341 signature challenge Poseidon");
     let challenge_hash = poseidon_hash_var(
         cs.clone(),
         &[
@@ -179,16 +225,14 @@ fn enforce_signature(
             message.clone(),
         ],
     )?;
-    sec(&cs, &format!("{p}/L309 enforce_signature: challenge.to_bits_le"));
+    sec(&cs, "L350 challenge.to_bits_le");
     let challenge_bits = challenge_hash.to_bits_le()?;
-    let g = EdwardsVar::new_constant(cs.clone(), EdwardsProjective::generator())?;
-    sec(&cs, &format!("{p}/L311 enforce_signature: G*s"));
+    let g = EdwardsVar::new_constant(cs, EdwardsProjective::generator())?;
+    sec(&public_key.cs(), "L352 G*s");
     let lhs = g.scalar_mul_le(s_bits.iter())?;
-    sec(&cs, &format!("{p}/L312 enforce_signature: PK*challenge"));
-    let pkc = public_key.scalar_mul_le(challenge_bits.iter())?;
-    sec(&cs, &format!("{p}/L312 enforce_signature: R + PK*c"));
-    let rhs = r + pkc;
-    sec(&cs, &format!("{p}/L313 enforce_signature: conditional_enforce_equal"));
+    sec(&public_key.cs(), "L353 R + PK*challenge");
+    let rhs = r + public_key.scalar_mul_le(challenge_bits.iter())?;
+    sec(&public_key.cs(), "L354 signature equality");
     lhs.conditional_enforce_equal(&rhs, condition)
 }
 
@@ -198,106 +242,108 @@ fn enforce_anchor_chain(
     note_id: &FpVar<CircuitField>,
     anchor: &FpVar<CircuitField>,
     prev_anchor: CircuitField,
-    p: &str,
 ) -> Result<Boolean<CircuitField>, SynthesisError> {
-    sec(&cs, &format!("{p}/L830 anchor_chain: is_genesis = anchor.is_eq(1)"));
+    sec(&cs, "L879 anchor.is_eq");
     let is_genesis = anchor.is_eq(&FpVar::one())?;
-    sec(&cs, &format!("{p}/L831 anchor_chain: previous anchor witness"));
-    let w0 = nw(&cs);
+    sec(&cs, "L880 previous anchor");
+    free(&cs, "prev_anchor", 1);
     let previous = FpVar::new_witness(cs.clone(), || Ok(prev_anchor))?;
-    free(&cs, &format!("{p} prev_anchor"), w0, None);
-    sec(&cs, &format!("{p}/L832 anchor_chain: previous_nullifier Poseidon"));
+    sec(&cs, "L881 previous nullifier Poseidon");
     let previous_nullifier = poseidon_hash_var(cs.clone(), &[
         domain_var(DOMAIN_NULLIFIER), secret.clone(), note_id.clone(), previous,
     ])?;
-    sec(&cs, &format!("{p}/L835 anchor_chain: derived_anchor Poseidon"));
-    let derived_anchor = poseidon_hash_var(cs.clone(), &[domain_var(DOMAIN_ANCHOR), previous_nullifier])?;
-    sec(&cs, &format!("{p}/L836 anchor_chain: conditional_enforce_equal"));
+    sec(&cs, "L884 derived anchor Poseidon");
+    let derived_anchor = poseidon_hash_var(cs, &[domain_var(DOMAIN_ANCHOR), previous_nullifier])?;
+    sec(&anchor.cs(), "L885 anchor equality");
     anchor.conditional_enforce_equal(&derived_anchor, &is_genesis.clone().not())?;
     Ok(is_genesis)
 }
 
-pub struct MarkedRequest(pub RequestCircuit);
-pub struct MarkedWithdrawal(pub WithdrawalCircuit);
-pub struct MarkedTransition(pub SolanaTransitionCircuit);
+pub struct MarkedRequest {
+    pub public: RequestPublic,
+    pub witness: RequestWitness,
+}
+
+impl From<RequestCircuit> for MarkedRequest {
+    fn from(c: RequestCircuit) -> Self {
+        Self { public: c.public, witness: c.witness }
+    }
+}
 
 impl ConstraintSynthesizer<CircuitField> for MarkedRequest {
     fn generate_constraints(
         self,
         cs: ConstraintSystemRef<CircuitField>,
     ) -> Result<(), SynthesisError> {
-        let s = self.0;
-        let p = "request";
-        sec(&cs, "request/L376-394 public inputs");
+        sec(&cs, "request/L417 public inputs");
         let protocol_version = FpVar::new_input(cs.clone(), || {
-            Ok(CircuitField::from(s.public.protocol_version as u64))
+            Ok(CircuitField::from(self.public.protocol_version as u64))
         })?;
         let chain_id =
-            FpVar::new_input(cs.clone(), || Ok(CircuitField::from(s.public.chain_id)))?;
-        let contract_address = FpVar::new_input(cs.clone(), || Ok(s.public.contract_address))?;
-        let active_root = FpVar::new_input(cs.clone(), || Ok(s.public.active_root))?;
+            FpVar::new_input(cs.clone(), || Ok(CircuitField::from(self.public.chain_id)))?;
+        let contract_address = FpVar::new_input(cs.clone(), || Ok(self.public.contract_address))?;
+        sec(&cs, "request/L423 deployment");
+        enforce_deployment(cs.clone(), &protocol_version, &chain_id,
+            self.public.chain_id, &contract_address)?;
+        sec(&cs, "request/L425 public inputs");
+        let active_root = FpVar::new_input(cs.clone(), || Ok(self.public.active_root))?;
         let state_signing_key =
-            EdwardsVar::new_input(cs.clone(), || Ok(s.public.state_signing_key))?;
+            signing_key_input(cs.clone(), self.public.state_signing_key)?;
+        sec(&cs, "request/L428 public inputs");
         let request_time_field = FpVar::new_input(cs.clone(), || {
-            Ok(CircuitField::from(s.public.request_time))
+            Ok(CircuitField::from(self.public.request_time))
         })?;
         let solvency_bound_field = FpVar::new_input(cs.clone(), || {
-            Ok(CircuitField::from(s.public.solvency_bound))
+            Ok(CircuitField::from(self.public.solvency_bound))
         })?;
-        let request_nullifier = FpVar::new_input(cs.clone(), || Ok(s.public.request_nullifier))?;
-        let authorization_tag = FpVar::new_input(cs.clone(), || Ok(s.public.authorization_tag))?;
+        let request_nullifier = FpVar::new_input(cs.clone(), || Ok(self.public.request_nullifier))?;
+        let authorization_tag = FpVar::new_input(cs.clone(), || Ok(self.public.authorization_tag))?;
         let anonymous_commitment =
-            EdwardsVar::new_input(cs.clone(), || Ok(s.public.anonymous_commitment))?;
+            EdwardsVar::new_input(cs.clone(), || Ok(self.public.anonymous_commitment))?;
 
-        sec(&cs, "request/L396 secret witness");
-        let w0 = nw(&cs);
-        let secret = FpVar::new_witness(cs.clone(), || Ok(s.witness.secret))?;
-        free(&cs, "request secret", w0, None);
-        sec(&cs, "request/L397 secret != 0");
+        sec(&cs, "request/L439 secret witness");
+        free(&cs, "secret", 1);
+        let secret = FpVar::new_witness(cs.clone(), || Ok(self.witness.secret))?;
+        sec(&cs, "request/L440 secret nonzero");
         secret.enforce_not_equal(&FpVar::zero())?;
-        sec(&cs, "request/L398 request_context witness");
-        let w0 = nw(&cs);
-        let request_context = FpVar::new_witness(cs.clone(), || Ok(s.witness.request_context))?;
-        free(&cs, "request request_context", w0, None);
-        sec(&cs, "request/L399 note_id UInt32 witness");
-        let w0 = nw(&cs);
-        let note_id = UInt32::new_witness(cs.clone(), || Ok(s.witness.note_id))?;
-        free(&cs, "request note_id bits", w0, None);
-        sec(&cs, "request/L400 deposit_amount UInt128 witness");
-        let w0 = nw(&cs);
-        let deposit_amount = UInt128::new_witness(cs.clone(), || Ok(s.witness.deposit_amount))?;
-        free(&cs, "request deposit_amount bits", w0, None);
-        sec(&cs, "request/L401 expiry UInt64 witness");
-        let w0 = nw(&cs);
-        let expiry = UInt64::new_witness(cs.clone(), || Ok(s.witness.expiry))?;
-        free(&cs, "request expiry bits", w0, None);
-        sec(&cs, "request/L402 balance UInt128 witness");
-        let w0 = nw(&cs);
-        let balance = UInt128::new_witness(cs.clone(), || Ok(s.witness.current_balance))?;
-        free(&cs, "request balance bits", w0, None);
-        sec(&cs, "request/L403-404 request_time UInt64 bits == public request_time");
-        let request_time = UInt64::new_witness(cs.clone(), || Ok(s.public.request_time))?;
+        sec(&cs, "request/L441 request_context witness");
+        free(&cs, "request_context", 1);
+        let request_context = FpVar::new_witness(cs.clone(), || Ok(self.witness.request_context))?;
+        sec(&cs, "request/L442 note_id");
+        free(&cs, "note_id bits", 32);
+        let note_id = UInt32::new_witness(cs.clone(), || Ok(self.witness.note_id))?;
+        sec(&cs, "request/L443 deposit");
+        free(&cs, "deposit bits", 128);
+        let deposit_amount = UInt128::new_witness(cs.clone(), || Ok(self.witness.deposit_amount))?;
+        sec(&cs, "request/L444 expiry");
+        free(&cs, "expiry bits", 64);
+        let expiry = UInt64::new_witness(cs.clone(), || Ok(self.witness.expiry))?;
+        sec(&cs, "request/L445 balance");
+        free(&cs, "balance bits", 128);
+        let balance = UInt128::new_witness(cs.clone(), || Ok(self.witness.current_balance))?;
+        sec(&cs, "request/L446 request time");
+        let request_time = UInt64::new_witness(cs.clone(), || Ok(self.public.request_time))?;
         request_time.to_fp()?.enforce_equal(&request_time_field)?;
-        sec(&cs, "request/L405 expiry >= request_time");
+        sec(&cs, "request/L448 expiry comparison");
         expiry.is_ge(&request_time)?.enforce_equal(&Boolean::TRUE)?;
-        sec(&cs, "request/L406-409 solvency_bound UInt128 bits == public solvency_bound");
-        let solvency_bound = UInt128::new_witness(cs.clone(), || Ok(s.public.solvency_bound))?;
+        sec(&cs, "request/L449 solvency");
+        let solvency_bound = UInt128::new_witness(cs.clone(), || Ok(self.public.solvency_bound))?;
         solvency_bound
             .to_fp()?
             .enforce_equal(&solvency_bound_field)?;
-        sec(&cs, "request/L410-412 balance >= solvency_bound");
+        sec(&cs, "request/L453 balance comparison");
         balance
             .is_ge(&solvency_bound)?
             .enforce_equal(&Boolean::TRUE)?;
-        sec(&cs, "request/L413 deposit_amount >= balance");
+        sec(&cs, "request/L456 deposit comparison");
         deposit_amount.is_ge(&balance)?.enforce_equal(&Boolean::TRUE)?;
 
-        sec(&cs, "request/L415 registration Poseidon");
+        sec(&cs, "request/L458 registration Poseidon");
         let registration = poseidon_hash_var(
             cs.clone(),
             &[domain_var(DOMAIN_REG), secret.clone(), FpVar::zero()],
         )?;
-        sec(&cs, "request/L419 leaf Poseidon");
+        sec(&cs, "request/L462 leaf Poseidon");
         let leaf = poseidon_hash_var(
             cs.clone(),
             &[
@@ -309,35 +355,34 @@ impl ConstraintSynthesizer<CircuitField> for MarkedRequest {
             ],
         )?;
         let mut current = leaf.clone();
-        for (level, sibling_value) in s.witness.merkle_siblings.iter().enumerate() {
-            sec(&cs, &format!("request/L431 merkle sibling[{level}] witness"));
-            let w0 = nw(&cs);
+        for (level, sibling_value) in self.witness.merkle_siblings.iter().enumerate() {
+            sec(&cs, "request/L474 merkle sibling");
+            free(&cs, "merkle sibling", 1);
             let sibling = FpVar::new_witness(cs.clone(), || Ok(*sibling_value))?;
-            free(&cs, &format!("request merkle sibling[{level}]"), w0, None);
-            sec(&cs, &format!("request/L432-435 merkle level {level} select+Poseidon"));
+            sec(&cs, "request/L475 merkle select+Poseidon");
             let bit = &note_id.bits[level];
             let left = bit.select(&sibling, &current)?;
             let right = bit.select(&current, &sibling)?;
             current = poseidon_hash_var(cs.clone(), &[domain_var(DOMAIN_NODE), left, right])?;
         }
-        sec(&cs, "request/L437 root == active_root");
+        sec(&cs, "request/L480 root equality");
         current.enforce_equal(&active_root)?;
 
-        sec(&cs, "request/L439 anchor witness");
-        let w0 = nw(&cs);
-        let anchor = FpVar::new_witness(cs.clone(), || Ok(s.witness.current_anchor))?;
-        free(&cs, "request current_anchor", w0, None);
+        sec(&cs, "request/L482 anchor");
+        free(&cs, "current_anchor", 1);
+        let anchor = FpVar::new_witness(cs.clone(), || Ok(self.witness.current_anchor))?;
         let is_genesis = enforce_anchor_chain(
-            cs.clone(), &secret, &note_id.to_fp()?, &anchor, s.witness.prev_anchor, p,
+            cs.clone(), &secret, &note_id.to_fp()?, &anchor, self.witness.prev_anchor,
         )?;
-        sec(&cs, "request/L443-445 genesis => balance == deposit");
+        sec(&cs, "request/L486 genesis balance");
         balance
             .to_fp()?
             .conditional_enforce_equal(&deposit_amount.to_fp()?, &is_genesis)?;
 
+        sec(&cs, "request/L490 commitment");
         let current_commitment =
-            commitment_var(cs.clone(), &balance, s.witness.current_blinding, &leaf, p)?;
-        sec(&cs, "request/L449 state_message Poseidon");
+            commitment_var(cs.clone(), &balance, self.witness.current_blinding, &leaf)?;
+        sec(&cs, "request/L492 state message Poseidon");
         let state_message = poseidon_hash_var(
             cs.clone(),
             &[
@@ -350,44 +395,55 @@ impl ConstraintSynthesizer<CircuitField> for MarkedRequest {
                 anchor.clone(),
             ],
         )?;
+        sec(&cs, "request/L504 state signature");
         enforce_signature(
             cs.clone(),
             &state_signing_key,
             &state_message,
-            s.witness.state_signature,
+            self.witness.state_signature,
             &is_genesis.not(),
-            &format!("{p}/state-sig"),
         )?;
 
         let h = EdwardsVar::new_constant(cs.clone(), balance_blinding_generator())?;
-        sec(&cs, "request/L470 rerandomization bits");
+        sec(&cs, "request/L513 rerandomization bits");
         let rerandomization_bits =
-            scalar_bits_witness(cs.clone(), s.witness.rerandomization, "request rerandomization bits")?;
-        sec(&cs, "request/L472 H*rerandomization");
-        let hr = h.scalar_mul_le(rerandomization_bits.iter())?;
-        sec(&cs, "request/L471 commitment + H*rerand");
-        let computed_anonymous = current_commitment + hr;
-        sec(&cs, "request/L473 == anonymous_commitment");
+            scalar_bits_witness(cs.clone(), self.witness.rerandomization.into_bigint())?;
+        sec(&cs, "request/L515 commitment + H*rerandomization");
+        let computed_anonymous =
+            current_commitment + h.scalar_mul_le(rerandomization_bits.iter())?;
+        sec(&cs, "request/L517 commitment equality");
         computed_anonymous.enforce_equal(&anonymous_commitment)?;
 
-        sec(&cs, "request/L475 nullifier Poseidon");
+        sec(&cs, "request/L519 nullifier Poseidon");
         let computed_nullifier =
             poseidon_hash_var(cs.clone(), &[domain_var(DOMAIN_NULLIFIER), secret, note_id.to_fp()?, anchor])?;
-        sec(&cs, "request/L477 nullifier == public");
+        sec(&cs, "request/L521 nullifier equality");
         computed_nullifier.enforce_equal(&request_nullifier)?;
-        sec(&cs, "request/L478 authorization Poseidon");
+        sec(&cs, "request/L522 authorization Poseidon");
         let computed_authorization = poseidon_hash_var(
-            cs.clone(),
+            cs,
             &[
                 domain_var(DOMAIN_AUTHORIZATION),
                 request_nullifier,
                 request_context,
             ],
         )?;
-        sec(&cs, "request/L486 authorization == public");
+        sec(&authorization_tag.cs(), "request/L530 authorization equality");
         computed_authorization.enforce_equal(&authorization_tag)?;
-        sec(&cs, "request/END");
+
+        sec(&authorization_tag.cs(), "request/END");
         Ok(())
+    }
+}
+
+pub struct MarkedTransition {
+    pub public: SolanaTransitionPublic,
+    pub witness: SolanaTransitionWitness,
+}
+
+impl From<SolanaTransitionCircuit> for MarkedTransition {
+    fn from(c: SolanaTransitionCircuit) -> Self {
+        Self { public: c.public, witness: c.witness }
     }
 }
 
@@ -396,57 +452,54 @@ impl ConstraintSynthesizer<CircuitField> for MarkedTransition {
         self,
         cs: ConstraintSystemRef<CircuitField>,
     ) -> Result<(), SynthesisError> {
-        let s = self.0;
-        sec(&cs, "transition/L604-607 protocol_version input == 2");
+        sec(&cs, "transition/L648 version");
         let protocol_version = FpVar::new_input(cs.clone(), || {
-            Ok(CircuitField::from(s.public.protocol_version as u64))
+            Ok(CircuitField::from(self.public.protocol_version as u64))
         })?;
         protocol_version.enforce_equal(&FpVar::Constant(CircuitField::from(2u64)))?;
 
-        sec(&cs, "transition/L609-612 chain_id input + UInt64 bits");
+        sec(&cs, "transition/L653 chain UInt64");
         let chain_id =
-            FpVar::new_input(cs.clone(), || Ok(CircuitField::from(s.public.chain_id)))?;
-        let chain_id_u64 = UInt64::new_witness(cs.clone(), || Ok(s.public.chain_id))?;
+            FpVar::new_input(cs.clone(), || Ok(CircuitField::from(self.public.chain_id)))?;
+        let chain_id_u64 = UInt64::new_witness(cs.clone(), || Ok(self.public.chain_id))?;
         chain_id_u64.to_fp()?.enforce_equal(&chain_id)?;
-        sec(&cs, "transition/L613 chain_id != 0");
+        sec(&cs, "transition/L657 chain nonzero");
         chain_id.enforce_not_equal(&FpVar::zero())?;
 
-        sec(&cs, "transition/L615 protocol_binding input");
-        let protocol_binding = FpVar::new_input(cs.clone(), || Ok(s.public.protocol_binding))?;
-        sec(&cs, "transition/L616 protocol_binding != 0");
+        sec(&cs, "transition/L659 binding");
+        let protocol_binding = FpVar::new_input(cs.clone(), || Ok(self.public.protocol_binding))?;
         protocol_binding.enforce_not_equal(&FpVar::zero())?;
-        sec(&cs, "transition/L617-621 roots, note_id inputs");
-        let old_root = FpVar::new_input(cs.clone(), || Ok(s.public.old_root))?;
-        let new_root = FpVar::new_input(cs.clone(), || Ok(s.public.new_root))?;
+        sec(&cs, "transition/L661 roots");
+        let old_root = FpVar::new_input(cs.clone(), || Ok(self.public.old_root))?;
+        let new_root = FpVar::new_input(cs.clone(), || Ok(self.public.new_root))?;
 
+        sec(&cs, "transition/L664 note id");
         let note_id_field =
-            FpVar::new_input(cs.clone(), || Ok(CircuitField::from(s.public.note_id)))?;
-        sec(&cs, "transition/L622-623 note_id UInt32 bits == public");
-        let note_id = UInt32::new_witness(cs.clone(), || Ok(s.public.note_id))?;
+            FpVar::new_input(cs.clone(), || Ok(CircuitField::from(self.public.note_id)))?;
+        let note_id = UInt32::new_witness(cs.clone(), || Ok(self.public.note_id))?;
         note_id.to_fp()?.enforce_equal(&note_id_field)?;
 
-        sec(&cs, "transition/L625 commitment input");
-        let commitment = FpVar::new_input(cs.clone(), || Ok(s.public.commitment))?;
-        sec(&cs, "transition/L626 commitment != 0");
+        sec(&cs, "transition/L669 commitment");
+        let commitment = FpVar::new_input(cs.clone(), || Ok(self.public.commitment))?;
         commitment.enforce_not_equal(&FpVar::zero())?;
-        sec(&cs, "transition/L627-630 amount input + UInt64 bits");
+        sec(&cs, "transition/L671 amount");
         let amount_field =
-            FpVar::new_input(cs.clone(), || Ok(CircuitField::from(s.public.amount)))?;
-        let amount = UInt64::new_witness(cs.clone(), || Ok(s.public.amount))?;
+            FpVar::new_input(cs.clone(), || Ok(CircuitField::from(self.public.amount)))?;
+        let amount = UInt64::new_witness(cs.clone(), || Ok(self.public.amount))?;
         amount.to_fp()?.enforce_equal(&amount_field)?;
-        sec(&cs, "transition/L631 amount != 0");
+        sec(&cs, "transition/L675 amount nonzero");
         amount_field.enforce_not_equal(&FpVar::zero())?;
-        sec(&cs, "transition/L632-635 expiry input + UInt64 bits");
+        sec(&cs, "transition/L676 expiry");
         let expiry_field =
-            FpVar::new_input(cs.clone(), || Ok(CircuitField::from(s.public.expiry)))?;
-        let expiry = UInt64::new_witness(cs.clone(), || Ok(s.public.expiry))?;
+            FpVar::new_input(cs.clone(), || Ok(CircuitField::from(self.public.expiry)))?;
+        let expiry = UInt64::new_witness(cs.clone(), || Ok(self.public.expiry))?;
         expiry.to_fp()?.enforce_equal(&expiry_field)?;
-        sec(&cs, "transition/L636 expiry != 0");
+        sec(&cs, "transition/L680 expiry nonzero");
         expiry_field.enforce_not_equal(&FpVar::zero())?;
-        sec(&cs, "transition/L637 inserting Boolean input");
-        let inserting = Boolean::new_input(cs.clone(), || Ok(s.public.inserting))?;
+        sec(&cs, "transition/L681 inserting");
+        let inserting = Boolean::new_input(cs.clone(), || Ok(self.public.inserting))?;
 
-        sec(&cs, "transition/L639 leaf Poseidon");
+        sec(&cs, "transition/L683 leaf Poseidon");
         let leaf = poseidon_hash_var(
             cs.clone(),
             &[
@@ -457,15 +510,14 @@ impl ConstraintSynthesizer<CircuitField> for MarkedTransition {
                 expiry.to_fp()?,
             ],
         )?;
-        sec(&cs, "transition/L649-650 select old/new leaf");
+        sec(&cs, "transition/L693 select leaves");
         let mut computed_old = inserting.select(&FpVar::zero(), &leaf)?;
         let mut computed_new = inserting.select(&leaf, &FpVar::zero())?;
-        for (level, sibling_value) in s.witness.siblings.iter().enumerate() {
-            sec(&cs, &format!("transition/L652 sibling[{level}] witness"));
-            let w0 = nw(&cs);
+        for (level, sibling_value) in self.witness.siblings.iter().enumerate() {
+            sec(&cs, "transition/L696 sibling");
+            free(&cs, "sibling", 1);
             let sibling = FpVar::new_witness(cs.clone(), || Ok(*sibling_value))?;
-            free(&cs, &format!("transition sibling[{level}]"), w0, None);
-            sec(&cs, &format!("transition/L653-661 level {level} old/new select+Poseidon"));
+            sec(&cs, "transition/L697 select+Poseidon");
             let bit = &note_id.bits[level];
             let old_left = bit.select(&sibling, &computed_old)?;
             let old_right = bit.select(&computed_old, &sibling)?;
@@ -476,11 +528,22 @@ impl ConstraintSynthesizer<CircuitField> for MarkedTransition {
             computed_new =
                 poseidon_hash_var(cs.clone(), &[domain_var(DOMAIN_NODE), new_left, new_right])?;
         }
-        sec(&cs, "transition/L663-664 roots == public");
+        sec(&cs, "transition/L707 roots equality");
         computed_old.enforce_equal(&old_root)?;
         computed_new.enforce_equal(&new_root)?;
         sec(&cs, "transition/END");
         Ok(())
+    }
+}
+
+pub struct MarkedWithdrawal {
+    pub public: WithdrawalPublic,
+    pub witness: WithdrawalWitness,
+}
+
+impl From<WithdrawalCircuit> for MarkedWithdrawal {
+    fn from(c: WithdrawalCircuit) -> Self {
+        Self { public: c.public, witness: c.witness }
     }
 }
 
@@ -489,79 +552,87 @@ impl ConstraintSynthesizer<CircuitField> for MarkedWithdrawal {
         self,
         cs: ConstraintSystemRef<CircuitField>,
     ) -> Result<(), SynthesisError> {
-        let s = self.0;
-        let p = "withdrawal";
-        sec(&cs, "withdrawal/L674-691 public inputs (part 1)");
+        sec(&cs, "withdrawal/L718 public inputs");
         let protocol_version = FpVar::new_input(cs.clone(), || {
-            Ok(CircuitField::from(s.public.protocol_version as u64))
+            Ok(CircuitField::from(self.public.protocol_version as u64))
         })?;
         let chain_id =
-            FpVar::new_input(cs.clone(), || Ok(CircuitField::from(s.public.chain_id)))?;
-        let contract_address = FpVar::new_input(cs.clone(), || Ok(s.public.contract_address))?;
-        let registration_field = FpVar::new_input(cs.clone(), || Ok(s.public.registration))?;
+            FpVar::new_input(cs.clone(), || Ok(CircuitField::from(self.public.chain_id)))?;
+        let contract_address = FpVar::new_input(cs.clone(), || Ok(self.public.contract_address))?;
+        sec(&cs, "withdrawal/L724 deployment");
+        enforce_deployment(cs.clone(), &protocol_version, &chain_id,
+            self.public.chain_id, &contract_address)?;
+        sec(&cs, "withdrawal/L726 registration input");
+        let registration_field = FpVar::new_input(cs.clone(), || Ok(self.public.registration))?;
         let state_signing_key =
-            EdwardsVar::new_input(cs.clone(), || Ok(s.public.state_signing_key))?;
+            signing_key_input(cs.clone(), self.public.state_signing_key)?;
         let clearance_signing_key =
-            EdwardsVar::new_input(cs.clone(), || Ok(s.public.clearance_signing_key))?;
+            signing_key_input(cs.clone(), self.public.clearance_signing_key)?;
+        sec(&cs, "withdrawal/L731 public inputs");
         let note_fields = FpVar::new_input(cs.clone(), || {
-            Ok(zkapi_proof::groth16::packed_note_fields(s.public.note_id, s.public.deposit_amount, s.public.expiry))
+            Ok(packed_note_fields(self.public.note_id, self.public.deposit_amount, self.public.expiry))
         })?;
         let final_balance_field = FpVar::new_input(cs.clone(), || {
-            Ok(CircuitField::from(s.public.final_balance))
+            Ok(CircuitField::from(self.public.final_balance))
         })?;
-        let destination = FpVar::new_input(cs.clone(), || Ok(s.public.destination))?;
-        sec(&cs, "withdrawal/L693 destination.to_bits_le");
-        let _destination_bits = destination.to_bits_le()?;
-        sec(&cs, "withdrawal/L694-699 public inputs (part 2)");
+        let destination = FpVar::new_input(cs.clone(), || Ok(self.public.destination))?;
+        // The wire statement carries a 20-byte destination binding. Its bit
+        // decomposition both binds the public input and enforces that width.
+        sec(&cs, "withdrawal/L740 destination.to_bits_le");
+        for bit in &destination.to_bits_le()?[160..] {
+            bit.enforce_equal(&Boolean::FALSE)?;
+        }
+        sec(&cs, "withdrawal/L743 public inputs");
         let withdrawal_nullifier =
-            FpVar::new_input(cs.clone(), || Ok(s.public.withdrawal_nullifier))?;
-        let has_clearance = Boolean::new_input(cs.clone(), || Ok(s.public.has_clearance))?;
-        let next_nullifier = FpVar::new_input(cs.clone(), || Ok(s.public.next_nullifier))?;
-        let conceded_field = FpVar::new_input(cs.clone(), || Ok(CircuitField::from(s.public.conceded)))?;
-        let valid_until_field = FpVar::new_input(cs.clone(), || Ok(CircuitField::from(s.public.valid_until)))?;
-        sec(&cs, "withdrawal/L700-701 valid_until UInt64 bits == public");
-        let valid_until = UInt64::new_witness(cs.clone(), || Ok(s.public.valid_until))?;
+            FpVar::new_input(cs.clone(), || Ok(self.public.withdrawal_nullifier))?;
+        let has_clearance = Boolean::new_input(cs.clone(), || Ok(self.public.has_clearance))?;
+        let next_nullifier = FpVar::new_input(cs.clone(), || Ok(self.public.next_nullifier))?;
+        let conceded_field = FpVar::new_input(cs.clone(), || Ok(CircuitField::from(self.public.conceded)))?;
+        let valid_until_field = FpVar::new_input(cs.clone(), || Ok(CircuitField::from(self.public.valid_until)))?;
+        sec(&cs, "withdrawal/L749 valid_until");
+        let valid_until = UInt64::new_witness(cs.clone(), || Ok(self.public.valid_until))?;
         valid_until.to_fp()?.enforce_equal(&valid_until_field)?;
 
-        sec(&cs, "withdrawal/L703 secret witness");
-        let w0 = nw(&cs);
-        let secret = FpVar::new_witness(cs.clone(), || Ok(s.witness.secret))?;
-        free(&cs, "withdrawal secret", w0, None);
-        sec(&cs, "withdrawal/L704 secret != 0");
+        sec(&cs, "withdrawal/L752 secret");
+        free(&cs, "secret", 1);
+        let secret = FpVar::new_witness(cs.clone(), || Ok(self.witness.secret))?;
+        sec(&cs, "withdrawal/L753 secret nonzero");
         secret.enforce_not_equal(&FpVar::zero())?;
-        sec(&cs, "withdrawal/L705 note_id UInt32 bits (tied to packed public L717-720)");
-        let note_id = UInt32::new_witness(cs.clone(), || Ok(s.public.note_id))?;
-        sec(&cs, "withdrawal/L706 deposit_amount UInt128 bits (tied to packed public L717-720)");
-        let deposit_amount = UInt128::new_witness(cs.clone(), || Ok(s.public.deposit_amount))?;
-        sec(&cs, "withdrawal/L707-708 final_balance UInt128 bits == public");
-        let final_balance = UInt128::new_witness(cs.clone(), || Ok(s.public.final_balance))?;
+        sec(&cs, "withdrawal/L754 note_id");
+        let note_id = UInt32::new_witness(cs.clone(), || Ok(self.public.note_id))?;
+        sec(&cs, "withdrawal/L755 deposit");
+        let deposit_amount = UInt128::new_witness(cs.clone(), || Ok(self.public.deposit_amount))?;
+        sec(&cs, "withdrawal/L756 final balance");
+        let final_balance = UInt128::new_witness(cs.clone(), || Ok(self.public.final_balance))?;
         final_balance.to_fp()?.enforce_equal(&final_balance_field)?;
-        sec(&cs, "withdrawal/L709 balance UInt128 bits (tied by L714)");
-        let balance = UInt128::new_witness(cs.clone(), || Ok(s.witness.current_balance))?;
-        sec(&cs, "withdrawal/L710-711 conceded UInt128 bits == public");
-        let conceded = UInt128::new_witness(cs.clone(), || Ok(s.public.conceded))?;
+        sec(&cs, "withdrawal/L758 balance");
+        let balance = UInt128::new_witness(cs.clone(), || Ok(self.witness.current_balance))?;
+        sec(&cs, "withdrawal/L759 conceded");
+        let conceded = UInt128::new_witness(cs.clone(), || Ok(self.public.conceded))?;
         conceded.to_fp()?.enforce_equal(&conceded_field)?;
-        sec(&cs, "withdrawal/L714 balance == final_balance + conceded");
+        // Three u128 values cannot wrap the scalar field; equality enforces a
+        // non-overflowing integer sum, not UInt128's modular addition.
+        sec(&cs, "withdrawal/L763 balance sum");
         balance.to_fp()?.enforce_equal(&(final_balance.to_fp()? + conceded.to_fp()?))?;
-        sec(&cs, "withdrawal/L715 deposit_amount >= balance");
+        sec(&cs, "withdrawal/L764 deposit comparison");
         deposit_amount.is_ge(&balance)?.enforce_equal(&Boolean::TRUE)?;
-        sec(&cs, "withdrawal/L716 has_clearance => conceded == 0");
+        sec(&cs, "withdrawal/L765 clearance concession");
         conceded_field.conditional_enforce_equal(&FpVar::zero(), &has_clearance)?;
-        sec(&cs, "withdrawal/L717 expiry UInt64 bits (tied to packed public L717-720)");
-        let expiry = UInt64::new_witness(cs.clone(), || Ok(s.public.expiry))?;
-        sec(&cs, "withdrawal/L718-720 packed note fields == public");
+        sec(&cs, "withdrawal/L766 expiry");
+        let expiry = UInt64::new_witness(cs.clone(), || Ok(self.public.expiry))?;
+        sec(&cs, "withdrawal/L767 packed fields");
         (note_id.to_fp()? * CircuitField::from(2u64).pow([192])
             + deposit_amount.to_fp()? * CircuitField::from(2u64).pow([64])
             + expiry.to_fp()?).enforce_equal(&note_fields)?;
 
-        sec(&cs, "withdrawal/L722 registration Poseidon");
+        sec(&cs, "withdrawal/L771 registration Poseidon");
         let registration = poseidon_hash_var(
             cs.clone(),
             &[domain_var(DOMAIN_REG), secret.clone(), FpVar::zero()],
         )?;
-        sec(&cs, "withdrawal/L726 registration == public");
+        sec(&cs, "withdrawal/L775 registration equality");
         registration.enforce_equal(&registration_field)?;
-        sec(&cs, "withdrawal/L727 leaf Poseidon");
+        sec(&cs, "withdrawal/L776 leaf Poseidon");
         let leaf = poseidon_hash_var(
             cs.clone(),
             &[
@@ -573,26 +644,25 @@ impl ConstraintSynthesizer<CircuitField> for MarkedWithdrawal {
             ],
         )?;
 
-        sec(&cs, "withdrawal/L738 anchor witness");
-        let w0 = nw(&cs);
-        let anchor = FpVar::new_witness(cs.clone(), || Ok(s.witness.current_anchor))?;
-        free(&cs, "withdrawal current_anchor", w0, None);
+        sec(&cs, "withdrawal/L787 anchor");
+        free(&cs, "current_anchor", 1);
+        let anchor = FpVar::new_witness(cs.clone(), || Ok(self.witness.current_anchor))?;
         let is_genesis = enforce_anchor_chain(
-            cs.clone(), &secret, &note_id.to_fp()?, &anchor, s.witness.prev_anchor, p,
+            cs.clone(), &secret, &note_id.to_fp()?, &anchor, self.witness.prev_anchor,
         )?;
-        sec(&cs, "withdrawal/L742-744 genesis => balance == deposit");
+        sec(&cs, "withdrawal/L791 genesis balance");
         balance
             .to_fp()?
             .conditional_enforce_equal(&deposit_amount.to_fp()?, &is_genesis)?;
 
+        sec(&cs, "withdrawal/L795 commitment");
         let current_commitment = commitment_var(
             cs.clone(),
             &balance,
-            s.witness.final_blinding,
+            self.witness.final_blinding,
             &leaf,
-            p,
         )?;
-        sec(&cs, "withdrawal/L752 state_message Poseidon");
+        sec(&cs, "withdrawal/L801 state message Poseidon");
         let state_message = poseidon_hash_var(
             cs.clone(),
             &[
@@ -605,33 +675,33 @@ impl ConstraintSynthesizer<CircuitField> for MarkedWithdrawal {
                 anchor.clone(),
             ],
         )?;
+        sec(&cs, "withdrawal/L813 state signature");
         enforce_signature(
             cs.clone(),
             &state_signing_key,
             &state_message,
-            s.witness.state_signature,
+            self.witness.state_signature,
             &is_genesis.not(),
-            &format!("{p}/state-sig"),
         )?;
 
-        sec(&cs, "withdrawal/L772 nullifier Poseidon");
+        sec(&cs, "withdrawal/L821 nullifier Poseidon");
         let computed_nullifier =
             poseidon_hash_var(cs.clone(), &[domain_var(DOMAIN_NULLIFIER), secret.clone(), note_id.to_fp()?, anchor])?;
-        sec(&cs, "withdrawal/L774 nullifier == public");
+        sec(&cs, "withdrawal/L823 nullifier equality");
         computed_nullifier.enforce_equal(&withdrawal_nullifier)?;
 
-        sec(&cs, "withdrawal/L776 next_anchor Poseidon");
+        sec(&cs, "withdrawal/L825 next anchor Poseidon");
         let next_anchor = poseidon_hash_var(cs.clone(), &[
             domain_var(DOMAIN_ANCHOR), withdrawal_nullifier.clone(),
         ])?;
-        sec(&cs, "withdrawal/L779 computed_next Poseidon");
+        sec(&cs, "withdrawal/L828 next nullifier Poseidon");
         let computed_next = poseidon_hash_var(cs.clone(), &[
             domain_var(DOMAIN_NULLIFIER), secret, note_id.to_fp()?, next_anchor,
         ])?;
-        sec(&cs, "withdrawal/L782 next_nullifier == select(has_clearance, 0, computed_next)");
+        sec(&cs, "withdrawal/L831 nullifier select");
         has_clearance.select(&FpVar::zero(), &computed_next)?.enforce_equal(&next_nullifier)?;
 
-        sec(&cs, "withdrawal/L784 clearance message Poseidon");
+        sec(&cs, "withdrawal/L833 clearance message Poseidon");
         let clear_message = poseidon_hash_var(
             cs.clone(),
             &[
@@ -642,15 +712,15 @@ impl ConstraintSynthesizer<CircuitField> for MarkedWithdrawal {
                 withdrawal_nullifier,
             ],
         )?;
+        sec(&cs, "withdrawal/L843 clearance signature");
         enforce_signature(
-            cs.clone(),
+            cs,
             &clearance_signing_key,
             &clear_message,
-            s.witness.clearance_signature,
+            self.witness.clearance_signature,
             &has_clearance,
-            &format!("{p}/clearance-sig"),
         )?;
-        sec(&cs, "withdrawal/END");
+        sec(&has_clearance.cs(), "withdrawal/END");
         Ok(())
     }
 }

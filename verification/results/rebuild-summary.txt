@@ -1,77 +1,937 @@
-repo: d05a8e38043879fac6b787c393968ade97c42bb1
+source: git archive of verify/hardened 6cb9896 (clean export), run on dagon-build via dagon-busy zk-verify-6cb9896, PICUS_PARALLEL=4
+verification rebuild: repo /home/ubuntu/zkv-6cb9896, work dir /home/ubuntu/zkv-6cb9896/verification/work
+
+===== [01] Tool versions
+repo: not a git checkout
 rustc 1.99.1 (58cf8f9c3 2026-10-13)
+cargo 1.99.1 (5f94df478 2026-08-27)
 Python 3.12.3
 Docker version 29.9.3, build 5457199
 elan 4.2.4 (227caca13 2026-08-25)
 Lean (version 4.24.0, x86_64-unknown-linux-gnu, commit 797c613eb9b6d4ec95db23e3e00af9ac6657f24b, Release)
------ [01] Tool versions: PASS (2s)
+cpus: 8, memory: 30 GiB
+----- [01] Tool versions: PASS (0s)
+
+===== [02] Picus verdict classifier self-test
+ok   safe -> SAFE
+ok   unsafe -> UNSAFE
+ok   unknown -> UNKNOWN
+ok   empty -> NONE
+ok   oom -> NONE
+ok   prefixed -> NONE
+ok   suffixed -> NONE
+ok   conflict -> CONFLICT
+ok   regression: old classifier says SAFE on the UNKNOWN line, the fixed one says UNKNOWN
+picus_verdict self-test: PASS
 ----- [02] Picus verdict classifier self-test: PASS (0s)
-request    ed73c7919790d3cb75e9fc60373aa7ac3c5fb4820c43f2364451ebfdb7f14566 ceremony.json MATCH
-withdrawal a2b46576733aafbe90b816a26cfe8f40c613d76581fbf9e982026e191fa0c973 ceremony.json MATCH
+
+===== [03] Export r1cs and check ceremony.json pins
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling version_check v0.9.5
+   Compiling autocfg v1.5.0
+   Compiling typenum v1.19.0
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.184
+   Compiling zerocopy v0.8.48
+   Compiling crossbeam-utils v0.8.22
+   Compiling crossbeam-epoch v0.9.20
+   Compiling generic-array v0.14.7
+   Compiling crossbeam-deque v0.8.7
+   Compiling num-traits v0.2.19
+   Compiling subtle v2.6.1
+   Compiling rayon-core v1.13.0
+   Compiling either v1.17.0
+   Compiling syn v2.0.117
+   Compiling syn v3.0.3
+   Compiling once_cell v1.21.4
+   Compiling getrandom v0.2.17
+   Compiling num-integer v0.1.46
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling rand_core v0.6.4
+   Compiling digest v0.10.7
+   Compiling paste v1.0.15
+   Compiling num-bigint v0.4.6
+   Compiling arrayvec v0.7.8
+   Compiling itertools v0.13.0
+   Compiling rayon v1.12.0
+   Compiling ahash v0.8.12
+   Compiling tracing-core v0.1.36
+   Compiling allocator-api2 v0.2.21
+   Compiling enum-ordinalize-derive v4.4.2
+   Compiling hashbrown v0.15.5
+   Compiling enum-ordinalize v4.4.2
+   Compiling pin-project-lite v0.2.17
+   Compiling tracing-subscriber v0.2.25
+   Compiling keccak v0.1.6
+   Compiling serde_core v1.0.228
+   Compiling syn v1.0.109
+   Compiling zmij v1.0.21
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.3.1
+   Compiling byteorder v1.5.0
+   Compiling serde_json v1.0.149
+   Compiling rand v0.8.5
+   Compiling cpufeatures v0.2.17
+   Compiling serde v1.0.228
+   Compiling sha2 v0.10.9
+   Compiling blake2 v0.10.6
+   Compiling itoa v1.0.18
+   Compiling ark-std v0.5.0
+   Compiling memchr v2.8.0
+   Compiling zeroize_derive v1.5.0
+   Compiling ark-serialize-derive v0.5.0
+   Compiling ark-ff-asm v0.5.0
+   Compiling educe v0.6.0
+   Compiling ark-serialize v0.5.0
+   Compiling ark-ff-macros v0.5.0
+   Compiling zeroize v1.8.2
+   Compiling tracing-attributes v0.1.31
+   Compiling merlin v3.0.0
+   Compiling serde_derive v1.0.228
+   Compiling ark-crypto-primitives-macros v0.5.0
+   Compiling sha3 v0.10.8
+   Compiling anyhow v1.0.102
+   Compiling hex v0.4.3
+   Compiling derivative v2.2.0
+   Compiling tracing v0.1.44
+   Compiling base64 v0.22.1
+   Compiling ark-ff v0.5.0
+   Compiling zkapi-types v0.1.0 (/home/ubuntu/zkv-6cb9896/protocol/rust/crates/zkapi-types)
+   Compiling ark-poly v0.5.0
+   Compiling ark-relations v0.5.1
+   Compiling ark-snark v0.5.1
+   Compiling ark-ec v0.5.0
+   Compiling ark-r1cs-std v0.5.0
+   Compiling ark-bn254 v0.5.0
+   Compiling ark-crypto-primitives v0.5.0
+   Compiling ark-ed-on-bn254 v0.5.0
+   Compiling zkapi-core v0.1.0 (/home/ubuntu/zkv-6cb9896/protocol/rust/crates/zkapi-core)
+   Compiling ark-groth16 v0.5.0
+   Compiling zkapi-proof v0.1.0 (/home/ubuntu/zkv-6cb9896/protocol/rust/crates/zkapi-proof)
+    Finished `release` profile [optimized] target(s) in 25.19s
+     Running `protocol/rust/target/release/examples/ceremony_export /home/ubuntu/zkv-6cb9896/verification/work/r1cs`
+request    constraints=32862 instanceVariables=13 witnessVariables=32155 ptauPowerNeeded=16
+withdrawal constraints=23537 instanceVariables=17 witnessVariables=22391 ptauPowerNeeded=15
+transition constraints=31810 instanceVariables=11 witnessVariables=31834 ptauPowerNeeded=15
+request    595545d3ef56eb2bbbbefdb8943aa85ba45d2c79340f94bf75de6ea05452945d ceremony.json MATCH
+withdrawal ad31498f2330687325faec694b11a221194c7790909a092a59964e6382163c4d ceremony.json MATCH
 transition a9cd49c195bd2d6e80664672f0994542baa12aa661e8e93bd9563f3bed8ad1c1 ceremony.json MATCH
------ [03] Export r1cs and check ceremony.json pins: PASS (31s)
-request: sha256=ed73c7919790d3cb75e9fc60373aa7ac3c5fb4820c43f2364451ebfdb7f14566 pin_match=true constraints=31670 inst=13 wit=31378
-withdrawal: sha256=a2b46576733aafbe90b816a26cfe8f40c613d76581fbf9e982026e191fa0c973 pin_match=true constraints=22222 inst=17 wit=21587
+----- [03] Export r1cs and check ceremony.json pins: PASS (26s)
+
+===== [04] Instrumented mapper (byte-identical to the pins)
+verbatim helper: poseidon_config
+verbatim helper: poseidon_hash_var
+verbatim helper: domain
+verbatim helper: domain_var
+verbatim helper: scalar_bits_witness
+verbatim helper: signing_key_input
+verbatim helper: enforce_deployment
+verbatim helper: commitment_var
+verbatim helper: enforce_signature
+verbatim helper: enforce_anchor_chain
+verbatim circuit: RequestCircuit
+verbatim circuit: WithdrawalCircuit
+verbatim circuit: SolanaTransitionCircuit
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling version_check v0.9.5
+   Compiling autocfg v1.5.0
+   Compiling typenum v1.19.0
+   Compiling libc v0.2.184
+   Compiling cfg-if v1.0.4
+   Compiling crossbeam-utils v0.8.22
+   Compiling zerocopy v0.8.48
+   Compiling crossbeam-epoch v0.9.20
+   Compiling generic-array v0.14.7
+   Compiling subtle v2.6.1
+   Compiling crossbeam-deque v0.8.7
+   Compiling num-traits v0.2.19
+   Compiling rayon-core v1.13.0
+   Compiling either v1.17.0
+   Compiling syn v2.0.117
+   Compiling syn v3.0.3
+   Compiling getrandom v0.2.17
+   Compiling once_cell v1.21.4
+   Compiling num-integer v0.1.46
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling rand_core v0.6.4
+   Compiling digest v0.10.7
+   Compiling paste v1.0.15
+   Compiling num-bigint v0.4.6
+   Compiling rayon v1.12.0
+   Compiling arrayvec v0.7.8
+   Compiling itertools v0.13.0
+   Compiling ahash v0.8.12
+   Compiling tracing-core v0.1.36
+   Compiling allocator-api2 v0.2.21
+   Compiling enum-ordinalize-derive v4.4.2
+   Compiling hashbrown v0.15.5
+   Compiling enum-ordinalize v4.4.2
+   Compiling pin-project-lite v0.2.17
+   Compiling tracing-subscriber v0.2.25
+   Compiling syn v1.0.109
+   Compiling keccak v0.1.6
+   Compiling serde_core v1.0.228
+   Compiling ppv-lite86 v0.2.21
+   Compiling zmij v1.0.21
+   Compiling serde v1.0.228
+   Compiling rand_chacha v0.3.1
+   Compiling byteorder v1.5.0
+   Compiling cpufeatures v0.2.17
+   Compiling rand v0.8.5
+   Compiling serde_json v1.0.149
+   Compiling sha2 v0.10.9
+   Compiling ark-std v0.5.0
+   Compiling blake2 v0.10.6
+   Compiling itoa v1.0.18
+   Compiling zeroize_derive v1.5.0
+   Compiling ark-serialize-derive v0.5.0
+   Compiling ark-ff-asm v0.5.0
+   Compiling ark-serialize v0.5.0
+   Compiling zeroize v1.8.2
+   Compiling ark-ff-macros v0.5.0
+   Compiling educe v0.6.0
+   Compiling tracing-attributes v0.1.31
+   Compiling merlin v3.0.0
+   Compiling ark-crypto-primitives-macros v0.5.0
+   Compiling serde_derive v1.0.228
+   Compiling memchr v2.8.0
+   Compiling sha3 v0.10.8
+   Compiling anyhow v1.0.102
+   Compiling hex v0.4.3
+   Compiling tracing v0.1.44
+   Compiling derivative v2.2.0
+   Compiling base64 v0.22.1
+   Compiling ark-ff v0.5.0
+   Compiling zkapi-types v0.1.0 (/home/ubuntu/zkv-6cb9896/protocol/rust/crates/zkapi-types)
+   Compiling ark-poly v0.5.0
+   Compiling ark-relations v0.5.1
+   Compiling ark-snark v0.5.1
+   Compiling ark-ec v0.5.0
+   Compiling ark-r1cs-std v0.5.0
+   Compiling ark-bn254 v0.5.0
+   Compiling ark-crypto-primitives v0.5.0
+   Compiling ark-ed-on-bn254 v0.5.0
+   Compiling zkapi-core v0.1.0 (/home/ubuntu/zkv-6cb9896/protocol/rust/crates/zkapi-core)
+   Compiling ark-groth16 v0.5.0
+   Compiling zkapi-proof v0.1.0 (/home/ubuntu/zkv-6cb9896/protocol/rust/crates/zkapi-proof)
+   Compiling picus-mapper v0.1.0 (/home/ubuntu/zkv-6cb9896/verification/mapper)
+warning: unused import: `AffineRepr`
+ --> src/main.rs:7:14
+  |
+7 | use ark_ec::{AffineRepr, CurveGroup, PrimeGroup};
+  |              ^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `2` is never read
+  --> src/bin/../circuits.rs:37:28
+   |
+37 |     Section(String, usize, usize),
+   |     -------                ^^^^^
+   |     |
+   |     field in this variant
+   |
+   = note: `Mark` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+   |
+37 -     Section(String, usize, usize),
+37 +     Section(String, usize, ()),
+   |
+
+warning: struct `MarkedTransition` is never constructed
+   --> src/bin/../circuits.rs:439:12
+    |
+439 | pub struct MarkedTransition {
+    |            ^^^^^^^^^^^^^^^^
+
+warning: `picus-mapper` (bin "picus-mapper") generated 1 warning
+warning: `picus-mapper` (bin "forge") generated 2 warnings
+    Finished `release` profile [optimized] target(s) in 28.82s
+request: sha256=595545d3ef56eb2bbbbefdb8943aa85ba45d2c79340f94bf75de6ea05452945d pin_match=true constraints=32862 inst=13 wit=32155
+withdrawal: sha256=ad31498f2330687325faec694b11a221194c7790909a092a59964e6382163c4d pin_match=true constraints=23537 inst=17 wit=22391
 transition: sha256=a9cd49c195bd2d6e80664672f0994542baa12aa661e8e93bd9563f3bed8ad1c1 pin_match=true constraints=31810 inst=11 wit=31834
------ [04] Instrumented mapper (byte-identical to the pins): PASS (34s)
+----- [04] Instrumented mapper (byte-identical to the pins): PASS (30s)
+
+===== [05] Forged-witness harness
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
+Constraint trace requires enabling `ConstraintLayer`
 PASS L-bits canonical: to_bits_le gadget accepts the canonical 254-bit decomposition (400 values)
 PASS L-bits alias: the only other 254-bit decomposition x+p is rejected (259 values with x+p < 2^254)
 PASS L-bits p-1: p-1 accepted
+Constraint trace requires enabling `ConstraintLayer`
 PASS L-bits p: bits of p rejected as a decomposition of 0
 PASS request genesis fixture: honest genesis request witness satisfies the pinned constraints
-PASS C1 is_eq multiplier (request genesis): multiplier wire (L830 anchor.is_eq(1)) replaced by a random value: still satisfied, same public inputs; it feeds no other constraint
+PASS C1 is_eq multiplier (request genesis): multiplier wire (L879 anchor.is_eq(1)) replaced by a random value: still satisfied, same public inputs; it feeds no other constraint
+Constraint trace requires enabling `ConstraintLayer`
 PASS C1 control: is_genesis flag: flipping is_not_equal itself is rejected
 PASS request non-genesis fixture: honest signed non-genesis request satisfies
+Constraint trace requires enabling `ConstraintLayer`
 PASS C1 control: multiplier when anchor != 1: multiplier is pinned to 1/(anchor-1) when anchor != 1
-PASS C2 genesis prev_anchor / signature free: two genesis witnesses with different prev_anchor and arbitrary (R,s) both satisfy with identical public inputs (prev wire 17536)
+PASS C2 genesis prev_anchor / signature free: two genesis witnesses with different prev_anchor and arbitrary (R,s) both satisfy with identical public inputs (prev wire 17629)
 PASS C3 signature R pre-cofactor alias: ge and ge+(0,-1) both satisfy the R allocation (8*ge = R) with the same R
-PASS C4 251-bit scalar alias: bits(k) and bits(k+l) both satisfy H*bits with the same output point
+PASS C3 signing-key Q pre-cofactor alias: Q+(0,-1) and recomputed doubles satisfy the full request with unchanged public key; Q wires 81, 82
+PASS C4 hardened scalar zero: canonical boundary accepted
+PASS C4 hardened scalar r-1: canonical boundary accepted
+Constraint trace requires enabling `ConstraintLayer`
+PASS C4 hardened scalar r: subgroup-order alias rejected
 PASS withdrawal escape fixture: honest escape withdrawal satisfies
+Constraint trace requires enabling `ConstraintLayer`
 PASS withdrawal control: final_balance + conceded != signed balance is rejected
 PASS L-EC denominators: a=1, d non-square; 1 +- d*x1*x2*y1*y2 and a*x^2+y^2, 2-a*x^2-y^2 non-zero on 202 on-curve points incl. 2-torsion
+0 failures
 ----- [05] Forged-witness harness: PASS (3s)
+
+===== [06] Relabel and slice
+request wires 32168 publics 12 free 1145 targets 31010 constraints 32862
+   free: request/signing key Q pre-cofactor point 2
+   free: request/secret 1
+   free: request/request_context 1
+   free: request/note_id bits 32
+   free: request/deposit bits 128
+   free: request/expiry bits 64
+   free: request/balance bits 128
+   free: request/merkle sibling 32
+   free: request/current_anchor 1
+   free: request/prev_anchor 1
+   free: request/scalar bits 753
+   free: request/signature R pre-cofactor point 2
+withdrawal wires 22408 publics 16 free 764 targets 21627 constraints 23537
+   free: withdrawal/signing key Q pre-cofactor point 4
+   free: withdrawal/secret 1
+   free: withdrawal/current_anchor 1
+   free: withdrawal/prev_anchor 1
+   free: withdrawal/scalar bits 753
+   free: withdrawal/signature R pre-cofactor point 4
+transition wires 31845 publics 10 free 32 targets 31802 constraints 31810
+   free: transition/sibling 32
+request 78 [('request/L283 scalar bound', 51), ('request/L326 note_leaf.to_bits_le', 12), ('request/L350 challenge.to_bits_le', 12), ('request/L298 signing key nonidentity', 2), ('request/L879 anchor.is_eq', 1)]
+withdrawal 104 [('withdrawal/L283 scalar bound', 51), ('withdrawal/L350 challenge.to_bits_le', 24), ('withdrawal/L740 destination.to_bits_le', 12), ('withdrawal/L326 note_leaf.to_bits_le', 12), ('withdrawal/L298 signing key nonidentity', 4), ('withdrawal/L879 anchor.is_eq', 1)]
+transition 0 []
 transition v5 slices 140 max constraints 401 {'bool': 225, 'bitsum': 4, 'bitsum_constraints': 4, 'ec': 0} unconstrained 0
-withdrawal v6 slices 311 max constraints 493 {'bool': 2571, 'ec': 4316, 'bitsum': 9, 'bitsum_constraints': 6} unconstrained 0
-request v6 slices 331 max constraints 493 {'ec': 3292, 'bool': 2128, 'bitsum': 5, 'bitsum_constraints': 5} unconstrained 0
------ [06] Relabel and slice: PASS (6s)
+withdrawal v6 slices 316 max constraints 587 {'bool': 2729, 'bitsum': 10, 'bitsum_constraints': 7, 'ec': 4332} unconstrained 0
+request v6 slices 334 max constraints 493 {'bool': 2192, 'bitsum': 6, 'bitsum_constraints': 6, 'ec': 3300} unconstrained 0
+----- [06] Relabel and slice: PASS (5s)
+
+===== [07] Picus slices (--strong --solver cvc5 --timeout 5000)
 image veridise/picus@sha256:3e78b3b6e3adb064e713553debdf83424bad538a84d95afbafc95e2c9dfe7f5c
-request-v6      {'SAFE': 331}  wall sum 638s max 4.1s
-transition-v5   {'SAFE': 140}  wall sum 386s max 5.8s
-withdrawal-v6   {'SAFE': 311}  wall sum 617s max 6.1s
-782 slices, 782 SAFE
------ [07] Picus slices (--strong --solver cvc5 --timeout 5000): PASS (304s)
+picus: 0/790 slices done, 4 containers running
+picus: 82/790 slices done, 4 containers running
+picus: 174/790 slices done, 4 containers running
+picus: 273/790 slices done, 4 containers running
+picus: 366/790 slices done, 4 containers running
+picus: 439/790 slices done, 4 containers running
+picus: 515/790 slices done, 4 containers running
+picus: 612/790 slices done, 4 containers running
+picus: 713/790 slices done, 4 containers running
+picus: 781/790 slices done, 1 containers running
+picus: 790/790 slices done, 0 containers running
+request-v6      {'SAFE': 334}  wall sum 424s max 2.3s
+transition-v5   {'SAFE': 140}  wall sum 242s max 2.3s
+withdrawal-v6   {'SAFE': 316}  wall sum 375s max 2.3s
+790 slices, 790 SAFE
+----- [07] Picus slices (--strong --solver cvc5 --timeout 5000): PASS (303s)
+
+===== [08] Composition check (every wire accounted for)
+request wires 32168 {'public': 13, 'picus-v6': 30424, 'free': 1145, 'is_neq-multiplier': 78, 'L-bits': 508}
+   slice runs: {('request-v6', 'SAFE'): 334} picus wall total 424s, max 2.3s
+withdrawal wires 22408 {'public': 17, 'picus-v6': 20507, 'free': 764, 'is_neq-multiplier': 104, 'L-bits': 1016}
+   slice runs: {('withdrawal-v6', 'SAFE'): 316} picus wall total 375s, max 2.3s
+transition wires 31845 {'public': 11, 'picus-v5': 31802, 'free': 32}
+   slice runs: {('transition-v5', 'SAFE'): 140} picus wall total 242s, max 2.3s
 unproven wires: {'request': 0, 'withdrawal': 0, 'transition': 0}
 wire accounting equals results/compose-summary.json: True
 ----- [08] Composition check (every wire accounted for): PASS (1s)
+
+===== [09] Lean lemmas: build and axioms
+== toolchain: leanprover/lean4:v4.24.0
 Lean (version 4.24.0, x86_64-unknown-linux-gnu, commit 797c613eb9b6d4ec95db23e3e00af9ac6657f24b, Release)
+info: mathlib: cloning https://github.com/leanprover-community/mathlib4
+info: mathlib: checking out revision 'f897ebcf72cd16f89ab4577d0c826cd14afaafc7'
+info: plausible: cloning https://github.com/leanprover-community/plausible
+info: plausible: checking out revision 'dfd06ebfe8d0e8fa7faba9cb5e5a2e74e7bd2805'
+info: LeanSearchClient: cloning https://github.com/leanprover-community/LeanSearchClient
+info: LeanSearchClient: checking out revision '99657ad92e23804e279f77ea6dbdeebaa1317b98'
+info: importGraph: cloning https://github.com/leanprover-community/import-graph
+info: importGraph: checking out revision 'd768126816be17600904726ca7976b185786e6b9'
+info: proofwidgets: cloning https://github.com/leanprover-community/ProofWidgets4
+info: proofwidgets: checking out revision '556caed0eadb7901e068131d1be208dd907d07a2'
+info: aesop: cloning https://github.com/leanprover-community/aesop
+info: aesop: checking out revision '725ac8cd67acd70a7beaf47c3725e23484c1ef50'
+info: Qq: cloning https://github.com/leanprover-community/quote4
+info: Qq: checking out revision 'dea6a3361fa36d5a13f87333dc506ada582e025c'
+info: batteries: cloning https://github.com/leanprover-community/batteries
+info: batteries: checking out revision '8da40b72fece29b7d3fe3d768bac4c8910ce9bee'
+info: Cli: cloning https://github.com/leanprover/lean4-cli
+info: Cli: checking out revision '91c18fa62838ad0ab7384c03c9684d99d306e1da'
+✔ [2/20] Built Cache.Lean (225ms)
+✔ [3/20] Built Cache.Lean:c.o (98ms)
+✔ [4/20] Built Cache.IO (1.0s)
+✔ [5/20] Built Cache.Hashing (535ms)
+✔ [6/20] Built Cache.Hashing:c.o (420ms)
+✔ [7/20] Built Cache.IO:c.o (1.4s)
+✔ [13/20] Built Batteries.Data.String.Basic:c.o (66ms)
+✔ [14/20] Built Batteries.Data.Array.Match:c.o (189ms)
+✔ [15/20] Built Batteries.Data.String.Matcher:c.o (143ms)
+✔ [16/20] Built Cache.Requests (1.0s)
+✔ [17/20] Built Cache.Main (507ms)
+✔ [18/20] Built Cache.Main:c.o (446ms)
+✔ [19/20] Built Cache.Requests:c.o (1.2s)
+✔ [20/20] Built cache:exe (279ms)
 == mathlib f897ebcf72cd16f89ab4577d0c826cd14afaafc7
+== clean build
 Build completed successfully (1776 jobs).
+== sorry/axiom scan
+none
+== #print axioms
+'Picus.p_prime' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Picus.d_not_square' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Picus.d_mul' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Picus.add_denoms_ne_zero' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Picus.add_gadget' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Picus.dbl_gadget' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Picus.add_onCurve' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Picus.onCurve_of_gadget' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Picus.onCurve_neg' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Picus.onCurve_select' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Picus.toBitsLe_canonical' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Picus.isNeq_ne' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Picus.isNeq_unique' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Picus.isNeq_m_of_ne' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Picus.isNeq_m_free' depends on axioms: [propext, Classical.choice, Quot.sound]
 theorems: 15, with only [propext, Classical.choice, Quot.sound]: 15
+== export
+exported 640 constraints
 lean-export.json sha256 7b846f032126fe9097c57e1ed4c702de39206cd7056b0c3fb0d515991bc9a667 (expected 7b846f032126fe9097c57e1ed4c702de39206cd7056b0c3fb0d515991bc9a667)
------ [09] Lean lemmas: build and axioms: PASS (129s)
-== request: sha256 ed73c7919790d3cb75e9fc60373aa7ac3c5fb4820c43f2364451ebfdb7f14566 (pin OK), 31391 wires, 31670 constraints
-== withdrawal: sha256 a2b46576733aafbe90b816a26cfe8f40c613d76581fbf9e982026e191fa0c973 (pin OK), 21604 wires, 22222 constraints
+----- [09] Lean lemmas: build and axioms: PASS (68s)
+
+===== [10] Linkage of the Lean lemmas to the pinned r1cs
+== request: sha256 595545d3ef56eb2bbbbefdb8943aa85ba45d2c79340f94bf75de6ea05452945d (pin OK), 32168 wires, 32862 constraints
+  L-bits site cons [18944, 19584] bits [18839, 19093]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 3 wires, all < base: True
+  L-bits site cons [24829, 25469] bits [24433, 24687]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 3 wires, all < base: True
+  L-bits: 508 bit wires linked; equal to the Picus L-bits input set: True
+  L-EC: 1650 division pairs (3300 denominator constraints), linked 1650, failed 0; kinds {'double': 260, 'const+var': 3, 'var+const': 1130, 'var+var': 257}
+    const+var/ht: {'constraint': 3}
+    const+var/hu: {'folded': 3}
+    const+var/hv0: {'folded': 3}
+    const+var/hv1: {'folded': 3}
+    const+var/hx3: {'constraint': 3}
+    const+var/hy3: {'constraint': 3}
+    double/hx2: {'constraint': 260}
+    double/hx3: {'constraint': 260}
+    double/hxy: {'constraint': 260}
+    double/hy2: {'constraint': 260}
+    double/hy3: {'constraint': 260}
+    var+const/ht: {'constraint': 1130}
+    var+const/hu: {'folded': 1130}
+    var+const/hv0: {'folded': 1130}
+    var+const/hv1: {'folded': 1130}
+    var+const/hx3: {'constraint': 1130}
+    var+const/hy3: {'constraint': 1130}
+    var+var/ht: {'constraint': 257}
+    var+var/hu: {'constraint': 257}
+    var+var/hv0: {'constraint': 257}
+    var+var/hv1: {'constraint': 257}
+    var+var/hx3: {'constraint': 257}
+    var+var/hy3: {'constraint': 257}
+  L-EC premise (inputs on curve): 3040 input points checked, failures 0; distinct points by rule {'alloc': 3, 'output': 1645, 'const': 754, 'boolsel': 5, 'select': 1383}
+  L-neq: 78 helper wires, shape+single-occurrence OK 78, independently re-detected 78, sets equal True
+    m=104 ne=103 cons=[94, 95] occurrences=1 ok=True
+    m=106 ne=105 cons=[96, 97] occurrences=1 ok=True
+    m=17641 ne=17640 cons=[17607, 17608] occurrences=1 ok=True
+    m=18629 ne=18628 cons=[18608, 18609] occurrences=1 ok=True
+    m=18633 ne=18632 cons=[18614, 18615] occurrences=1 ok=True
+    m=18639 ne=18638 cons=[18623, 18624] occurrences=1 ok=True
+    m=18672 ne=18671 cons=[18677, 18678] occurrences=1 ok=True
+    m=18728 ne=18727 cons=[18769, 18770] occurrences=1 ok=True
+    m=18739 ne=18738 cons=[18785, 18786] occurrences=1 ok=True
+    m=18742 ne=18741 cons=[18789, 18790] occurrences=1 ok=True
+    m=18751 ne=18750 cons=[18801, 18802] occurrences=1 ok=True
+    m=18758 ne=18757 cons=[18813, 18814] occurrences=1 ok=True
+    m=18771 ne=18770 cons=[18835, 18836] occurrences=1 ok=True
+    m=18774 ne=18773 cons=[18839, 18840] occurrences=1 ok=True
+    m=18790 ne=18789 cons=[18865, 18866] occurrences=1 ok=True
+    m=18793 ne=18792 cons=[18869, 18870] occurrences=1 ok=True
+    m=18804 ne=18803 cons=[18886, 18887] occurrences=1 ok=True
+    m=18807 ne=18806 cons=[18890, 18891] occurrences=1 ok=True
+    m=18813 ne=18812 cons=[18900, 18901] occurrences=1 ok=True
+    m=18834 ne=18833 cons=[18934, 18935] occurrences=1 ok=True
+    m=19111 ne=19110 cons=[19228, 19229] occurrences=1 ok=True
+    m=19115 ne=19114 cons=[19234, 19235] occurrences=1 ok=True
+    m=19121 ne=19120 cons=[19243, 19244] occurrences=1 ok=True
+    m=19154 ne=19153 cons=[19297, 19298] occurrences=1 ok=True
+    m=19210 ne=19209 cons=[19389, 19390] occurrences=1 ok=True
+    m=19228 ne=19227 cons=[19418, 19419] occurrences=1 ok=True
+    m=19244 ne=19243 cons=[19445, 19446] occurrences=1 ok=True
+    m=19251 ne=19250 cons=[19455, 19456] occurrences=1 ok=True
+    m=19257 ne=19256 cons=[19464, 19465] occurrences=1 ok=True
+    m=19277 ne=19276 cons=[19498, 19499] occurrences=1 ok=True
+    m=19283 ne=19282 cons=[19508, 19509] occurrences=1 ok=True
+    m=19295 ne=19294 cons=[19526, 19527] occurrences=1 ok=True
+    m=23743 ne=23742 cons=[24013, 24014] occurrences=1 ok=True
+    m=23747 ne=23746 cons=[24019, 24020] occurrences=1 ok=True
+    m=23753 ne=23752 cons=[24028, 24029] occurrences=1 ok=True
+    m=23786 ne=23785 cons=[24082, 24083] occurrences=1 ok=True
+    m=23842 ne=23841 cons=[24174, 24175] occurrences=1 ok=True
+    m=23853 ne=23852 cons=[24190, 24191] occurrences=1 ok=True
+    m=23856 ne=23855 cons=[24194, 24195] occurrences=1 ok=True
+    m=23865 ne=23864 cons=[24206, 24207] occurrences=1 ok=True
+    m=23872 ne=23871 cons=[24218, 24219] occurrences=1 ok=True
+    m=23885 ne=23884 cons=[24240, 24241] occurrences=1 ok=True
+    m=23888 ne=23887 cons=[24244, 24245] occurrences=1 ok=True
+    m=23904 ne=23903 cons=[24270, 24271] occurrences=1 ok=True
+    m=23907 ne=23906 cons=[24274, 24275] occurrences=1 ok=True
+    m=23918 ne=23917 cons=[24291, 24292] occurrences=1 ok=True
+    m=23921 ne=23920 cons=[24295, 24296] occurrences=1 ok=True
+    m=23927 ne=23926 cons=[24305, 24306] occurrences=1 ok=True
+    m=23948 ne=23947 cons=[24339, 24340] occurrences=1 ok=True
+    m=24705 ne=24704 cons=[25113, 25114] occurrences=1 ok=True
+    m=24709 ne=24708 cons=[25119, 25120] occurrences=1 ok=True
+    m=24715 ne=24714 cons=[25128, 25129] occurrences=1 ok=True
+    m=24748 ne=24747 cons=[25182, 25183] occurrences=1 ok=True
+    m=24804 ne=24803 cons=[25274, 25275] occurrences=1 ok=True
+    m=24822 ne=24821 cons=[25303, 25304] occurrences=1 ok=True
+    m=24838 ne=24837 cons=[25330, 25331] occurrences=1 ok=True
+    m=24845 ne=24844 cons=[25340, 25341] occurrences=1 ok=True
+    m=24851 ne=24850 cons=[25349, 25350] occurrences=1 ok=True
+    m=24871 ne=24870 cons=[25383, 25384] occurrences=1 ok=True
+    m=24877 ne=24876 cons=[25393, 25394] occurrences=1 ok=True
+    m=24889 ne=24888 cons=[25411, 25412] occurrences=1 ok=True
+    m=29742 ne=29741 cons=[30306, 30307] occurrences=1 ok=True
+    m=29746 ne=29745 cons=[30312, 30313] occurrences=1 ok=True
+    m=29752 ne=29751 cons=[30321, 30322] occurrences=1 ok=True
+    m=29785 ne=29784 cons=[30375, 30376] occurrences=1 ok=True
+    m=29841 ne=29840 cons=[30467, 30468] occurrences=1 ok=True
+    m=29852 ne=29851 cons=[30483, 30484] occurrences=1 ok=True
+    m=29855 ne=29854 cons=[30487, 30488] occurrences=1 ok=True
+    m=29864 ne=29863 cons=[30499, 30500] occurrences=1 ok=True
+    m=29871 ne=29870 cons=[30511, 30512] occurrences=1 ok=True
+    m=29884 ne=29883 cons=[30533, 30534] occurrences=1 ok=True
+    m=29887 ne=29886 cons=[30537, 30538] occurrences=1 ok=True
+    m=29903 ne=29902 cons=[30563, 30564] occurrences=1 ok=True
+    m=29906 ne=29905 cons=[30567, 30568] occurrences=1 ok=True
+    m=29917 ne=29916 cons=[30584, 30585] occurrences=1 ok=True
+    m=29920 ne=29919 cons=[30588, 30589] occurrences=1 ok=True
+    m=29926 ne=29925 cons=[30598, 30599] occurrences=1 ok=True
+    m=29947 ne=29946 cons=[30632, 30633] occurrences=1 ok=True
+== withdrawal: sha256 ad31498f2330687325faec694b11a221194c7790909a092a59964e6382163c4d (pin OK), 22408 wires, 23537 constraints
+  L-bits site cons [132, 772] bits [141, 395]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 1 wires, all < base: True
+  L-bits site cons [4218, 4858] bits [3832, 4086]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 3 wires, all < base: True
+  L-bits site cons [10103, 10743] bits [9426, 9680]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 3 wires, all < base: True
+  L-bits site cons [18340, 18980] bits [17368, 17622]: 640 constraints compared with Lean toBitsLe, mismatches 0; x = LC over 3 wires, all < base: True
+  L-bits: 1016 bit wires linked; equal to the Picus L-bits input set: True
+  L-EC: 2166 division pairs (4332 denominator constraints), linked 2166, failed 0; kinds {'double': 520, 'const+var': 6, 'var+const': 1130, 'var+var': 510}
+    const+var/ht: {'constraint': 6}
+    const+var/hu: {'folded': 6}
+    const+var/hv0: {'folded': 6}
+    const+var/hv1: {'folded': 6}
+    const+var/hx3: {'constraint': 6}
+    const+var/hy3: {'constraint': 6}
+    double/hx2: {'constraint': 520}
+    double/hx3: {'constraint': 520}
+    double/hxy: {'constraint': 520}
+    double/hy2: {'constraint': 520}
+    double/hy3: {'constraint': 520}
+    var+const/ht: {'constraint': 1130}
+    var+const/hu: {'folded': 1130}
+    var+const/hv0: {'folded': 1130}
+    var+const/hv1: {'folded': 1130}
+    var+const/hx3: {'constraint': 1130}
+    var+const/hy3: {'constraint': 1130}
+    var+var/ht: {'constraint': 510}
+    var+var/hu: {'constraint': 510}
+    var+var/hv0: {'constraint': 510}
+    var+var/hv1: {'constraint': 510}
+    var+var/hx3: {'constraint': 510}
+    var+var/hy3: {'constraint': 510}
+  L-EC premise (inputs on curve): 3812 input points checked, failures 0; distinct points by rule {'alloc': 6, 'output': 2157, 'const': 754, 'boolsel': 5, 'select': 1636}
+  L-neq: 104 helper wires, shape+single-occurrence OK 104, independently re-detected 104, sets equal True
+    m=108 ne=107 cons=[94, 95] occurrences=1 ok=True
+    m=110 ne=109 cons=[96, 97] occurrences=1 ok=True
+    m=137 ne=136 cons=[126, 127] occurrences=1 ok=True
+    m=139 ne=138 cons=[128, 129] occurrences=1 ok=True
+    m=413 ne=412 cons=[416, 417] occurrences=1 ok=True
+    m=417 ne=416 cons=[422, 423] occurrences=1 ok=True
+    m=423 ne=422 cons=[431, 432] occurrences=1 ok=True
+    m=456 ne=455 cons=[485, 486] occurrences=1 ok=True
+    m=512 ne=511 cons=[577, 578] occurrences=1 ok=True
+    m=530 ne=529 cons=[606, 607] occurrences=1 ok=True
+    m=546 ne=545 cons=[633, 634] occurrences=1 ok=True
+    m=553 ne=552 cons=[643, 644] occurrences=1 ok=True
+    m=559 ne=558 cons=[652, 653] occurrences=1 ok=True
+    m=579 ne=578 cons=[686, 687] occurrences=1 ok=True
+    m=585 ne=584 cons=[696, 697] occurrences=1 ok=True
+    m=597 ne=596 cons=[714, 715] occurrences=1 ok=True
+    m=2634 ne=2633 cons=[2881, 2882] occurrences=1 ok=True
+    m=3622 ne=3621 cons=[3882, 3883] occurrences=1 ok=True
+    m=3626 ne=3625 cons=[3888, 3889] occurrences=1 ok=True
+    m=3632 ne=3631 cons=[3897, 3898] occurrences=1 ok=True
+    m=3665 ne=3664 cons=[3951, 3952] occurrences=1 ok=True
+    m=3721 ne=3720 cons=[4043, 4044] occurrences=1 ok=True
+    m=3732 ne=3731 cons=[4059, 4060] occurrences=1 ok=True
+    m=3735 ne=3734 cons=[4063, 4064] occurrences=1 ok=True
+    m=3744 ne=3743 cons=[4075, 4076] occurrences=1 ok=True
+    m=3751 ne=3750 cons=[4087, 4088] occurrences=1 ok=True
+    m=3764 ne=3763 cons=[4109, 4110] occurrences=1 ok=True
+    m=3767 ne=3766 cons=[4113, 4114] occurrences=1 ok=True
+    m=3783 ne=3782 cons=[4139, 4140] occurrences=1 ok=True
+    m=3786 ne=3785 cons=[4143, 4144] occurrences=1 ok=True
+    m=3797 ne=3796 cons=[4160, 4161] occurrences=1 ok=True
+    m=3800 ne=3799 cons=[4164, 4165] occurrences=1 ok=True
+    m=3806 ne=3805 cons=[4174, 4175] occurrences=1 ok=True
+    m=3827 ne=3826 cons=[4208, 4209] occurrences=1 ok=True
+    m=4104 ne=4103 cons=[4502, 4503] occurrences=1 ok=True
+    m=4108 ne=4107 cons=[4508, 4509] occurrences=1 ok=True
+    m=4114 ne=4113 cons=[4517, 4518] occurrences=1 ok=True
+    m=4147 ne=4146 cons=[4571, 4572] occurrences=1 ok=True
+    m=4203 ne=4202 cons=[4663, 4664] occurrences=1 ok=True
+    m=4221 ne=4220 cons=[4692, 4693] occurrences=1 ok=True
+    m=4237 ne=4236 cons=[4719, 4720] occurrences=1 ok=True
+    m=4244 ne=4243 cons=[4729, 4730] occurrences=1 ok=True
+    m=4250 ne=4249 cons=[4738, 4739] occurrences=1 ok=True
+    m=4270 ne=4269 cons=[4772, 4773] occurrences=1 ok=True
+    m=4276 ne=4275 cons=[4782, 4783] occurrences=1 ok=True
+    m=4288 ne=4287 cons=[4800, 4801] occurrences=1 ok=True
+    m=8736 ne=8735 cons=[9287, 9288] occurrences=1 ok=True
+    m=8740 ne=8739 cons=[9293, 9294] occurrences=1 ok=True
+    m=8746 ne=8745 cons=[9302, 9303] occurrences=1 ok=True
+    m=8779 ne=8778 cons=[9356, 9357] occurrences=1 ok=True
+    m=8835 ne=8834 cons=[9448, 9449] occurrences=1 ok=True
+    m=8846 ne=8845 cons=[9464, 9465] occurrences=1 ok=True
+    m=8849 ne=8848 cons=[9468, 9469] occurrences=1 ok=True
+    m=8858 ne=8857 cons=[9480, 9481] occurrences=1 ok=True
+    m=8865 ne=8864 cons=[9492, 9493] occurrences=1 ok=True
+    m=8878 ne=8877 cons=[9514, 9515] occurrences=1 ok=True
+    m=8881 ne=8880 cons=[9518, 9519] occurrences=1 ok=True
+    m=8897 ne=8896 cons=[9544, 9545] occurrences=1 ok=True
+    m=8900 ne=8899 cons=[9548, 9549] occurrences=1 ok=True
+    m=8911 ne=8910 cons=[9565, 9566] occurrences=1 ok=True
+    m=8914 ne=8913 cons=[9569, 9570] occurrences=1 ok=True
+    m=8920 ne=8919 cons=[9579, 9580] occurrences=1 ok=True
+    m=8941 ne=8940 cons=[9613, 9614] occurrences=1 ok=True
+    m=9698 ne=9697 cons=[10387, 10388] occurrences=1 ok=True
+    m=9702 ne=9701 cons=[10393, 10394] occurrences=1 ok=True
+    m=9708 ne=9707 cons=[10402, 10403] occurrences=1 ok=True
+    m=9741 ne=9740 cons=[10456, 10457] occurrences=1 ok=True
+    m=9797 ne=9796 cons=[10548, 10549] occurrences=1 ok=True
+    m=9815 ne=9814 cons=[10577, 10578] occurrences=1 ok=True
+    m=9831 ne=9830 cons=[10604, 10605] occurrences=1 ok=True
+    m=9838 ne=9837 cons=[10614, 10615] occurrences=1 ok=True
+    m=9844 ne=9843 cons=[10623, 10624] occurrences=1 ok=True
+    m=9864 ne=9863 cons=[10657, 10658] occurrences=1 ok=True
+    m=9870 ne=9869 cons=[10667, 10668] occurrences=1 ok=True
+    m=9882 ne=9881 cons=[10685, 10686] occurrences=1 ok=True
+    m=16678 ne=16677 cons=[17524, 17525] occurrences=1 ok=True
+    m=16682 ne=16681 cons=[17530, 17531] occurrences=1 ok=True
+    m=16688 ne=16687 cons=[17539, 17540] occurrences=1 ok=True
+    m=16721 ne=16720 cons=[17593, 17594] occurrences=1 ok=True
+    m=16777 ne=16776 cons=[17685, 17686] occurrences=1 ok=True
+    m=16788 ne=16787 cons=[17701, 17702] occurrences=1 ok=True
+    m=16791 ne=16790 cons=[17705, 17706] occurrences=1 ok=True
+    m=16800 ne=16799 cons=[17717, 17718] occurrences=1 ok=True
+    m=16807 ne=16806 cons=[17729, 17730] occurrences=1 ok=True
+    m=16820 ne=16819 cons=[17751, 17752] occurrences=1 ok=True
+    m=16823 ne=16822 cons=[17755, 17756] occurrences=1 ok=True
+    m=16839 ne=16838 cons=[17781, 17782] occurrences=1 ok=True
+    m=16842 ne=16841 cons=[17785, 17786] occurrences=1 ok=True
+    m=16853 ne=16852 cons=[17802, 17803] occurrences=1 ok=True
+    m=16856 ne=16855 cons=[17806, 17807] occurrences=1 ok=True
+    m=16862 ne=16861 cons=[17816, 17817] occurrences=1 ok=True
+    m=16883 ne=16882 cons=[17850, 17851] occurrences=1 ok=True
+    m=17640 ne=17639 cons=[18624, 18625] occurrences=1 ok=True
+    m=17644 ne=17643 cons=[18630, 18631] occurrences=1 ok=True
+    m=17650 ne=17649 cons=[18639, 18640] occurrences=1 ok=True
+    m=17683 ne=17682 cons=[18693, 18694] occurrences=1 ok=True
+    m=17739 ne=17738 cons=[18785, 18786] occurrences=1 ok=True
+    m=17757 ne=17756 cons=[18814, 18815] occurrences=1 ok=True
+    m=17773 ne=17772 cons=[18841, 18842] occurrences=1 ok=True
+    m=17780 ne=17779 cons=[18851, 18852] occurrences=1 ok=True
+    m=17786 ne=17785 cons=[18860, 18861] occurrences=1 ok=True
+    m=17806 ne=17805 cons=[18894, 18895] occurrences=1 ok=True
+    m=17812 ne=17811 cons=[18904, 18905] occurrences=1 ok=True
+    m=17824 ne=17823 cons=[18922, 18923] occurrences=1 ok=True
 == transition: sha256 a9cd49c195bd2d6e80664672f0994542baa12aa661e8e93bd9563f3bed8ad1c1 (pin OK), 31845 wires, 31810 constraints
+  L-bits: 0 bit wires linked; equal to the Picus L-bits input set: True
+  L-EC: 0 division pairs (0 denominator constraints), linked 0, failed 0; kinds {}
+  L-EC premise (inputs on curve): 0 input points checked, failures 0; distinct points by rule {}
+  L-neq: 0 helper wires, shape+single-occurrence OK 0, independently re-detected 0, sets equal True
 ALL LINKED
------ [10] Linkage of the Lean lemmas to the pinned r1cs: PASS (15s)
+----- [10] Linkage of the Lean lemmas to the pinned r1cs: PASS (13s)
+
+===== [11] Linkage negative controls
 REJECTED  L-bits: one in-field constraint perturbed -> mismatches per site [1, 0]
 REJECTED  L-EC: add denominator uses d+1 -> linked: False
 REJECTED  L-EC: add y3 numerator perturbed -> linked: False
-REJECTED  L-EC premise: on-curve check of the R witness perturbed -> provenance failures 1
+REJECTED  L-EC: shifted cofactor input rejected by full linkage -> failed gadgets 0, provenance failures 1
+REJECTED  L-EC premise: on-curve check of L339 R witness perturbed -> provenance failures 1
+REJECTED  L-EC premise: on-curve check of L296 signing key Q witness perturbed -> provenance failures 1
 REJECTED  L-neq: extra occurrence of m added -> occurrences 2, row ok [False]
 NEGATIVE CONTROLS: all rejected
------ [11] Linkage negative controls: PASS (8s)
-PASS     Tool versions
-PASS     Picus verdict classifier self-test
-PASS     Export r1cs and check ceremony.json pins
-PASS     Instrumented mapper (byte-identical to the pins)
-PASS     Forged-witness harness
-PASS     Relabel and slice
-PASS     Picus slices (--strong --solver cvc5 --timeout 5000)
-PASS     Composition check (every wire accounted for)
-PASS     Lean lemmas: build and axioms
-PASS     Linkage of the Lean lemmas to the pinned r1cs
-PASS     Linkage negative controls
+----- [11] Linkage negative controls: PASS (25s)
+
 ===== SUMMARY
 PASS     Tool versions
 PASS     Picus verdict classifier self-test
@@ -84,4 +944,5 @@ PASS     Composition check (every wire accounted for)
 PASS     Lean lemmas: build and axioms
 PASS     Linkage of the Lean lemmas to the pinned r1cs
 PASS     Linkage negative controls
+logs: /home/ubuntu/zkv-6cb9896/verification/work/logs
 VERIFICATION: PASS
