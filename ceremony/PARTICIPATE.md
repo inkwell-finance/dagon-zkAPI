@@ -41,7 +41,7 @@ Pick one way. All three do the same computation.
 
 ```sh
 curl -fsSL https://ceremony.dagon.so/contribute.mjs -o contribute.mjs
-curl -fsSL https://raw.githubusercontent.com/inkwell-finance/dagon-zkAPI/ccc634b/ceremony/ceremony.json -o ceremony.json
+curl -fsSL https://raw.githubusercontent.com/inkwell-finance/dagon-zkAPI/be7405c/ceremony/ceremony.json -o ceremony.json
 sha256sum contribute.mjs ceremony.json
 ```
 
@@ -64,7 +64,7 @@ It prints your attestation hash and saves a receipt file. Keep the receipt and p
 ### 3. Build it yourself (strongest; removes any need to trust us)
 
 ```sh
-git clone https://github.com/inkwell-finance/dagon-zkAPI && cd dagon-zkAPI && git checkout ccc634b
+git clone https://github.com/inkwell-finance/dagon-zkAPI && cd dagon-zkAPI && git checkout be7405c
 cd ceremony && npm ci && node build.mjs
 node web/dist/contribute.mjs --server https://ceremony.dagon.so --ceremony ceremony.json --name "Your name"
 ```
@@ -124,7 +124,7 @@ reads the code, the "you must trust the server's code" caveat below disappears.
   for the round-1 r1cs; those results (`verification/results/`) are pinned to the round-1 hashes and have not yet been
   re-run on the hardened request/withdrawal r1cs (transition is byte-identical). See `verification/README.md`;
   reproduce with `verification/rebuild.sh`.
-- Source: <https://github.com/inkwell-finance/dagon-zkAPI/tree/ccc634b/ceremony>. Design and operator guide:
+- Source: <https://github.com/inkwell-finance/dagon-zkAPI/tree/be7405c/ceremony>. Design and operator guide:
   `ceremony/README.md`.
 
 Questions: reply to whoever sent you this link. Thank you for helping.
