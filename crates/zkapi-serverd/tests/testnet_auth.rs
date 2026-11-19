@@ -28,7 +28,7 @@ fn config(network: &str, password: Option<TestnetPassword>) -> ServerConfig {
     };
     ServerConfig {
         testnet_password: password,
-        proof_setup_dir: format!("{}/../../protocol/setup/v2", env!("CARGO_MANIFEST_DIR")),
+        proof_setup_dir: zkapi_proof::test_setup().to_string_lossy().into_owned(),
         ..ServerConfig::new(
             network.into(),
             identity,

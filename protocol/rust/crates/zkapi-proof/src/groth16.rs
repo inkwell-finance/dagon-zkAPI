@@ -1089,7 +1089,7 @@ mod tests {
         assert!(!torsion.is_in_correct_subgroup_assuming_on_curve());
         for point in [torsion, EdwardsAffine::zero()] {
             let old = ConstraintSystem::new_ref();
-            EdwardsVar::new_input(old.clone(), || Ok(point)).unwrap();
+            let _ = EdwardsVar::new_input(old.clone(), || Ok(point)).unwrap();
             assert!(old.is_satisfied().unwrap());
 
             let mut request = genesis_request();
