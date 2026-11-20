@@ -9,18 +9,22 @@ Each run:
 1. Fetches `transcript.json` and `ceremony.json`, each capped at 8 MiB before buffering.
 2. Copies every file the transcript lists (r1cs, each round's zkeys and `entry.json`). A last round with
    `kind: "beacon"` also requires `final/FINAL.md`, final zkeys and verification-key JSON; there is no `transcript.final`.
-   Round and final zkeys are skipped only when R2 already has the transcript's size and stored sha256.
+   Round and final zkeys are skipped only when R2 already has the transcript's size and stored sha256; verification
+   keys are skipped when R2 has their transcript sha256.
    The Worker supplies the expected sha256 on put, so R2 rejects mismatching bytes and stores the checksum.
    Zkeys stream through `FixedLengthStream` using their transcript size, even with gzip/chunked responses.
    Other bodies use a valid unencoded response length, or are buffered with an 8 MiB cap and hashed.
-   A zkey whose bytes disagree with the transcript is deleted and the run fails.
+   A zkey or verification key whose bytes disagree with the transcript is deleted and the run fails. A failed put
+   leaves the previous object in place, so a transient failure on a file without a transcript sha256 deletes nothing.
 3. Probes `closed.json` every run, copying it before the indexes. Only a 404 while not finalized is optional;
-   other errors abort the run. Finalization requires the checkpoint. Final reports and verification keys are refreshed.
+   other errors abort the run. Finalization requires the checkpoint. Final reports are refreshed.
 4. Writes `ceremony.json`, then `transcript.json`, after all required artifacts have been copied.
 5. Lists all pages under `files/`, then deletes stale keys. A listing failure deletes nothing; a transcript fetch,
    body-read or parse failure never reaches listing. `files/closed.json` and **all** `files/final/` objects are never
    pruned, even when an open/older transcript is observed. Nothing outside `files/` is touched (`round1/`, `index.html`).
-   Removing retained close/final artifacts after an intentional restart is an operator task.
+   Removing retained close/final artifacts after an intentional restart is an operator task. Objects uploaded after
+   the run started are not pruned: an overlapping run (a slow run lasting past the next cron tick) may have seen a
+   newer transcript.
 
 Zkeys uploaded before checksums were stored have none, so the first run of this version downloads them once more.
 

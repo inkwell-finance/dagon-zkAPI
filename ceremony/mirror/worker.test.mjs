@@ -48,7 +48,7 @@ class FakeBucket {
     } else body = new Uint8Array(value instanceof ArrayBuffer ? value : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
     const checksum = typeof options.sha256 === "string" ? options.sha256 : options.sha256 && Buffer.from(options.sha256).toString("hex");
     if (checksum && sha(body) !== checksum) throw new Error("put: The SHA-256 checksum you specified did not match what we received.");
-    this.objects.set(key, { body, sha256: checksum });
+    this.objects.set(key, { body, sha256: checksum, uploaded: new Date() });
     this.puts.push(key);
   }
   async delete(key) {
@@ -61,7 +61,7 @@ class FakeBucket {
     const start = cursor ? Number(cursor) : 0;
     const page = keys.slice(start, start + 2); // tiny pages exercise the cursor loop
     const truncated = start + 2 < keys.length;
-    return { objects: page.map((key) => ({ key })), truncated, ...(truncated ? { cursor: String(start + 2) } : {}) };
+    return { objects: page.map((key) => ({ key, uploaded: this.objects.get(key).uploaded ?? new Date(0) })), truncated, ...(truncated ? { cursor: String(start + 2) } : {}) };
   }
 }
 
@@ -282,7 +282,7 @@ describe("ceremony mirror sync", () => {
     const protectedKeys = ["index.html", "round1/a", "files-other/a", "files/closed.json", "files/final/a", "files/ceremony.json", "files/transcript.json", "files/keep"];
     const stale = Array.from({ length: 7 }, (_, i) => `files/stale${i}`);
     for (const key of [...protectedKeys, ...stale]) env.BUCKET.objects.set(key, { body: text(key) });
-    assert.equal(await prune(env, ["keep"]), stale.length);
+    assert.equal(await prune(env, ["keep"], new Date()), stale.length);
     assert.deepEqual(env.BUCKET.deletes, stale);
     assert.deepEqual([...env.BUCKET.objects.keys()], protectedKeys);
     assert.ok(env.BUCKET.lists.length > 1);
@@ -296,9 +296,9 @@ describe("ceremony mirror sync", () => {
       assert.equal(prefix, "files/");
       if (++calls === 1) return { objects: [], truncated: true, cursor: "opaque" };
       assert.equal(cursor, "opaque");
-      return { objects: [{ key: "index.html" }, { key: "round1/a" }, { key: "files/stale" }], truncated: false };
+      return { objects: [{ key: "index.html" }, { key: "round1/a" }, { key: "files/stale", uploaded: new Date(0) }], truncated: false };
     };
-    assert.equal(await prune({ BUCKET: bucket }, []), 1);
+    assert.equal(await prune({ BUCKET: bucket }, [], new Date()), 1);
     assert.deepEqual(bucket.deletes, ["files/stale"]);
     assert.equal(calls, 2);
   });
@@ -314,6 +314,33 @@ describe("ceremony mirror sync", () => {
     await assert.rejects(sync(env), /R2 listing unavailable/);
     assert.equal(env.BUCKET.puts.at(-1), "files/transcript.json");
     assert.deepEqual(env.BUCKET.deletes, []);
+  });
+
+  test("an overlapping run's newer uploads are not pruned by an older transcript", async () => {
+    const env = { BUCKET: new FakeBucket() };
+    env.BUCKET.objects.set("files/rounds/0001/request.zkey", { body: bytesOf(10, 5), uploaded: new Date(0) });
+    const put = env.BUCKET.put.bind(env.BUCKET);
+    env.BUCKET.put = async (key, value, options) => {
+      // A concurrent run that saw round 2 uploads it while this run (which sees only round 0) is in progress.
+      if (key === "files/transcript.json") await put("files/rounds/0002/request.zkey", bytesOf(10, 6));
+      return put(key, value, options);
+    };
+    await sync(env);
+    assert.deepEqual(env.BUCKET.deletes, ["files/rounds/0001/request.zkey"]);
+    assert.ok(env.BUCKET.objects.has("files/rounds/0002/request.zkey"));
+  });
+
+  test("a failed streamed put keeps an unhashed refreshed file; a current verification key is not refetched", async () => {
+    serveFinalized();
+    const env = { BUCKET: new FakeBucket() };
+    await sync(env);
+    served["closed.json"] = { body: served["closed.json"].body, error: "connection reset" };
+    const before = env.BUCKET.objects.get("files/closed.json").body;
+    fetched = [];
+    await assert.rejects(sync(env), /closed\.json: put failed: .*connection reset/);
+    assert.deepEqual(env.BUCKET.objects.get("files/closed.json").body, before);
+    assert.deepEqual(env.BUCKET.deletes, []);
+    assert.ok(!fetched.some((k) => k.endsWith("_verification_key.json") || k.endsWith(".zkey")));
   });
 
   for (const encoding of [{ chunked: true }, { gzip: true, headers: { "content-length": "42" } }]) {

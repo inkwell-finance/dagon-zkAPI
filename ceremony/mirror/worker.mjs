@@ -46,15 +46,16 @@ export async function readCapped(body, cap, key) {
   return out;
 }
 
-// True when R2 already holds exactly the transcript's bytes (size and the sha256 checksum R2 stored at put time).
+// True when R2 already holds exactly the transcript's bytes (the sha256 checksum R2 stored at put time, and the
+// size when the transcript records one).
 export async function isCurrent(env, key, expect) {
   const head = await env.BUCKET.head(`files/${key}`);
   const sha256 = head?.checksums?.sha256;
-  return Boolean(head && head.size === expect.bytes && sha256 && hex(sha256) === expect.sha256);
+  return Boolean(head && (expect.bytes === undefined || head.size === expect.bytes) && sha256 && hex(sha256) === expect.sha256);
 }
 
 export async function mirrorFile(env, key, expect) {
-  if (expect?.bytes && expect?.sha256 && (await isCurrent(env, key, expect))) return "present";
+  if (expect?.sha256 && (await isCurrent(env, key, expect))) return "present";
   const r = await get(key, expect?.optional);
   if (!r) return "absent";
   const lengthHeader = r.headers.get("content-length");
@@ -88,6 +89,8 @@ export async function mirrorFile(env, key, expect) {
       ...(expect?.sha256 ? { sha256: expect.sha256 } : {}),
     });
   } catch (error) {
+    // A failed put leaves the previous object untouched. Remove it only when it is known not to match the transcript.
+    if (!expect?.sha256) throw new Error(`${key}: put failed: ${error.message ?? error}`);
     return fail(`${key}: put failed: ${error.message ?? error}`);
   }
   return "uploaded";
@@ -110,7 +113,7 @@ export function wantedFiles(transcript) {
       const info = last.circuits[c];
       wanted.push(
         { key: `final/${c}_final.zkey`, sha256: info.sha256, bytes: info.bytes },
-        { key: `final/${c}_verification_key.json`, sha256: info.verificationKeySha256, refresh: true },
+        { key: `final/${c}_verification_key.json`, sha256: info.verificationKeySha256 },
       );
     }
   }
@@ -118,14 +121,17 @@ export function wantedFiles(transcript) {
 }
 
 // Complete the listing before deleting anything: a failed page must not cause partial pruning.
-// Never prune closure/final artifacts, or keys outside files/ (including round1/ and index.html).
-export async function prune(env, keep) {
+// Never prune closure/final artifacts, or keys outside files/ (including round1/ and index.html). Objects uploaded
+// since this run started belong to an overlapping run that may have observed a newer transcript.
+export async function prune(env, keep, started) {
   const listed = new Set(["files/ceremony.json", "files/transcript.json", "files/closed.json", ...[...keep].map((k) => `files/${k}`)]);
   const stale = [];
   let cursor;
   do {
     const page = await env.BUCKET.list({ prefix: "files/", cursor });
-    for (const o of page.objects) if (o.key.startsWith("files/") && !o.key.startsWith("files/final/") && !listed.has(o.key)) stale.push(o.key);
+    for (const o of page.objects) {
+      if (o.key.startsWith("files/") && !o.key.startsWith("files/final/") && !listed.has(o.key) && o.uploaded < started) stale.push(o.key);
+    }
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
   for (const key of stale) await env.BUCKET.delete(key);
@@ -133,19 +139,21 @@ export async function prune(env, keep) {
 }
 
 export async function sync(env) {
+  const started = new Date();
   const transcriptBytes = await readCapped((await get("transcript.json")).body, BUFFER_CAP, "transcript.json");
   const transcript = JSON.parse(new TextDecoder().decode(transcriptBytes));
   const configBytes = await readCapped((await get("ceremony.json")).body, BUFFER_CAP, "ceremony.json");
   const wanted = wantedFiles(transcript);
   const counts = { uploaded: 0, present: 0, absent: 0 };
   for (const w of wanted) {
-    // r1cs and entry files are immutable; closure and final reports are refreshed after a restart.
-    if (!w.bytes && !w.refresh && (await env.BUCKET.head(`files/${w.key}`))) { counts.present++; continue; }
+    // r1cs and entry files are immutable; closure and final reports are refreshed after a restart. Keys with a
+    // transcript sha256 are compared with R2's stored checksum in mirrorFile.
+    if (!w.sha256 && !w.refresh && (await env.BUCKET.head(`files/${w.key}`))) { counts.present++; continue; }
     counts[await mirrorFile(env, w.key, w)]++;
   }
   await env.BUCKET.put("files/ceremony.json", configBytes, { httpMetadata: { contentType: "application/json" } });
   await env.BUCKET.put("files/transcript.json", transcriptBytes, { httpMetadata: { contentType: "application/json" } });
-  const removed = await prune(env, wanted.map((w) => w.key));
+  const removed = await prune(env, wanted.map((w) => w.key), started);
   console.log(JSON.stringify({ rounds: transcript.rounds.length, ...counts, removed }));
 }
 
