@@ -1,5 +1,6 @@
-source: git archive of verify/hardened 6cb9896 (clean export), run on dagon-build via dagon-busy zk-verify-6cb9896, PICUS_PARALLEL=4
-verification rebuild: repo /home/ubuntu/zkv-6cb9896, work dir /home/ubuntu/zkv-6cb9896/verification/work
+Evidence refresh: clean git archive of ceremony/round-2 96f6df6796e34a54295c3fbdb6082923a1610584
+Rebuild steps 1-6 and 8-11 rerun; step 7 reuses prior SAFE evidence only after exact byte and log checks.
+verification rebuild: repo /tmp/ceremony-merge-96f6df6, work dir /tmp/ceremony-merge-96f6df6/verification/work
 
 ===== [01] Tool versions
 repo: not a git checkout
@@ -23,103 +24,21 @@ ok   suffixed -> NONE
 ok   conflict -> CONFLICT
 ok   regression: old classifier says SAFE on the UNKNOWN line, the fixed one says UNKNOWN
 picus_verdict self-test: PASS
------ [02] Picus verdict classifier self-test: PASS (0s)
+----- [02] Picus verdict classifier self-test: PASS (1s)
 
 ===== [03] Export r1cs and check ceremony.json pins
-   Compiling proc-macro2 v1.0.106
-   Compiling unicode-ident v1.0.24
-   Compiling quote v1.0.45
-   Compiling version_check v0.9.5
-   Compiling autocfg v1.5.0
-   Compiling typenum v1.19.0
-   Compiling cfg-if v1.0.4
-   Compiling libc v0.2.184
-   Compiling zerocopy v0.8.48
-   Compiling crossbeam-utils v0.8.22
-   Compiling crossbeam-epoch v0.9.20
-   Compiling generic-array v0.14.7
-   Compiling crossbeam-deque v0.8.7
-   Compiling num-traits v0.2.19
-   Compiling subtle v2.6.1
-   Compiling rayon-core v1.13.0
-   Compiling either v1.17.0
-   Compiling syn v2.0.117
-   Compiling syn v3.0.3
-   Compiling once_cell v1.21.4
-   Compiling getrandom v0.2.17
-   Compiling num-integer v0.1.46
-   Compiling crypto-common v0.1.7
-   Compiling block-buffer v0.10.4
-   Compiling rand_core v0.6.4
-   Compiling digest v0.10.7
-   Compiling paste v1.0.15
-   Compiling num-bigint v0.4.6
-   Compiling arrayvec v0.7.8
-   Compiling itertools v0.13.0
-   Compiling rayon v1.12.0
-   Compiling ahash v0.8.12
-   Compiling tracing-core v0.1.36
-   Compiling allocator-api2 v0.2.21
-   Compiling enum-ordinalize-derive v4.4.2
-   Compiling hashbrown v0.15.5
-   Compiling enum-ordinalize v4.4.2
-   Compiling pin-project-lite v0.2.17
-   Compiling tracing-subscriber v0.2.25
-   Compiling keccak v0.1.6
-   Compiling serde_core v1.0.228
-   Compiling syn v1.0.109
-   Compiling zmij v1.0.21
-   Compiling ppv-lite86 v0.2.21
-   Compiling rand_chacha v0.3.1
-   Compiling byteorder v1.5.0
-   Compiling serde_json v1.0.149
-   Compiling rand v0.8.5
-   Compiling cpufeatures v0.2.17
-   Compiling serde v1.0.228
-   Compiling sha2 v0.10.9
-   Compiling blake2 v0.10.6
-   Compiling itoa v1.0.18
-   Compiling ark-std v0.5.0
-   Compiling memchr v2.8.0
-   Compiling zeroize_derive v1.5.0
-   Compiling ark-serialize-derive v0.5.0
-   Compiling ark-ff-asm v0.5.0
-   Compiling educe v0.6.0
-   Compiling ark-serialize v0.5.0
-   Compiling ark-ff-macros v0.5.0
-   Compiling zeroize v1.8.2
-   Compiling tracing-attributes v0.1.31
-   Compiling merlin v3.0.0
-   Compiling serde_derive v1.0.228
-   Compiling ark-crypto-primitives-macros v0.5.0
-   Compiling sha3 v0.10.8
-   Compiling anyhow v1.0.102
-   Compiling hex v0.4.3
-   Compiling derivative v2.2.0
-   Compiling tracing v0.1.44
-   Compiling base64 v0.22.1
-   Compiling ark-ff v0.5.0
-   Compiling zkapi-types v0.1.0 (/home/ubuntu/zkv-6cb9896/protocol/rust/crates/zkapi-types)
-   Compiling ark-poly v0.5.0
-   Compiling ark-relations v0.5.1
-   Compiling ark-snark v0.5.1
-   Compiling ark-ec v0.5.0
-   Compiling ark-r1cs-std v0.5.0
-   Compiling ark-bn254 v0.5.0
-   Compiling ark-crypto-primitives v0.5.0
-   Compiling ark-ed-on-bn254 v0.5.0
-   Compiling zkapi-core v0.1.0 (/home/ubuntu/zkv-6cb9896/protocol/rust/crates/zkapi-core)
-   Compiling ark-groth16 v0.5.0
-   Compiling zkapi-proof v0.1.0 (/home/ubuntu/zkv-6cb9896/protocol/rust/crates/zkapi-proof)
-    Finished `release` profile [optimized] target(s) in 25.19s
-     Running `protocol/rust/target/release/examples/ceremony_export /home/ubuntu/zkv-6cb9896/verification/work/r1cs`
+   Compiling zkapi-types v0.1.0 (/tmp/ceremony-merge-96f6df6/protocol/rust/crates/zkapi-types)
+   Compiling zkapi-core v0.1.0 (/tmp/ceremony-merge-96f6df6/protocol/rust/crates/zkapi-core)
+   Compiling zkapi-proof v0.1.0 (/tmp/ceremony-merge-96f6df6/protocol/rust/crates/zkapi-proof)
+    Finished `release` profile [optimized] target(s) in 5.67s
+     Running `/home/ubuntu/zkv-6cb9896/protocol/rust/target/release/examples/ceremony_export /tmp/ceremony-merge-96f6df6/verification/work/r1cs`
 request    constraints=32862 instanceVariables=13 witnessVariables=32155 ptauPowerNeeded=16
 withdrawal constraints=23537 instanceVariables=17 witnessVariables=22391 ptauPowerNeeded=15
 transition constraints=31810 instanceVariables=11 witnessVariables=31834 ptauPowerNeeded=15
 request    595545d3ef56eb2bbbbefdb8943aa85ba45d2c79340f94bf75de6ea05452945d ceremony.json MATCH
 withdrawal ad31498f2330687325faec694b11a221194c7790909a092a59964e6382163c4d ceremony.json MATCH
 transition a9cd49c195bd2d6e80664672f0994542baa12aa661e8e93bd9563f3bed8ad1c1 ceremony.json MATCH
------ [03] Export r1cs and check ceremony.json pins: PASS (26s)
+----- [03] Export r1cs and check ceremony.json pins: PASS (6s)
 
 ===== [04] Instrumented mapper (byte-identical to the pins)
 verbatim helper: poseidon_config
@@ -135,92 +54,10 @@ verbatim helper: enforce_anchor_chain
 verbatim circuit: RequestCircuit
 verbatim circuit: WithdrawalCircuit
 verbatim circuit: SolanaTransitionCircuit
-   Compiling proc-macro2 v1.0.106
-   Compiling quote v1.0.45
-   Compiling unicode-ident v1.0.24
-   Compiling version_check v0.9.5
-   Compiling autocfg v1.5.0
-   Compiling typenum v1.19.0
-   Compiling libc v0.2.184
-   Compiling cfg-if v1.0.4
-   Compiling crossbeam-utils v0.8.22
-   Compiling zerocopy v0.8.48
-   Compiling crossbeam-epoch v0.9.20
-   Compiling generic-array v0.14.7
-   Compiling subtle v2.6.1
-   Compiling crossbeam-deque v0.8.7
-   Compiling num-traits v0.2.19
-   Compiling rayon-core v1.13.0
-   Compiling either v1.17.0
-   Compiling syn v2.0.117
-   Compiling syn v3.0.3
-   Compiling getrandom v0.2.17
-   Compiling once_cell v1.21.4
-   Compiling num-integer v0.1.46
-   Compiling crypto-common v0.1.7
-   Compiling block-buffer v0.10.4
-   Compiling rand_core v0.6.4
-   Compiling digest v0.10.7
-   Compiling paste v1.0.15
-   Compiling num-bigint v0.4.6
-   Compiling rayon v1.12.0
-   Compiling arrayvec v0.7.8
-   Compiling itertools v0.13.0
-   Compiling ahash v0.8.12
-   Compiling tracing-core v0.1.36
-   Compiling allocator-api2 v0.2.21
-   Compiling enum-ordinalize-derive v4.4.2
-   Compiling hashbrown v0.15.5
-   Compiling enum-ordinalize v4.4.2
-   Compiling pin-project-lite v0.2.17
-   Compiling tracing-subscriber v0.2.25
-   Compiling syn v1.0.109
-   Compiling keccak v0.1.6
-   Compiling serde_core v1.0.228
-   Compiling ppv-lite86 v0.2.21
-   Compiling zmij v1.0.21
-   Compiling serde v1.0.228
-   Compiling rand_chacha v0.3.1
-   Compiling byteorder v1.5.0
-   Compiling cpufeatures v0.2.17
-   Compiling rand v0.8.5
-   Compiling serde_json v1.0.149
-   Compiling sha2 v0.10.9
-   Compiling ark-std v0.5.0
-   Compiling blake2 v0.10.6
-   Compiling itoa v1.0.18
-   Compiling zeroize_derive v1.5.0
-   Compiling ark-serialize-derive v0.5.0
-   Compiling ark-ff-asm v0.5.0
-   Compiling ark-serialize v0.5.0
-   Compiling zeroize v1.8.2
-   Compiling ark-ff-macros v0.5.0
-   Compiling educe v0.6.0
-   Compiling tracing-attributes v0.1.31
-   Compiling merlin v3.0.0
-   Compiling ark-crypto-primitives-macros v0.5.0
-   Compiling serde_derive v1.0.228
-   Compiling memchr v2.8.0
-   Compiling sha3 v0.10.8
-   Compiling anyhow v1.0.102
-   Compiling hex v0.4.3
-   Compiling tracing v0.1.44
-   Compiling derivative v2.2.0
-   Compiling base64 v0.22.1
-   Compiling ark-ff v0.5.0
-   Compiling zkapi-types v0.1.0 (/home/ubuntu/zkv-6cb9896/protocol/rust/crates/zkapi-types)
-   Compiling ark-poly v0.5.0
-   Compiling ark-relations v0.5.1
-   Compiling ark-snark v0.5.1
-   Compiling ark-ec v0.5.0
-   Compiling ark-r1cs-std v0.5.0
-   Compiling ark-bn254 v0.5.0
-   Compiling ark-crypto-primitives v0.5.0
-   Compiling ark-ed-on-bn254 v0.5.0
-   Compiling zkapi-core v0.1.0 (/home/ubuntu/zkv-6cb9896/protocol/rust/crates/zkapi-core)
-   Compiling ark-groth16 v0.5.0
-   Compiling zkapi-proof v0.1.0 (/home/ubuntu/zkv-6cb9896/protocol/rust/crates/zkapi-proof)
-   Compiling picus-mapper v0.1.0 (/home/ubuntu/zkv-6cb9896/verification/mapper)
+   Compiling zkapi-types v0.1.0 (/tmp/ceremony-merge-96f6df6/protocol/rust/crates/zkapi-types)
+   Compiling zkapi-core v0.1.0 (/tmp/ceremony-merge-96f6df6/protocol/rust/crates/zkapi-core)
+   Compiling zkapi-proof v0.1.0 (/tmp/ceremony-merge-96f6df6/protocol/rust/crates/zkapi-proof)
+   Compiling picus-mapper v0.1.0 (/tmp/ceremony-merge-96f6df6/verification/mapper)
 warning: unused import: `AffineRepr`
  --> src/main.rs:7:14
   |
@@ -253,11 +90,11 @@ warning: struct `MarkedTransition` is never constructed
 
 warning: `picus-mapper` (bin "picus-mapper") generated 1 warning
 warning: `picus-mapper` (bin "forge") generated 2 warnings
-    Finished `release` profile [optimized] target(s) in 28.82s
+    Finished `release` profile [optimized] target(s) in 9.51s
 request: sha256=595545d3ef56eb2bbbbefdb8943aa85ba45d2c79340f94bf75de6ea05452945d pin_match=true constraints=32862 inst=13 wit=32155
 withdrawal: sha256=ad31498f2330687325faec694b11a221194c7790909a092a59964e6382163c4d pin_match=true constraints=23537 inst=17 wit=22391
 transition: sha256=a9cd49c195bd2d6e80664672f0994542baa12aa661e8e93bd9563f3bed8ad1c1 pin_match=true constraints=31810 inst=11 wit=31834
------ [04] Instrumented mapper (byte-identical to the pins): PASS (30s)
+----- [04] Instrumented mapper (byte-identical to the pins): PASS (11s)
 
 ===== [05] Forged-witness harness
 Constraint trace requires enabling `ConstraintLayer`
@@ -576,24 +413,16 @@ withdrawal v6 slices 316 max constraints 587 {'bool': 2729, 'bitsum': 10, 'bitsu
 request v6 slices 334 max constraints 493 {'bool': 2192, 'bitsum': 6, 'bitsum_constraints': 6, 'ec': 3300} unconstrained 0
 ----- [06] Relabel and slice: PASS (5s)
 
-===== [07] Picus slices (--strong --solver cvc5 --timeout 5000)
-image veridise/picus@sha256:3e78b3b6e3adb064e713553debdf83424bad538a84d95afbafc95e2c9dfe7f5c
-picus: 0/790 slices done, 4 containers running
-picus: 82/790 slices done, 4 containers running
-picus: 174/790 slices done, 4 containers running
-picus: 273/790 slices done, 4 containers running
-picus: 366/790 slices done, 4 containers running
-picus: 439/790 slices done, 4 containers running
-picus: 515/790 slices done, 4 containers running
-picus: 612/790 slices done, 4 containers running
-picus: 713/790 slices done, 4 containers running
-picus: 781/790 slices done, 1 containers running
-picus: 790/790 slices done, 0 containers running
-request-v6      {'SAFE': 334}  wall sum 424s max 2.3s
-transition-v5   {'SAFE': 140}  wall sum 242s max 2.3s
-withdrawal-v6   {'SAFE': 316}  wall sum 375s max 2.3s
-790 slices, 790 SAFE
------ [07] Picus slices (--strong --solver cvc5 --timeout 5000): PASS (303s)
+===== [07] Picus evidence reuse (NOT rerun; exact slices and SAFE logs checked)
+PICUS REUSE: all 790 regenerated r1cs slices byte-identical to /home/ubuntu/zkv-6cb9896/verification/work/out/slices
+slice SHA256 manifest digest: 46c38fad601d69074a95b45635b2b26ca1d6364e7a737ef3d660ea8b77f1b366
+PICUS REUSE: exact 790-slice coverage; all 790 saved verdicts SAFE, exit 0, exact original options; all 790 logs have only the exact SAFE verdict
+prior result SHA256: b2f4a970ddf423d0b6ab3ded521aa4fd1758cd8b68ed58d93de0245d6e106641 /home/ubuntu/zkv-6cb9896/verification/work/runs/results-slices-0.jsonl
+prior result SHA256: 692b0183feb7f088276396093b932098bf17e0ed2eb946b4ca926eba2b323b2c /home/ubuntu/zkv-6cb9896/verification/work/runs/results-slices-1.jsonl
+prior result SHA256: fa15c38c1cdc1867cdae7fe562aa0bb025155e55ebb0be6b8c9dae393845a8b0 /home/ubuntu/zkv-6cb9896/verification/work/runs/results-slices-2.jsonl
+prior result SHA256: e0cba8dd7c1da9302ac61e551fc61b80c7ad944d618056bf8e0c8a0160ab7642 /home/ubuntu/zkv-6cb9896/verification/work/runs/results-slices-3.jsonl
+Picus was NOT rerun; the byte-identical solver inputs reuse the recorded 6cb9896 SAFE run (image sha256:3e78b3b6e3adb064e713553debdf83424bad538a84d95afbafc95e2c9dfe7f5c).
+----- [07] Picus evidence reuse (NOT rerun; exact slices and SAFE logs checked): PASS (1s)
 
 ===== [08] Composition check (every wire accounted for)
 request wires 32168 {'public': 13, 'picus-v6': 30424, 'free': 1145, 'is_neq-multiplier': 78, 'L-bits': 508}
@@ -609,38 +438,6 @@ wire accounting equals results/compose-summary.json: True
 ===== [09] Lean lemmas: build and axioms
 == toolchain: leanprover/lean4:v4.24.0
 Lean (version 4.24.0, x86_64-unknown-linux-gnu, commit 797c613eb9b6d4ec95db23e3e00af9ac6657f24b, Release)
-info: mathlib: cloning https://github.com/leanprover-community/mathlib4
-info: mathlib: checking out revision 'f897ebcf72cd16f89ab4577d0c826cd14afaafc7'
-info: plausible: cloning https://github.com/leanprover-community/plausible
-info: plausible: checking out revision 'dfd06ebfe8d0e8fa7faba9cb5e5a2e74e7bd2805'
-info: LeanSearchClient: cloning https://github.com/leanprover-community/LeanSearchClient
-info: LeanSearchClient: checking out revision '99657ad92e23804e279f77ea6dbdeebaa1317b98'
-info: importGraph: cloning https://github.com/leanprover-community/import-graph
-info: importGraph: checking out revision 'd768126816be17600904726ca7976b185786e6b9'
-info: proofwidgets: cloning https://github.com/leanprover-community/ProofWidgets4
-info: proofwidgets: checking out revision '556caed0eadb7901e068131d1be208dd907d07a2'
-info: aesop: cloning https://github.com/leanprover-community/aesop
-info: aesop: checking out revision '725ac8cd67acd70a7beaf47c3725e23484c1ef50'
-info: Qq: cloning https://github.com/leanprover-community/quote4
-info: Qq: checking out revision 'dea6a3361fa36d5a13f87333dc506ada582e025c'
-info: batteries: cloning https://github.com/leanprover-community/batteries
-info: batteries: checking out revision '8da40b72fece29b7d3fe3d768bac4c8910ce9bee'
-info: Cli: cloning https://github.com/leanprover/lean4-cli
-info: Cli: checking out revision '91c18fa62838ad0ab7384c03c9684d99d306e1da'
-✔ [2/20] Built Cache.Lean (225ms)
-✔ [3/20] Built Cache.Lean:c.o (98ms)
-✔ [4/20] Built Cache.IO (1.0s)
-✔ [5/20] Built Cache.Hashing (535ms)
-✔ [6/20] Built Cache.Hashing:c.o (420ms)
-✔ [7/20] Built Cache.IO:c.o (1.4s)
-✔ [13/20] Built Batteries.Data.String.Basic:c.o (66ms)
-✔ [14/20] Built Batteries.Data.Array.Match:c.o (189ms)
-✔ [15/20] Built Batteries.Data.String.Matcher:c.o (143ms)
-✔ [16/20] Built Cache.Requests (1.0s)
-✔ [17/20] Built Cache.Main (507ms)
-✔ [18/20] Built Cache.Main:c.o (446ms)
-✔ [19/20] Built Cache.Requests:c.o (1.2s)
-✔ [20/20] Built cache:exe (279ms)
 == mathlib f897ebcf72cd16f89ab4577d0c826cd14afaafc7
 == clean build
 Build completed successfully (1776 jobs).
@@ -666,7 +463,7 @@ theorems: 15, with only [propext, Classical.choice, Quot.sound]: 15
 == export
 exported 640 constraints
 lean-export.json sha256 7b846f032126fe9097c57e1ed4c702de39206cd7056b0c3fb0d515991bc9a667 (expected 7b846f032126fe9097c57e1ed4c702de39206cd7056b0c3fb0d515991bc9a667)
------ [09] Lean lemmas: build and axioms: PASS (68s)
+----- [09] Lean lemmas: build and axioms: PASS (20s)
 
 ===== [10] Linkage of the Lean lemmas to the pinned r1cs
 == request: sha256 595545d3ef56eb2bbbbefdb8943aa85ba45d2c79340f94bf75de6ea05452945d (pin OK), 32168 wires, 32862 constraints
@@ -928,7 +725,8 @@ REJECTED  L-EC: add y3 numerator perturbed -> linked: False
 REJECTED  L-EC: shifted cofactor input rejected by full linkage -> failed gadgets 0, provenance failures 1
 REJECTED  L-EC premise: on-curve check of L339 R witness perturbed -> provenance failures 1
 REJECTED  L-EC premise: on-curve check of L296 signing key Q witness perturbed -> provenance failures 1
-REJECTED  L-neq: extra occurrence of m added -> occurrences 2, row ok [False]
+REJECTED  L-neq: extra occurrence of m in L298 signing key nonidentity -> occurrences 2, row ok [False]
+REJECTED  L-neq: extra occurrence of m in L283 scalar bound -> occurrences 2, row ok [False]
 NEGATIVE CONTROLS: all rejected
 ----- [11] Linkage negative controls: PASS (25s)
 
@@ -939,10 +737,10 @@ PASS     Export r1cs and check ceremony.json pins
 PASS     Instrumented mapper (byte-identical to the pins)
 PASS     Forged-witness harness
 PASS     Relabel and slice
-PASS     Picus slices (--strong --solver cvc5 --timeout 5000)
+PASS     Picus evidence reuse (NOT rerun; exact slices and SAFE logs checked)
 PASS     Composition check (every wire accounted for)
 PASS     Lean lemmas: build and axioms
 PASS     Linkage of the Lean lemmas to the pinned r1cs
 PASS     Linkage negative controls
-logs: /home/ubuntu/zkv-6cb9896/verification/work/logs
-VERIFICATION: PASS
+logs: /tmp/ceremony-merge-96f6df6/verification/work/logs
+VERIFICATION: PASS (Picus evidence reused, not rerun; all 790 slice bytes and SAFE logs checked)
