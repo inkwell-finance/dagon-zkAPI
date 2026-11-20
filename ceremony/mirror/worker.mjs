@@ -10,6 +10,9 @@ const SRC = "https://ceremony.dagon.so";
 // just because the edge compressed it or omitted content-length.
 export const BUFFER_CAP = 8 * 1024 * 1024;
 
+// R2 timestamps and Worker wall time need not agree exactly. Delay pruning near the boundary by one minute.
+const PRUNE_CLOCK_MARGIN_MS = 60_000;
+
 export const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 
 const contentType = (key) => (key.endsWith(".json") ? "application/json" : key.endsWith(".md") ? "text/markdown" : "application/octet-stream");
@@ -89,9 +92,13 @@ export async function mirrorFile(env, key, expect) {
       ...(expect?.sha256 ? { sha256: expect.sha256 } : {}),
     });
   } catch (error) {
-    // A failed put leaves the previous object untouched. Remove it only when it is known not to match the transcript.
-    if (!expect?.sha256) throw new Error(`${key}: put failed: ${error.message ?? error}`);
-    return fail(`${key}: put failed: ${error.message ?? error}`);
+    // A failed put leaves the previous object untouched. A missing stored checksum is not proof of corruption.
+    if (expect?.sha256) {
+      const head = await env.BUCKET.head(`files/${key}`);
+      const stored = head?.checksums?.sha256;
+      if (!head || (stored && hex(stored) !== expect.sha256)) return fail(`${key}: put failed: ${error.message ?? error}`);
+    }
+    throw new Error(`${key}: put failed: ${error.message ?? error}`);
   }
   return "uploaded";
 }
@@ -122,7 +129,7 @@ export function wantedFiles(transcript) {
 
 // Complete the listing before deleting anything: a failed page must not cause partial pruning.
 // Never prune closure/final artifacts, or keys outside files/ (including round1/ and index.html). Objects uploaded
-// since this run started belong to an overlapping run that may have observed a newer transcript.
+// since shortly before this run started may belong to an overlapping run that observed a newer transcript.
 export async function prune(env, keep, started) {
   const listed = new Set(["files/ceremony.json", "files/transcript.json", "files/closed.json", ...[...keep].map((k) => `files/${k}`)]);
   const stale = [];
@@ -130,7 +137,7 @@ export async function prune(env, keep, started) {
   do {
     const page = await env.BUCKET.list({ prefix: "files/", cursor });
     for (const o of page.objects) {
-      if (o.key.startsWith("files/") && !o.key.startsWith("files/final/") && !listed.has(o.key) && o.uploaded < started) stale.push(o.key);
+      if (o.key.startsWith("files/") && !o.key.startsWith("files/final/") && !listed.has(o.key) && o.uploaded.getTime() < started.getTime() - PRUNE_CLOCK_MARGIN_MS) stale.push(o.key);
     }
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);

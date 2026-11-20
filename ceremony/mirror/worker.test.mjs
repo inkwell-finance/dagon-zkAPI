@@ -330,6 +330,56 @@ describe("ceremony mirror sync", () => {
     assert.ok(env.BUCKET.objects.has("files/rounds/0002/request.zkey"));
   });
 
+  test("pruning tolerates R2 timestamps behind the Worker clock, including the margin boundary", async () => {
+    const env = { BUCKET: new FakeBucket() };
+    const started = new Date(120_000);
+    for (const [key, uploaded] of [["old", 59_999], ["boundary", 60_000], ["skewed", 119_000], ["new", 120_001]]) {
+      env.BUCKET.objects.set(`files/${key}`, { body: text(key), uploaded: new Date(uploaded) });
+    }
+    assert.equal(await prune(env, [], started), 1);
+    assert.deepEqual(env.BUCKET.deletes, ["files/old"]);
+  });
+
+  test("a transient put failure preserves an unverified legacy zkey and retries until one successful migration", async () => {
+    const env = { BUCKET: new FakeBucket() };
+    const key = "rounds/0000/request.zkey";
+    const old = bytesOf(5000, 9);
+    env.BUCKET.objects.set(`files/${key}`, { body: old });
+    served[key] = { body: zkeys.request, error: "connection reset" };
+    await assert.rejects(sync(env), /request\.zkey: put failed: .*connection reset/);
+    assert.deepEqual(env.BUCKET.objects.get(`files/${key}`).body, old);
+    assert.deepEqual(env.BUCKET.deletes, []);
+    assert.ok(!env.BUCKET.objects.has("files/transcript.json"));
+    served[key] = { body: zkeys.request };
+    await sync(env);
+    assert.deepEqual(env.BUCKET.objects.get(`files/${key}`).body, zkeys.request);
+    assert.equal(env.BUCKET.objects.get(`files/${key}`).sha256, sha(zkeys.request));
+    fetched = [];
+    await sync(env);
+    assert.ok(!fetched.includes(key));
+  });
+
+  test("a failed put removes an object with a proven stored checksum mismatch", async () => {
+    const env = { BUCKET: new FakeBucket() };
+    const key = "rounds/0000/request.zkey";
+    const old = bytesOf(5000, 9);
+    env.BUCKET.objects.set(`files/${key}`, { body: old, sha256: sha(old) });
+    served[key] = { body: zkeys.request, error: "connection reset" };
+    await assert.rejects(sync(env), /removed from the mirror/);
+    assert.deepEqual(env.BUCKET.deletes, [`files/${key}`]);
+    assert.ok(!env.BUCKET.objects.has(`files/${key}`));
+  });
+
+  test("a successful second finalized run skips verified verification keys", async () => {
+    serveFinalized();
+    const env = { BUCKET: new FakeBucket() };
+    await sync(env);
+    fetched = [];
+    await sync(env);
+    assert.ok(!fetched.some((k) => k.endsWith("_verification_key.json") || k.endsWith(".zkey")));
+    assert.ok(fetched.includes("final/FINAL.md"));
+  });
+
   test("a failed streamed put keeps an unhashed refreshed file; a current verification key is not refetched", async () => {
     serveFinalized();
     const env = { BUCKET: new FakeBucket() };

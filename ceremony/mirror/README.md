@@ -14,19 +14,23 @@ Each run:
    The Worker supplies the expected sha256 on put, so R2 rejects mismatching bytes and stores the checksum.
    Zkeys stream through `FixedLengthStream` using their transcript size, even with gzip/chunked responses.
    Other bodies use a valid unencoded response length, or are buffered with an 8 MiB cap and hashed.
-   A zkey or verification key whose bytes disagree with the transcript is deleted and the run fails. A failed put
-   leaves the previous object in place, so a transient failure on a file without a transcript sha256 deletes nothing.
+   A zkey or verification key whose bytes disagree with the transcript is rejected and the run fails. A failed
+   streamed put preserves an existing object unless its stored sha256 proves a mismatch with the transcript;
+   an absent stored checksum is not proof of corruption. Files without a transcript sha256 are also preserved.
 3. Probes `closed.json` every run, copying it before the indexes. Only a 404 while not finalized is optional;
    other errors abort the run. Finalization requires the checkpoint. Final reports are refreshed.
 4. Writes `ceremony.json`, then `transcript.json`, after all required artifacts have been copied.
 5. Lists all pages under `files/`, then deletes stale keys. A listing failure deletes nothing; a transcript fetch,
    body-read or parse failure never reaches listing. `files/closed.json` and **all** `files/final/` objects are never
    pruned, even when an open/older transcript is observed. Nothing outside `files/` is touched (`round1/`, `index.html`).
-   Removing retained close/final artifacts after an intentional restart is an operator task. Objects uploaded after
-   the run started are not pruned: an overlapping run (a slow run lasting past the next cron tick) may have seen a
-   newer transcript.
+   Removing retained close/final artifacts after an intentional restart is an operator task. Objects uploaded
+   within one minute before the run started or later are not pruned: an overlapping run may have seen a newer
+   transcript. The minute is a conservative clock-skew allowance between R2's `uploaded` and the Worker's clock,
+   not a guaranteed bound supplied by R2. Larger skew is not covered; stale objects wait for a later run.
 
-Zkeys uploaded before checksums were stored have none, so the first run of this version downloads them once more.
+Zkeys uploaded before checksums were stored have none, so this version downloads them again until a successful
+verified upload stores their checksum; subsequent runs skip them. A transient upload failure leaves legacy
+bytes in place and aborts index publication, but does not mark them verified or suppress the next retry.
 
 ## Worker resource limits
 
