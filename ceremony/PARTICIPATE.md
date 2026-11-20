@@ -41,7 +41,7 @@ Pick one way. All three do the same computation.
 
 ```sh
 curl -fsSL https://ceremony.dagon.so/contribute.mjs -o contribute.mjs
-curl -fsSL https://raw.githubusercontent.com/inkwell-finance/dagon-zkAPI/be7405c/ceremony/ceremony.json -o ceremony.json
+curl -fsSL https://raw.githubusercontent.com/inkwell-finance/dagon-zkAPI/bc0390b71c191799976cf37b2f5e286138014d88/ceremony/ceremony.json -o ceremony.json
 sha256sum contribute.mjs ceremony.json
 ```
 
@@ -64,7 +64,7 @@ It prints your attestation hash and saves a receipt file. Keep the receipt and p
 ### 3. Build it yourself (strongest; removes any need to trust us)
 
 ```sh
-git clone https://github.com/inkwell-finance/dagon-zkAPI && cd dagon-zkAPI && git checkout be7405c
+git clone https://github.com/inkwell-finance/dagon-zkAPI && cd dagon-zkAPI && git checkout bc0390b71c191799976cf37b2f5e286138014d88
 cd ceremony && npm ci && node build.mjs
 node web/dist/contribute.mjs --server https://ceremony.dagon.so --ceremony ceremony.json --name "Your name"
 ```
@@ -125,7 +125,7 @@ reads the code, the "you must trust the server's code" caveat below disappears.
   residuals (C1–C3; C4 resolved). This rules out under-constraint only; it is not a proof that the circuits match the
   spec, and Ecne was not rerun on them. Reproduce with `verification/rebuild.sh` (790/790 Picus SAFE, 0 unproven
   wires, 8/8 negative controls rejected); details in `verification/README.md`.
-- Source: <https://github.com/inkwell-finance/dagon-zkAPI/tree/be7405c/ceremony>. Design and operator guide:
+- Source: <https://github.com/inkwell-finance/dagon-zkAPI/tree/bc0390b71c191799976cf37b2f5e286138014d88/ceremony>. Design and operator guide:
   `ceremony/README.md`.
 
 Questions: reply to whoever sent you this link. Thank you for helping.
