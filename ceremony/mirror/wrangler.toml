@@ -1,0 +1,12 @@
+name = "dagon-ceremony-mirror"
+main = "worker.mjs"
+account_id = "5842dffafe62cc234a849beb3989b5a4"
+compatibility_date = "2026-11-01"
+workers_dev = false
+
+[triggers]
+crons = ["*/10 * * * *"]
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "dagon-ceremony"
