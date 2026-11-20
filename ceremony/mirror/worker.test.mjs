@@ -370,6 +370,15 @@ describe("ceremony mirror sync", () => {
     assert.ok(!env.BUCKET.objects.has(`files/${key}`));
   });
 
+  test("a failed put removes a legacy object whose stored size disagrees with the transcript", async () => {
+    const env = { BUCKET: new FakeBucket() };
+    const key = "rounds/0000/request.zkey";
+    env.BUCKET.objects.set(`files/${key}`, { body: bytesOf(zkeys.request.byteLength - 1, 9) });
+    served[key] = { body: zkeys.request, error: "connection reset" };
+    await assert.rejects(sync(env), /removed from the mirror/);
+    assert.deepEqual(env.BUCKET.deletes, [`files/${key}`]);
+  });
+
   test("a successful second finalized run skips verified verification keys", async () => {
     serveFinalized();
     const env = { BUCKET: new FakeBucket() };

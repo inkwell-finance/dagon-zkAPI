@@ -92,11 +92,13 @@ export async function mirrorFile(env, key, expect) {
       ...(expect?.sha256 ? { sha256: expect.sha256 } : {}),
     });
   } catch (error) {
-    // A failed put leaves the previous object untouched. A missing stored checksum is not proof of corruption.
+    // A failed put leaves the previous object untouched. A missing stored checksum is not proof of corruption,
+    // but a stored checksum or size that disagrees with the transcript is.
     if (expect?.sha256) {
       const head = await env.BUCKET.head(`files/${key}`);
       const stored = head?.checksums?.sha256;
-      if (!head || (stored && hex(stored) !== expect.sha256)) return fail(`${key}: put failed: ${error.message ?? error}`);
+      const mismatch = (stored && hex(stored) !== expect.sha256) || (expect.bytes !== undefined && head?.size !== expect.bytes);
+      if (!head || mismatch) return fail(`${key}: put failed: ${error.message ?? error}`);
     }
     throw new Error(`${key}: put failed: ${error.message ?? error}`);
   }

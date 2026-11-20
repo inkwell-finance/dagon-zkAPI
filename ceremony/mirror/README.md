@@ -15,7 +15,7 @@ Each run:
    Zkeys stream through `FixedLengthStream` using their transcript size, even with gzip/chunked responses.
    Other bodies use a valid unencoded response length, or are buffered with an 8 MiB cap and hashed.
    A zkey or verification key whose bytes disagree with the transcript is rejected and the run fails. A failed
-   streamed put preserves an existing object unless its stored sha256 proves a mismatch with the transcript;
+   streamed put preserves an existing object unless its stored sha256 or size proves a mismatch with the transcript;
    an absent stored checksum is not proof of corruption. Files without a transcript sha256 are also preserved.
 3. Probes `closed.json` every run, copying it before the indexes. Only a 404 while not finalized is optional;
    other errors abort the run. Finalization requires the checkpoint. Final reports are refreshed.
