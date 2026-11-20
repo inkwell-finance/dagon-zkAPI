@@ -3,25 +3,25 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { beforeEach, describe, test } from "node:test";
 
-// Workers-only globals the streaming path uses.
-crypto.DigestStream = class extends WritableStream {
-  constructor(algorithm) {
-    assert.equal(algorithm, "SHA-256");
-    const hash = createHash("sha256");
-    let resolve;
-    const digest = new Promise((r) => (resolve = r));
-    super({ write: (chunk) => hash.update(chunk), close: () => resolve(new Uint8Array(hash.digest()).buffer) });
-    this.digest = digest;
-  }
-};
+// Workers-only stream length enforcement; R2 verifies checksums, not a second Worker hash branch.
 globalThis.FixedLengthStream = class extends TransformStream {
   constructor(length) {
-    super();
+    let size = 0;
+    super({
+      transform(chunk, controller) {
+        size += chunk.byteLength;
+        if (size > length) throw new Error(`length ${size} > ${length}`);
+        controller.enqueue(chunk);
+      },
+      flush() {
+        if (size !== length) throw new Error(`length ${size} != ${length}`);
+      },
+    });
     this.readable.knownLength = length;
   }
 };
 
-const { default: worker, sync } = await import("./worker.mjs");
+const { default: worker, sync, mirrorFile, prune, BUFFER_CAP } = await import("./worker.mjs");
 
 const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const bytesOf = (n, seed) => Uint8Array.from({ length: n }, (_, i) => (i * 31 + seed) & 0xff);
@@ -32,6 +32,8 @@ class FakeBucket {
   objects = new Map();
   puts = [];
   deletes = [];
+  streamPuts = [];
+  lists = [];
   async head(key) {
     const o = this.objects.get(key);
     return o ? { key, size: o.body.byteLength, checksums: o.sha256 ? { sha256: new Uint8Array(Buffer.from(o.sha256, "hex")).buffer } : {} } : null;
@@ -39,12 +41,14 @@ class FakeBucket {
   async put(key, value, options = {}) {
     let body;
     if (value instanceof ReadableStream) {
+      this.streamPuts.push(key);
       if (value.knownLength === undefined) throw new TypeError("Provided readable stream must have a known length (request/response body or readable half of FixedLengthStream)");
       body = new Uint8Array(await new Response(value).arrayBuffer());
       if (body.byteLength !== value.knownLength) throw new Error(`length ${body.byteLength} != ${value.knownLength}`);
     } else body = new Uint8Array(value instanceof ArrayBuffer ? value : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
-    if (options.sha256 && sha(body) !== options.sha256) throw new Error("put: The SHA-256 checksum you specified did not match what we received.");
-    this.objects.set(key, { body, sha256: options.sha256 });
+    const checksum = typeof options.sha256 === "string" ? options.sha256 : options.sha256 && Buffer.from(options.sha256).toString("hex");
+    if (checksum && sha(body) !== checksum) throw new Error("put: The SHA-256 checksum you specified did not match what we received.");
+    this.objects.set(key, { body, sha256: checksum });
     this.puts.push(key);
   }
   async delete(key) {
@@ -52,6 +56,7 @@ class FakeBucket {
     this.deletes.push(key);
   }
   async list({ prefix, cursor }) {
+    this.lists.push({ prefix, cursor });
     const keys = [...this.objects.keys()].filter((k) => k.startsWith(prefix)).sort();
     const start = cursor ? Number(cursor) : 0;
     const page = keys.slice(start, start + 2); // tiny pages exercise the cursor loop
@@ -88,16 +93,42 @@ beforeEach(() => {
     fetched.push(path);
     const file = served[path];
     if (!file) return new Response("{}", { status: 404 });
+    if (file.status) return new Response("{}", { status: file.status });
+    let offset = 0;
     const body = new ReadableStream({
-      start(c) {
-        for (let i = 0; i < file.body.byteLength; i += 1024) c.enqueue(file.body.slice(i, i + 1024));
-        c.close();
+      pull(c) {
+        if (file.error) return c.error(new Error(file.error));
+        if (offset === file.body.byteLength) return c.close();
+        const end = Math.min(offset + 64 * 1024, file.body.byteLength);
+        c.enqueue(file.body.subarray(offset, end));
+        offset = end;
       },
     });
-    const headers = file.gzip ? { "content-encoding": "gzip" } : { "content-length": String(file.body.byteLength) };
-    return new Response(body, { headers });
+    const headers = file.gzip ? { "content-encoding": "gzip" } : file.chunked ? {} : { "content-length": String(file.body.byteLength) };
+    return new Response(body, { headers: { ...headers, ...file.headers } });
   };
 });
+
+function serveFinalized() {
+  const finalized = structuredClone(transcript);
+  const contribution = { ...structuredClone(transcript.rounds[0]), round: 1, kind: "contribution" };
+  const beacon = { round: 2, kind: "beacon", circuits: {} };
+  served["closed.json"] = { body: text('{"round":1,"attestation":"test"}'), gzip: true };
+  served["final/FINAL.md"] = { body: text("# Final keys") };
+  for (const c of transcript.ceremony.circuits) {
+    const key = bytesOf(zkeys[c].byteLength, 8);
+    const vk = text(JSON.stringify({ circuit: c }));
+    beacon.circuits[c] = { bytes: key.byteLength, sha256: sha(key), verificationKeySha256: sha(vk) };
+    served[`rounds/0001/${c}.zkey`] = { body: zkeys[c] };
+    served[`rounds/0002/${c}.zkey`] = { body: key };
+    served[`final/${c}_final.zkey`] = { body: key, chunked: true };
+    served[`final/${c}_verification_key.json`] = { body: vk, gzip: true };
+  }
+  served["rounds/0001/entry.json"] = { body: text(JSON.stringify(contribution)), gzip: true };
+  served["rounds/0002/entry.json"] = { body: text(JSON.stringify(beacon)), gzip: true };
+  finalized.rounds.push(contribution, beacon);
+  served["transcript.json"] = { body: text(JSON.stringify(finalized)), gzip: true };
+}
 
 describe("ceremony mirror sync", () => {
   test("mirrors gzip JSON without length, replaces unverified zkeys, prunes stale files/ keys, writes transcript.json last", async () => {
@@ -108,6 +139,9 @@ describe("ceremony mirror sync", () => {
     env.BUCKET.objects.set("files/rounds/0001/request.zkey", { body: bytesOf(10, 5) }); // from an abandoned ceremony
     env.BUCKET.objects.set("files/closed.json", { body: text("{}") });
     env.BUCKET.objects.set("other/keep.bin", { body: bytesOf(10, 6) });
+    env.BUCKET.objects.set("files/final/FINAL.md", { body: text("retained") });
+    env.BUCKET.objects.set("round1/files/transcript.json", { body: text("{}") });
+    env.BUCKET.objects.set("index.html", { body: text("landing page") });
 
     await sync(env);
 
@@ -125,14 +159,18 @@ describe("ceremony mirror sync", () => {
     assert.equal(env.BUCKET.puts.at(-2), "files/ceremony.json");
     assert.ok(env.BUCKET.puts.every((k) => k.startsWith("files/")));
     assert.ok(env.BUCKET.deletes.every((k) => k.startsWith("files/")));
-    assert.deepEqual(env.BUCKET.deletes.sort(), ["files/closed.json", "files/rounds/0001/request.zkey"]);
+    assert.deepEqual(env.BUCKET.deletes, ["files/rounds/0001/request.zkey"]);
+    assert.ok(get("files/closed.json"));
+    assert.ok(get("files/final/FINAL.md"));
+    assert.ok(get("round1/files/transcript.json"));
+    assert.ok(get("index.html"));
     assert.ok(get("other/keep.bin"), "keys outside files/ are never touched");
 
-    // A second run finds every zkey current by size and checksum and downloads nothing but the two indexes.
+    // A second run downloads only the indexes and probes closure (404 while open).
     fetched = [];
     env.BUCKET.puts = [];
     await sync(env);
-    assert.deepEqual(fetched, ["transcript.json", "ceremony.json"]);
+    assert.deepEqual(fetched, ["transcript.json", "ceremony.json", "closed.json"]);
     assert.deepEqual(env.BUCKET.puts, ["files/ceremony.json", "files/transcript.json"]);
   });
 
@@ -151,6 +189,189 @@ describe("ceremony mirror sync", () => {
     served["rounds/0000/entry.json"] = { body: new Uint8Array(8 * 1024 * 1024 + 1), gzip: true };
     await assert.rejects(sync(env), /entry\.json: body exceeds/);
     assert.ok(!env.BUCKET.objects.has("files/transcript.json"));
+  });
+
+  test("mirrors closure before a beacon exists, replacing an older checkpoint", async () => {
+    const env = { BUCKET: new FakeBucket() };
+    env.BUCKET.objects.set("files/closed.json", { body: text("old") });
+    served["closed.json"] = { body: text('{"round":0}'), gzip: true };
+    await sync(env);
+    assert.deepEqual(env.BUCKET.objects.get("files/closed.json").body, served["closed.json"].body);
+    assert.ok(env.BUCKET.puts.indexOf("files/closed.json") < env.BUCKET.puts.indexOf("files/transcript.json"));
+    assert.deepEqual(env.BUCKET.deletes, []);
+  });
+
+  test("a beacon round (without transcript.final) mirrors and verifies every final artifact", async () => {
+    serveFinalized();
+    const env = { BUCKET: new FakeBucket() };
+    env.BUCKET.objects.set("files/final/request_final.zkey", { body: bytesOf(zkeys.request.length, 9), sha256: sha(bytesOf(zkeys.request.length, 9)) });
+    await sync(env);
+    for (const key of Object.keys(served).filter((k) => k === "closed.json" || k.startsWith("final/"))) {
+      assert.deepEqual(env.BUCKET.objects.get(`files/${key}`)?.body, served[key].body, key);
+      assert.ok(env.BUCKET.puts.indexOf(`files/${key}`) < env.BUCKET.puts.indexOf("files/transcript.json"));
+    }
+    assert.ok(env.BUCKET.streamPuts.includes("files/final/request_final.zkey"));
+    assert.equal(env.BUCKET.objects.get("files/final/request_final.zkey").sha256, sha(served["final/request_final.zkey"].body));
+    assert.deepEqual(env.BUCKET.deletes, []);
+  });
+
+  for (const missing of ["closed.json", "final/FINAL.md", "final/request_final.zkey", "final/request_verification_key.json"]) {
+    test(`finalization waits for ${missing} before publishing or pruning`, async () => {
+      serveFinalized();
+      delete served[missing];
+      const env = { BUCKET: new FakeBucket() };
+      env.BUCKET.objects.set("files/stale", { body: text("keep until success") });
+      await assert.rejects(sync(env), /GET .* -> 404/);
+      assert.ok(!env.BUCKET.objects.has("files/transcript.json"));
+      assert.deepEqual(env.BUCKET.lists, []);
+      assert.deepEqual(env.BUCKET.deletes, []);
+    });
+  }
+
+  for (const key of ["final/request_final.zkey", "final/request_verification_key.json"]) {
+    test(`rejects corrupt ${key} against the beacon round hash`, async () => {
+      serveFinalized();
+      served[key].body = bytesOf(served[key].body.length, 4);
+      const env = { BUCKET: new FakeBucket() };
+      await assert.rejects(sync(env), /removed from the mirror/);
+      assert.ok(!env.BUCKET.objects.has(`files/${key}`));
+      assert.ok(!env.BUCKET.objects.has("files/transcript.json"));
+      assert.deepEqual(env.BUCKET.lists, []);
+    });
+  }
+
+  test("a transient closure fetch failure aborts instead of treating closure as absent", async () => {
+    served["closed.json"] = { status: 503 };
+    const env = { BUCKET: new FakeBucket() };
+    env.BUCKET.objects.set("files/closed.json", { body: text("retained") });
+    await assert.rejects(sync(env), /closed\.json -> 503/);
+    assert.deepEqual(env.BUCKET.lists, []);
+    assert.deepEqual(env.BUCKET.deletes, []);
+    assert.ok(!env.BUCKET.objects.has("files/transcript.json"));
+  });
+
+  for (const [name, file, error] of [
+    ["fetch", { status: 503 }, /transcript\.json -> 503/],
+    ["parse", { body: text("{"), gzip: true }, /JSON/],
+    ["body", { body: text("{}"), error: "connection reset" }, /connection reset/],
+  ]) {
+    test(`transcript ${name} failure never lists or prunes`, async () => {
+      served["transcript.json"] = file;
+      const env = { BUCKET: new FakeBucket() };
+      env.BUCKET.objects.set("files/stale", { body: text("retained") });
+      await assert.rejects(sync(env), error);
+      assert.deepEqual(env.BUCKET.lists, []);
+      assert.deepEqual(env.BUCKET.deletes, []);
+      assert.deepEqual(env.BUCKET.puts, []);
+    });
+  }
+
+  for (const key of ["transcript.json", "ceremony.json"]) {
+    test(`${key} is also capped before publication or pruning`, async () => {
+      served[key] = { body: new Uint8Array(BUFFER_CAP + 1), gzip: true };
+      const env = { BUCKET: new FakeBucket() };
+      await assert.rejects(sync(env), /body exceeds/);
+      assert.deepEqual(env.BUCKET.lists, []);
+      assert.deepEqual(env.BUCKET.deletes, []);
+      assert.deepEqual(env.BUCKET.puts, []);
+    });
+  }
+
+  test("paging collects all stale keys before deletion, retaining root/archive/close/final keys", async () => {
+    const env = { BUCKET: new FakeBucket() };
+    const protectedKeys = ["index.html", "round1/a", "files-other/a", "files/closed.json", "files/final/a", "files/ceremony.json", "files/transcript.json", "files/keep"];
+    const stale = Array.from({ length: 7 }, (_, i) => `files/stale${i}`);
+    for (const key of [...protectedKeys, ...stale]) env.BUCKET.objects.set(key, { body: text(key) });
+    assert.equal(await prune(env, ["keep"]), stale.length);
+    assert.deepEqual(env.BUCKET.deletes, stale);
+    assert.deepEqual([...env.BUCKET.objects.keys()], protectedKeys);
+    assert.ok(env.BUCKET.lists.length > 1);
+    assert.ok(env.BUCKET.lists.every((page) => page.prefix === "files/"));
+  });
+
+  test("listing may return an empty truncated page; even stray out-of-prefix results are not deleted", async () => {
+    const bucket = new FakeBucket();
+    let calls = 0;
+    bucket.list = async ({ prefix, cursor }) => {
+      assert.equal(prefix, "files/");
+      if (++calls === 1) return { objects: [], truncated: true, cursor: "opaque" };
+      assert.equal(cursor, "opaque");
+      return { objects: [{ key: "index.html" }, { key: "round1/a" }, { key: "files/stale" }], truncated: false };
+    };
+    assert.equal(await prune({ BUCKET: bucket }, []), 1);
+    assert.deepEqual(bucket.deletes, ["files/stale"]);
+    assert.equal(calls, 2);
+  });
+
+  test("a transient second-page listing failure deletes nothing, after indexes were published", async () => {
+    const env = { BUCKET: new FakeBucket() };
+    env.BUCKET.objects.set("files/aaa-stale", { body: text("retained") });
+    const list = env.BUCKET.list.bind(env.BUCKET);
+    env.BUCKET.list = async (options) => {
+      if (options.cursor) throw new Error("R2 listing unavailable");
+      return list(options);
+    };
+    await assert.rejects(sync(env), /R2 listing unavailable/);
+    assert.equal(env.BUCKET.puts.at(-1), "files/transcript.json");
+    assert.deepEqual(env.BUCKET.deletes, []);
+  });
+
+  for (const encoding of [{ chunked: true }, { gzip: true, headers: { "content-length": "42" } }]) {
+    test(`streams transcript-sized zkeys with ${encoding.gzip ? "compressed" : "missing"} content-length`, async () => {
+      served["rounds/0000/request.zkey"] = { body: zkeys.request, ...encoding };
+      const env = { BUCKET: new FakeBucket() };
+      await sync(env);
+      assert.ok(env.BUCKET.streamPuts.includes("files/rounds/0000/request.zkey"));
+      assert.deepEqual(env.BUCKET.objects.get("files/rounds/0000/request.zkey").body, zkeys.request);
+    });
+  }
+
+  for (const size of [4999, 5001]) {
+    test(`rejects a chunked zkey of ${size} bytes when the transcript says 5000`, async () => {
+      served["rounds/0000/request.zkey"] = { body: bytesOf(size, 1), chunked: true };
+      const env = { BUCKET: new FakeBucket() };
+      await assert.rejects(sync(env), /removed from the mirror/);
+      assert.ok(!env.BUCKET.objects.has("files/transcript.json"));
+      assert.deepEqual(env.BUCKET.lists, []);
+    });
+  }
+
+  test("a 50 MiB unknown-length zkey is streamed without tee or whole-body digest", async (t) => {
+    const chunk = new Uint8Array(64 * 1024).fill(7);
+    const count = 800;
+    const hash = createHash("sha256");
+    for (let i = 0; i < count; i++) hash.update(chunk);
+    const expected = { bytes: chunk.length * count, sha256: hash.digest("hex") };
+    let pulled = 0;
+    globalThis.fetch = async () => {
+      const response = new Response(new ReadableStream({
+        pull(controller) {
+          if (pulled++ < count) controller.enqueue(chunk);
+          else controller.close();
+        },
+      }));
+      response.body.tee = () => { throw new Error("must not tee large bodies"); };
+      return response;
+    };
+    t.mock.method(crypto.subtle, "digest", () => { throw new Error("must not buffer large bodies"); });
+    let stored = false;
+    const bucket = {
+      head: async () => null,
+      async put(key, body, options) {
+        assert.equal(key, "files/rounds/0000/request.zkey");
+        assert.ok(body instanceof ReadableStream);
+        assert.equal(body.knownLength, expected.bytes);
+        assert.equal(options.sha256, expected.sha256);
+        let size = 0;
+        const received = createHash("sha256");
+        for await (const value of body) { size += value.byteLength; received.update(value); }
+        assert.equal(size, expected.bytes);
+        assert.equal(received.digest("hex"), expected.sha256);
+        stored = true;
+      },
+    };
+    assert.equal(await mirrorFile({ BUCKET: bucket }, "rounds/0000/request.zkey", expected), "uploaded");
+    assert.ok(stored);
   });
 
   test("the default export is the cron handler", async () => {
