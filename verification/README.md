@@ -205,9 +205,21 @@ curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh
 verification/rebuild.sh
 ```
 
-The hardened run uses `ssh dagon-build`, a clean `git archive` export, and
-`dagon-busy zk-verify-hardened -- bash -lc '…'`, with `PICUS_PARALLEL=4` on its 8 vCPUs.
-The measured run is recorded in `results/rebuild-summary.txt`. Generated files go to `verification/work/`
+The hardened runs use `ssh dagon-build`, a clean `git archive` export and `dagon-busy <name> -- …`, with
+`PICUS_PARALLEL=4` on its 8 vCPUs. The evidence is recorded in two runs:
+
+- `git show 1681a01:verification/results/rebuild-summary.txt`: unmodified `rebuild.sh` on `6cb9896`, all 11
+  steps including the Picus run (step 07: 790/790 SAFE, PASS); its linkage negative controls predate the
+  L283 scalar-bound control (7 of the current 8).
+- `results/rebuild-summary.txt`: the merged `ceremony/round-2` tree (`96f6df6`), steps 1–6 and 8–11 rerun with
+  all 8 negative controls rejected. Picus was **not** rerun. That run used a one-off wrapper: it sourced the
+  step functions of `rebuild.sh` (lines 1–198) and replaced step 07 with a check that all 790 regenerated
+  slices are byte-identical to the `6cb9896` slices, then reused that run's saved results (exact coverage,
+  options and SAFE logs). Its step-07 line and qualified final verdict are therefore not output that
+  `rebuild.sh` itself prints; `rebuild.sh` always runs Picus (`SKIP_PICUS=1` makes it report FAIL). The
+  reused per-slice results reproduce the first run's Picus wall totals (424 s, 375 s and 242 s).
+
+Generated files go to `verification/work/`
 (override with `VERIF_WORK`); per-step logs are in `work/logs/`. Options: `PICUS_PARALLEL` (default
 6 containers), `PICUS_MEMORY` (default `3g` each), `PICUS_WALL` (default 900 s per slice).
 
